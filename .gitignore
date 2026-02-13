@@ -1,0 +1,12 @@
+build/
+dist/
+deb-build/
+result
+result-*
+*.deb
+*.changes
+*.buildinfo
+*.swp
+*.swo
+__pycache__/
+*.pyc
