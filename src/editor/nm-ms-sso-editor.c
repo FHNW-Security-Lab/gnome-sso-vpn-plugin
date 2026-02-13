@@ -604,7 +604,7 @@ plugin_get_property(GObject *object, guint prop_id, GValue *value, GParamSpec *p
 {
     switch (prop_id) {
     case PLUGIN_PROP_NAME:
-        g_value_set_string(value, "MS SSO OpenConnect");
+        g_value_set_string(value, "SSO-VPN Openconnect");
         break;
     case PLUGIN_PROP_DESC:
         g_value_set_string(value, "VPN connection using Microsoft SSO authentication");

@@ -55,3 +55,16 @@ In your system flake:
   };
 }
 ```
+
+If your setup uses a separate `flake/packages.nix` mapping, add:
+
+```nix
+gnome-sso-vpn = {
+  input = "gnome-sso-vpn";
+  package = "default";
+  modulePath = "nix/nixos-module.nix";
+  overlayPath = "nix/overlay.nix";
+  enableOptionPath = [ "services" "gnome-ms-sso-plugin" "enable" ];
+  enableOptionValue = true;
+};
+```

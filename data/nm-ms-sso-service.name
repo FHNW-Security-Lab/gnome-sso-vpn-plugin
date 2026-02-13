@@ -1,5 +1,5 @@
 [VPN Connection]
-name=ms-sso
+name=SSO-VPN Openconnect
 service=org.freedesktop.NetworkManager.ms-sso
 program=/usr/libexec/nm-ms-sso-service
 supports-multiple-connections=false
