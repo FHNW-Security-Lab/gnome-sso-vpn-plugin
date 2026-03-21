@@ -14,6 +14,7 @@ It uses the unified core module for:
 
 import json
 import os
+import re
 import sys
 import signal
 import subprocess
