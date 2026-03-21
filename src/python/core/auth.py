@@ -263,6 +263,7 @@ def do_saml_auth(
             return False
 
         vpn_request_event = threading.Event()
+        ui_change_event = threading.Event()
 
         def _wait_for_vpn_callback(timeout_ms: int = 60000) -> None:
             if _is_vpn_url(page.url):
@@ -275,12 +276,13 @@ def do_saml_auth(
                     return
                 if _is_vpn_url(page.url):
                     return
-                if vpn_request_event.wait(timeout=0.25):
+                if vpn_request_event.wait(timeout=0.05):
                     return
 
         def handle_request(request):
             if _is_vpn_url(request.url):
                 vpn_request_event.set()
+                ui_change_event.set()
                 if debug:
                     print(f"    [DEBUG] Request to VPN: {request.url[:80]}...")
                     print(f"    [DEBUG] Request method: {request.method}")
@@ -304,6 +306,7 @@ def do_saml_auth(
         def handle_response(response):
             if not _is_vpn_url(response.url):
                 return
+            ui_change_event.set()
             try:
                 headers = response.headers
                 if debug:
@@ -323,6 +326,9 @@ def do_saml_auth(
 
         page.on("request", handle_request)
         page.on("response", handle_response)
+        page.on("load", lambda *_: ui_change_event.set())
+        page.on("domcontentloaded", lambda *_: ui_change_event.set())
+        page.on("framenavigated", lambda *_: ui_change_event.set())
 
         def _find_visible_in_frames(selectors: list[str]):
             for frame in page.frames:
@@ -546,6 +552,44 @@ def do_saml_auth(
                 pass
             return False
 
+        def _auth_ui_ready() -> bool:
+            selectors = [
+                "input",
+                "button",
+                "input[type='submit']",
+                "#idSIButton9",
+                "#submitButton",
+                "#i0116",
+                "#i0118",
+                "#userNameInput",
+                "#passwordInput",
+                "#idTxtBx_SAOTCC_OTC",
+            ]
+            for frame in page.frames:
+                for sel in selectors:
+                    try:
+                        loc = frame.locator(sel)
+                        if loc.count() > 0 and loc.first.is_visible():
+                            return True
+                    except Exception:
+                        continue
+            return False
+
+        def _wait_until_ready(timeout_seconds: float = 1.0) -> None:
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                if (
+                    _is_vpn_url(page.url)
+                    or saml_result.get("saml_response")
+                    or saml_result.get("prelogin_cookie")
+                    or saml_result.get("portal_userauthcookie")
+                    or _auth_ui_ready()
+                ):
+                    return
+                remaining = max(0.0, deadline - time.monotonic())
+                ui_change_event.wait(timeout=min(0.05, remaining))
+                ui_change_event.clear()
+
         def _is_adfs_page() -> bool:
             url = page.url.lower()
             if "adfs" in url and "/ls" in url:
@@ -559,15 +603,16 @@ def do_saml_auth(
                 for wait_until in wait_targets:
                     try:
                         page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+                        _wait_until_ready(0.5)
                         return
                     except Exception as exc:
                         errors.append(exc)
                         if "ERR_NETWORK_CHANGED" in str(exc):
                             if debug:
                                 print("    [DEBUG] Page.goto hit ERR_NETWORK_CHANGED; retrying")
-                            time.sleep(1)
+                            _wait_until_ready(0.2)
                             continue
-                time.sleep(1)
+                _wait_until_ready(0.2)
             raise errors[-1] if errors else Exception("Page.goto failed")
 
         def _click_first_text(texts: list[str]):
@@ -602,7 +647,7 @@ def do_saml_auth(
                 page.screenshot(path="/tmp/vpn-step1-portal.png")
                 print("    [DEBUG] Screenshot: /tmp/vpn-step1-portal.png")
 
-            time.sleep(1)
+            _wait_until_ready(0.5)
             if _is_vpn_url(page.url):
                 all_cookies = context.cookies()
                 session_cookies = {}
@@ -811,12 +856,12 @@ def do_saml_auth(
 
                 if progressed:
                     try:
-                        page.wait_for_load_state("domcontentloaded", timeout=5000)
+                        page.wait_for_load_state("domcontentloaded", timeout=1500)
                     except Exception:
                         pass
-                    time.sleep(0.3)
+                    _wait_until_ready(0.2)
                 else:
-                    time.sleep(1)
+                    _wait_until_ready(0.1)
 
             _wait_for_vpn_callback(timeout_seconds * 1000)
 

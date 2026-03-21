@@ -150,6 +150,9 @@ class VPNPluginService(dbus.service.Object):
         self.current_gateway = None
         self.current_tun_device = None
         self.current_protocol = None
+        self.current_gateway_host = None
+        self.current_gateway_port = 443
+        self.owned_tun_devices = set()
         # Track GP connection timing so we can delay initial Config/UI state.
         self.gp_connect_start_time = None
         self.auth_in_progress = False
@@ -364,6 +367,113 @@ class VPNPluginService(dbus.service.Object):
             pass
         return tun_devs
 
+    def _parse_gateway_host(self, gateway: str) -> str:
+        """Return the hostname part of the configured VPN gateway."""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(gateway if "://" in gateway else f"//{gateway}")
+            return parsed.hostname or gateway
+        except Exception:
+            return gateway
+
+    def _parse_gateway_port(self, gateway: str) -> int:
+        """Return the port part of the configured VPN gateway."""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(gateway if "://" in gateway else f"//{gateway}")
+            return parsed.port or 443
+        except Exception:
+            return 443
+
+    def _get_openconnect_resolve_arg(self) -> Optional[str]:
+        """Return a stable --resolve argument for reconnects when possible."""
+        gateway_host = getattr(self, "current_gateway_host", None)
+        gateway_ip = getattr(self, "current_gateway_ip", None)
+        if not gateway_host or not gateway_ip or gateway_host == gateway_ip:
+            return None
+        return f"--resolve={gateway_host}:{gateway_ip}"
+
+    def _probe_gateway(self, timeout_seconds: float = 3.0) -> bool:
+        """Best-effort probe to detect dead uplinks while tun still exists."""
+        gateway_ip = getattr(self, "current_gateway_ip", None)
+        if not gateway_ip:
+            return True
+        gateway_port = getattr(self, "current_gateway_port", 443)
+        try:
+            with socket.create_connection((gateway_ip, gateway_port), timeout=timeout_seconds):
+                return True
+        except Exception:
+            return False
+
+    def _consume_vpn_stdout(self, output_buffer: str, openconnect_reported_up: bool):
+        """Drain any available OpenConnect output without blocking."""
+        if not self.vpn_process or not self.vpn_process.stdout:
+            return output_buffer, openconnect_reported_up
+
+        while True:
+            try:
+                chunk = self.vpn_process.stdout.read(4096)
+            except (BlockingIOError, IOError):
+                break
+            except Exception:
+                break
+
+            if not chunk:
+                break
+
+            text = chunk.decode('utf-8', errors='replace')
+            output_buffer += text
+            if len(output_buffer) > 65536:
+                output_buffer = output_buffer[-65536:]
+
+            for line in text.split('\n'):
+                line_lc = line.lower()
+                if 'DNS' in line.upper():
+                    log.info(f"OpenConnect DNS info: {line.strip()}")
+                    ips = re.findall(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b', line)
+                    for ip in ips:
+                        if ip not in self.vpn_dns_servers:
+                            self.vpn_dns_servers.append(ip)
+                            log.info(f"Captured VPN DNS: {ip}")
+                if 'domain' in line_lc or 'search' in line_lc:
+                    log.info(f"OpenConnect domain info: {line.strip()}")
+                if (
+                    "connected as " in line_lc
+                    or "cstp connected" in line_lc
+                    or "esp session established" in line_lc
+                    or "dtls connected" in line_lc
+                    or "tun opened" in line_lc
+                ):
+                    if not openconnect_reported_up:
+                        openconnect_reported_up = True
+                        log.info("OpenConnect reported tunnel session up")
+
+        return output_buffer, openconnect_reported_up
+
+    def _stop_vpn_process(self, preserve_session: bool = True, force: bool = False) -> None:
+        """Stop OpenConnect while letting vpnc-script clean up when possible."""
+        if not self.vpn_process or self.vpn_process.poll() is not None:
+            return
+
+        sig = signal.SIGHUP if preserve_session else signal.SIGTERM
+        try:
+            self.vpn_process.send_signal(sig)
+            self.vpn_process.wait(timeout=5)
+            return
+        except ProcessLookupError:
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception as e:
+            log.warning(f"Failed to stop OpenConnect with {sig.name}: {e}")
+
+        if force:
+            try:
+                self.vpn_process.kill()
+                self.vpn_process.wait(timeout=5)
+            except Exception:
+                pass
+
     def _parse_positive_int(self, value, default: int) -> int:
         """Parse non-negative integer config values."""
         if value is None:
@@ -460,6 +570,8 @@ class VPNPluginService(dbus.service.Object):
             # Store gateway for config emission
             self.current_gateway = gateway
             self.current_protocol = protocol
+            self.current_gateway_host = self._parse_gateway_host(gateway)
+            self.current_gateway_port = self._parse_gateway_port(gateway)
 
             # IMPORTANT: Resolve gateway IP NOW, before VPN connects
             # After VPN connects, DNS switches to VPN DNS servers which can't resolve external hostnames
@@ -896,6 +1008,9 @@ class VPNPluginService(dbus.service.Object):
             # Connect to VPN
             # We use subprocess so we can monitor and return control
             proto_flag = PROTOCOLS.get(protocol, {}).get('flag', 'anyconnect')
+            resolve_arg = self._get_openconnect_resolve_arg()
+            reconnect_arg = "--reconnect-timeout=300"
+            dpd_arg = "--force-dpd=30"
 
             if protocol == 'gp' and 'prelogin-cookie' in cookies:
                 cookie_str = cookies.get('prelogin-cookie', '')
@@ -904,15 +1019,19 @@ class VPNPluginService(dbus.service.Object):
                     "openconnect",
                     "--verbose",
                     f"--protocol={proto_flag}",
+                    reconnect_arg,
+                    dpd_arg,
                     "--passwd-on-stdin",
                     "--useragent=PAN GlobalProtect",
                     "--usergroup=portal:prelogin-cookie",
                     "--os=linux-64",
                     gateway,
                 ]
+                if resolve_arg:
+                    cmd.insert(3, resolve_arg)
                 # Add username if available (required for GlobalProtect)
                 if username:
-                    cmd.insert(5, f"--user={username}")
+                    cmd.insert(7 if resolve_arg else 6, f"--user={username}")
                 self.vpn_process = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
@@ -931,9 +1050,13 @@ class VPNPluginService(dbus.service.Object):
                     "openconnect",
                     "--verbose",
                     f"--protocol={proto_flag}",
+                    reconnect_arg,
+                    dpd_arg,
                     f"--cookie={cookie_str}",
                     gateway,
                 ]
+                if resolve_arg:
+                    cmd.insert(3, resolve_arg)
                 log.debug(
                     "OpenConnect command: openconnect --verbose "
                     f"--protocol={proto_flag} --cookie=[redacted] {gateway}"
@@ -955,6 +1078,8 @@ class VPNPluginService(dbus.service.Object):
                 )
 
             log.info(f"OpenConnect started (PID {self.vpn_process.pid})")
+            if resolve_arg:
+                log.info(f"Using {resolve_arg} for OpenConnect reconnects")
 
             # Initialize DNS server list
             self.vpn_dns_servers = []
@@ -992,38 +1117,10 @@ class VPNPluginService(dbus.service.Object):
                     raise Exception(f"OpenConnect exited (code {exit_code}): {output_buffer[-500:]}")
 
                 # Try to read any available output (non-blocking)
-                try:
-                    chunk = self.vpn_process.stdout.read(4096)
-                    if chunk:
-                        text = chunk.decode('utf-8', errors='replace')
-                        output_buffer += text
-                        # Parse for DNS servers (OpenConnect outputs: "Received DNS server X.X.X.X")
-                        for line in text.split('\n'):
-                            line_lc = line.lower()
-                            if 'DNS' in line.upper():
-                                log.info(f"OpenConnect DNS info: {line.strip()}")
-                                # Try to extract IP from various formats
-                                import re
-                                ips = re.findall(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', line)
-                                for ip in ips:
-                                    if ip not in self.vpn_dns_servers:
-                                        self.vpn_dns_servers.append(ip)
-                                        log.info(f"Captured VPN DNS: {ip}")
-                            # Also capture search domains
-                            if 'domain' in line_lc or 'search' in line_lc:
-                                log.info(f"OpenConnect domain info: {line.strip()}")
-                            if (
-                                "connected as " in line_lc
-                                or "cstp connected" in line_lc
-                                or "esp session established" in line_lc
-                                or "dtls connected" in line_lc
-                                or "tun opened" in line_lc
-                            ):
-                                if not openconnect_reported_up:
-                                    openconnect_reported_up = True
-                                    log.info("OpenConnect reported tunnel session up")
-                except (BlockingIOError, IOError):
-                    pass  # No data available yet
+                output_buffer, openconnect_reported_up = self._consume_vpn_stdout(
+                    output_buffer,
+                    openconnect_reported_up,
+                )
 
                 # Check tunnel interfaces. For AnyConnect, require an OpenConnect
                 # "session up" marker so we don't falsely bind to stale tun devices.
@@ -1039,6 +1136,7 @@ class VPNPluginService(dbus.service.Object):
 
                 if candidate_tun:
                     self.current_tun_device = candidate_tun
+                    self.owned_tun_devices.add(candidate_tun)
                     if protocol != 'anyconnect' or openconnect_reported_up:
                         log.info(f"Found tun device: {self.current_tun_device}")
                         connected = True
@@ -1051,8 +1149,7 @@ class VPNPluginService(dbus.service.Object):
                 # process or DNS state behind.
                 try:
                     if self.vpn_process and self.vpn_process.poll() is None:
-                        self.vpn_process.kill()
-                        self.vpn_process.wait(timeout=5)
+                        self._stop_vpn_process(preserve_session=True, force=True)
                 except Exception:
                     pass
                 self._cleanup_dns()
@@ -1075,9 +1172,22 @@ class VPNPluginService(dbus.service.Object):
             missing_tun_checks = 0
             watch_interval = max(1, int(watchdog_interval_seconds))
             tun_miss_limit = max(1, int(watchdog_missing_tun_limit))
+            gateway_probe_timeout = max(1, self._parse_positive_int(
+                os.environ.get("MS_SSO_NM_GATEWAY_PROBE_TIMEOUT_SECONDS"),
+                3,
+            ))
+            gateway_probe_fail_limit = max(1, self._parse_positive_int(
+                os.environ.get("MS_SSO_NM_GATEWAY_PROBE_FAIL_LIMIT"),
+                3,
+            ))
+            gateway_probe_failures = 0
             while self.vpn_process.poll() is None:
                 if self._is_connect_cancelled(connect_generation):
                     break
+                output_buffer, openconnect_reported_up = self._consume_vpn_stdout(
+                    output_buffer,
+                    openconnect_reported_up,
+                )
                 tun_dev = self.current_tun_device
                 if tun_dev:
                     check = subprocess.run(
@@ -1095,23 +1205,43 @@ class VPNPluginService(dbus.service.Object):
                         if missing_tun_checks >= tun_miss_limit:
                             log.warning("Watchdog: tunnel device vanished; restarting connection")
                             try:
-                                self.vpn_process.kill()
+                                self._stop_vpn_process(preserve_session=True, force=True)
                             except Exception:
                                 pass
                             break
                     else:
                         missing_tun_checks = 0
+
+                if self._probe_gateway(timeout_seconds=float(gateway_probe_timeout)):
+                    gateway_probe_failures = 0
+                else:
+                    gateway_probe_failures += 1
+                    log.warning(
+                        "Watchdog: gateway probe failed "
+                        f"({gateway_probe_failures}/{gateway_probe_fail_limit})"
+                    )
+                    if gateway_probe_failures >= gateway_probe_fail_limit:
+                        log.warning("Watchdog: uplink to VPN gateway appears down; restarting connection")
+                        try:
+                            self._stop_vpn_process(preserve_session=True, force=True)
+                        except Exception:
+                            pass
+                        break
                 time.sleep(watch_interval)
 
             # Wait for process to fully exit and report uptime
             try:
+                output_buffer, openconnect_reported_up = self._consume_vpn_stdout(
+                    output_buffer,
+                    openconnect_reported_up,
+                )
                 exit_code = self.vpn_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 exit_code = self.vpn_process.poll()
                 if exit_code is None:
                     log.warning("Watchdog: OpenConnect did not exit in time; forcing kill")
                     try:
-                        self.vpn_process.kill()
+                        self._stop_vpn_process(preserve_session=True, force=True)
                     except Exception:
                         pass
                     try:
@@ -1129,8 +1259,7 @@ class VPNPluginService(dbus.service.Object):
             log.info(f"Attempt error: {error_msg}")
             try:
                 if self.vpn_process and self.vpn_process.poll() is None:
-                    self.vpn_process.kill()
-                    self.vpn_process.wait(timeout=5)
+                    self._stop_vpn_process(preserve_session=True, force=True)
             except Exception:
                 pass
             self._cleanup_dns()
@@ -1560,14 +1689,21 @@ class VPNPluginService(dbus.service.Object):
         tun_devs = set()
         if self.current_tun_device:
             tun_devs.add(self.current_tun_device)
+        tun_devs.update(self.owned_tun_devices)
 
         # Best effort: add currently present tunnel interfaces so DNS gets
         # reverted even when we missed current_tun_device tracking.
-        tun_devs.update(self._list_tun_devices())
+        if not tun_devs:
+            tun_devs.update(self._list_tun_devices())
 
         # Fallback when we can't enumerate: try tun0 at minimum.
         if not tun_devs:
             tun_devs.add("tun0")
+
+        owned_cleanup_devs = set()
+        if self.current_tun_device:
+            owned_cleanup_devs.add(self.current_tun_device)
+        owned_cleanup_devs.update(self.owned_tun_devices)
 
         for tun_dev in sorted(tun_devs):
             cleaned = False
@@ -1596,10 +1732,34 @@ class VPNPluginService(dbus.service.Object):
                 except Exception as e:
                     log.info(f"resolvconf cleanup failed for {tun_dev}: {e}")
 
+            if tun_dev not in owned_cleanup_devs:
+                continue
+
+            try:
+                subprocess.run(
+                    ["ip", "route", "flush", "dev", tun_dev],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except Exception as e:
+                log.info(f"Route cleanup failed for {tun_dev}: {e}")
+
+            try:
+                subprocess.run(
+                    ["ip", "link", "delete", "dev", tun_dev],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except Exception as e:
+                log.info(f"Link cleanup failed for {tun_dev}: {e}")
+
         # Always clear in-memory DNS/tunnel state, even when no tun device was found.
         self.vpn_dns_servers = []
         self.vpn_domains = []
         self.current_tun_device = None
+        self.owned_tun_devices.clear()
 
     # D-Bus methods
     @dbus.service.method(NM_VPN_DBUS_PLUGIN_INTERFACE,
@@ -1647,20 +1807,13 @@ class VPNPluginService(dbus.service.Object):
 
         self._set_state(NM_VPN_SERVICE_STATE_STOPPING)
 
-        # Kill openconnect process with SIGKILL to preserve session cookie
-        # SIGTERM causes OpenConnect to send a logout message which invalidates the cookie
+        # Use SIGHUP so openconnect preserves the session cookie but still runs
+        # vpnc-script cleanup for routes and DNS.
         if self.vpn_process and self.vpn_process.poll() is None:
-            log.info("Killing openconnect with SIGKILL to preserve session cookie")
-            self.vpn_process.kill()  # SIGKILL - no graceful logout
-            try:
-                self.vpn_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass  # Already sent SIGKILL, nothing more we can do
+            log.info("Stopping openconnect with SIGHUP to preserve session cookie")
+            self._stop_vpn_process(preserve_session=True, force=True)
 
-        # Also kill any other openconnect processes with SIGKILL
-        subprocess.run(['pkill', '-KILL', '-x', 'openconnect'], capture_output=True)
-
-        # Ensure DNS cleanup even when OpenConnect is SIGKILLed.
+        # Ensure DNS cleanup even if openconnect/vpnc-script left residue behind.
         self._cleanup_dns()
 
         self._set_state(NM_VPN_SERVICE_STATE_STOPPED)
