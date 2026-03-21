@@ -154,6 +154,7 @@ class VPNPluginService(dbus.service.Object):
         self.current_gateway_host = None
         self.current_gateway_port = 443
         self.owned_tun_devices = set()
+        self.ipv6_leak_protection_enabled = False
         # Track GP connection timing so we can delay initial Config/UI state.
         self.gp_connect_start_time = None
         self.auth_in_progress = False
@@ -1477,6 +1478,47 @@ class VPNPluginService(dbus.service.Object):
             except Exception as e:
                 log.warning(f"Failed to delete on-link host route: {e}")
 
+    def _apply_ipv6_leak_protection(self) -> None:
+        """Block local IPv6 egress while this IPv4-only VPN is active."""
+        if self.ipv6_leak_protection_enabled:
+            return
+        if not self._is_truthy(os.environ.get("MS_SSO_NM_BLOCK_IPV6", "1")):
+            return
+
+        try:
+            result = subprocess.run(
+                ["ip", "-6", "route", "replace", "unreachable", "::/0", "metric", "50"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                self.ipv6_leak_protection_enabled = True
+                log.info("Enabled IPv6 leak protection with unreachable default route")
+            else:
+                log.warning(
+                    "Failed to enable IPv6 leak protection: "
+                    f"{(result.stderr or result.stdout).strip()}"
+                )
+        except Exception as e:
+            log.warning(f"Failed to enable IPv6 leak protection: {e}")
+
+    def _remove_ipv6_leak_protection(self) -> None:
+        """Remove the temporary IPv6 block route added for VPN leak protection."""
+        if not self.ipv6_leak_protection_enabled:
+            return
+        try:
+            subprocess.run(
+                ["ip", "-6", "route", "del", "unreachable", "::/0", "metric", "50"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as e:
+            log.warning(f"Failed to remove IPv6 leak protection: {e}")
+        finally:
+            self.ipv6_leak_protection_enabled = False
+
     def _emit_starting_keepalive(self):
         """Emit a keepalive STARTING state to reduce NM connect timeouts."""
         try:
@@ -1662,6 +1704,8 @@ class VPNPluginService(dbus.service.Object):
                 self.Ip4Config(ip4_config)
                 log.info(f"Emitted Ip4Config signal: addr={ip_addr}/{prefix}, dns={len(dns_servers)} servers")
 
+            self._apply_ipv6_leak_protection()
+
             # Now set state to started
             self._set_state(NM_VPN_SERVICE_STATE_STARTED)
         except Exception as e:
@@ -1687,6 +1731,8 @@ class VPNPluginService(dbus.service.Object):
 
     def _cleanup_dns(self):
         """Attempt to clear DNS settings left behind on disconnect/failure."""
+        self._remove_ipv6_leak_protection()
+
         tun_devs = set()
         if self.current_tun_device:
             tun_devs.add(self.current_tun_device)
