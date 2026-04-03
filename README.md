@@ -55,6 +55,16 @@ If that automatic Playwright step fails because of network restrictions, run:
 sudo PLAYWRIGHT_BROWSERS_PATH=/var/cache/ms-playwright playwright install chromium
 ```
 
+To remove the package again:
+
+```bash
+sudo pacman -Rns networkmanager-ms-sso-git
+sudo rm -rf /var/cache/ms-playwright /var/cache/ms-sso-openconnect
+```
+
+If you also want to remove the configured VPN connection, delete it from
+NetworkManager or with `nmcli connection delete "<connection name>"`.
+
 ## Nix Flake Usage
 
 Build package:
