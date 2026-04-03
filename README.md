@@ -30,6 +30,12 @@ Build and install locally:
 ./build-arch.sh
 ```
 
+Install with `paru` from a local checkout:
+
+```bash
+paru -Bi packaging/arch --rebuild
+```
+
 Or build it manually:
 
 ```bash
