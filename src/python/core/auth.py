@@ -177,6 +177,15 @@ def do_saml_auth(
         except OSError:
             return False
 
+    def _looks_like_playwright_browser_dir(path: str) -> bool:
+        try:
+            return any(
+                entry.startswith(("chromium-", "chromium_headless_shell-", "firefox-", "webkit-"))
+                for entry in os.listdir(path)
+            )
+        except OSError:
+            return False
+
     force_ephemeral_browser_session = (
         _is_truthy(disable_browser_session_cache)
         or _is_truthy(os.environ.get("MS_SSO_DISABLE_BROWSER_SESSION_CACHE"))
@@ -192,14 +201,27 @@ def do_saml_auth(
         try:
             import pwd
             home = pwd.getpwnam(real_user).pw_dir
-            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = f"{home}/.cache/ms-playwright"
         except Exception:
             pass
-    else:
-        for pw_path in ["/var/cache/ms-playwright", "/opt/ms-playwright", "/usr/share/ms-playwright"]:
-            if os.path.isdir(pw_path):
-                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = pw_path
-                break
+
+    browser_path_candidates = []
+    existing_env_browser_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if existing_env_browser_path:
+        browser_path_candidates.append(existing_env_browser_path)
+    if home:
+        browser_path_candidates.append(os.path.join(home, ".cache", "ms-playwright"))
+    browser_path_candidates.extend([
+        "/var/cache/ms-playwright",
+        "/opt/ms-playwright",
+        "/usr/share/ms-playwright",
+    ])
+
+    for browser_path in browser_path_candidates:
+        if _looks_like_playwright_browser_dir(browser_path):
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = browser_path
+            if debug:
+                print(f"    [DEBUG] Using Playwright browsers from: {browser_path}")
+            break
 
     with sync_playwright() as p:
         session_tmp_dir = None
