@@ -1,0 +1,42 @@
+_setup_runtime_dirs() {
+  install -d -m755 /var/cache/ms-playwright
+  install -d -m755 /var/cache/ms-sso-openconnect
+  install -d -m755 /var/cache/ms-sso-openconnect/browser-session
+
+  if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/networkmanager-ms-sso.conf >/dev/null 2>&1 || true
+  fi
+}
+
+_playwright_browser_installed() {
+  find /var/cache/ms-playwright -maxdepth 1 -type d -name 'chromium-*' | grep -q .
+}
+
+_install_playwright_chromium() {
+  if _playwright_browser_installed; then
+    echo 'Playwright Chromium runtime already present in /var/cache/ms-playwright.'
+    return 0
+  fi
+
+  if ! command -v playwright >/dev/null 2>&1; then
+    echo 'warning: playwright executable not found; skipping Chromium runtime installation.'
+    return 0
+  fi
+
+  echo 'Installing Playwright Chromium runtime into /var/cache/ms-playwright...'
+  if PLAYWRIGHT_BROWSERS_PATH=/var/cache/ms-playwright playwright install chromium; then
+    echo 'Playwright Chromium runtime installed successfully.'
+  else
+    echo 'warning: failed to install Playwright Chromium runtime automatically.'
+    echo 'warning: retry manually with: sudo PLAYWRIGHT_BROWSERS_PATH=/var/cache/ms-playwright playwright install chromium'
+  fi
+}
+
+post_install() {
+  _setup_runtime_dirs
+  _install_playwright_chromium
+}
+
+post_upgrade() {
+  post_install
+}

@@ -1,6 +1,9 @@
 VERSION ?= 2.0.0
 
-.PHONY: deb nix
+.PHONY: arch deb nix
+
+arch:
+	@./build-arch.sh
 
 deb:
 	@./build.sh $(VERSION)

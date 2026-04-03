@@ -9,6 +9,7 @@ Standalone GNOME NetworkManager plugin for MS SSO OpenConnect.
 - Plugin metadata and D-Bus policy (`data/`)
 - Shared Python runtime used by the plugin (`src/python/core/`)
 - Debian packaging assets (`packaging/debian/`)
+- Arch packaging assets (`packaging/arch/`)
 - Nix packaging + NixOS module (`nix/`, `flake.nix`)
 
 ## Build Debian Package
@@ -18,6 +19,35 @@ Standalone GNOME NetworkManager plugin for MS SSO OpenConnect.
 ```
 
 Output artifacts are placed under `dist/`.
+
+## Build Or Install On Arch
+
+Arch packaging is provided as an AUR-style `-git` package in `packaging/arch/`.
+
+Build and install locally:
+
+```bash
+./build-arch.sh
+```
+
+Or build it manually:
+
+```bash
+cd packaging/arch
+makepkg -si --syncdeps --cleanbuild
+```
+
+The package installs as `networkmanager-ms-sso-git`.
+
+The Arch package automatically creates writable runtime caches under
+`/var/cache/ms-sso-openconnect` and installs the Playwright Chromium runtime
+into `/var/cache/ms-playwright` during `paru`/`pacman` installation.
+
+If that automatic Playwright step fails because of network restrictions, run:
+
+```bash
+sudo PLAYWRIGHT_BROWSERS_PATH=/var/cache/ms-playwright playwright install chromium
+```
 
 ## Nix Flake Usage
 

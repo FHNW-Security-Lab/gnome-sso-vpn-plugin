@@ -1,0 +1,72 @@
+pkgname=networkmanager-ms-sso-git
+_upstream_name=networkmanager-ms-sso
+_repo_name=gnome-sso-vpn-plugin
+pkgver=2.0.0.r5.g0daf92c
+pkgrel=1
+pkgdesc='NetworkManager VPN plugin for MS SSO OpenConnect'
+arch=('x86_64')
+url='https://github.com/FHNW-Security-Lab/gnome-sso-vpn-plugin'
+license=('GPL-2.0-or-later')
+depends=(
+  'libnm'
+  'networkmanager'
+  'openconnect'
+  'gtk4'
+  'libadwaita'
+  'libsecret'
+  'python-gobject'
+  'python-dbus'
+  'python-keyring'
+  'python-pyotp'
+  'python-playwright'
+)
+makedepends=(
+  'git'
+  'meson'
+  'ninja'
+  'pkgconf'
+)
+optdepends=(
+  'gnome-control-center: configure the VPN connection from GNOME Settings'
+  'gnome-keyring: org.freedesktop.secrets provider for credential storage'
+)
+provides=("${_upstream_name}")
+conflicts=("${_upstream_name}")
+install="${pkgname}.install"
+source=("${_repo_name}::git+${url}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "${srcdir}/${_repo_name}"
+
+  local version rev short
+  version="$(
+    sed -n "s/^  version: '\\([^']\\+\\)',$/\\1/p" meson.build | head -n1
+  )"
+  rev="$(git rev-list --count HEAD)"
+  short="$(git rev-parse --short HEAD)"
+
+  printf '%s.r%s.g%s\n' "${version}" "${rev}" "${short}"
+}
+
+build() {
+  local meson_options=(
+    --prefix=/usr
+    --libexecdir=libexec
+    --sysconfdir=/etc
+    --buildtype=plain
+  )
+
+  meson setup \
+    "${srcdir}/build" \
+    "${srcdir}/${_repo_name}" \
+    "${meson_options[@]}"
+  meson compile -C "${srcdir}/build"
+}
+
+package() {
+  meson install -C "${srcdir}/build" --destdir "${pkgdir}"
+  install -Dm644 \
+    "${srcdir}/${_repo_name}/packaging/arch/networkmanager-ms-sso.conf" \
+    "${pkgdir}/usr/lib/tmpfiles.d/networkmanager-ms-sso.conf"
+}

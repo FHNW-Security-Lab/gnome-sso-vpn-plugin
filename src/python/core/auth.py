@@ -166,6 +166,17 @@ def do_saml_auth(
             return False
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
+    def _ensure_writable_dir(path: str) -> bool:
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, ".write-test")
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
+            return True
+        except OSError:
+            return False
+
     force_ephemeral_browser_session = (
         _is_truthy(disable_browser_session_cache)
         or _is_truthy(os.environ.get("MS_SSO_DISABLE_BROWSER_SESSION_CACHE"))
@@ -197,25 +208,31 @@ def do_saml_auth(
             cache_dir = session_tmp_dir
             if debug:
                 print(f"    [DEBUG] Using ephemeral browser session dir: {cache_dir}")
-        elif real_user != "root":
-            cache_dir = os.path.join(home, ".cache", "ms-sso-openconnect", "browser-session")
         else:
             cache_dir = None
-            for base in ["/var/cache", "/tmp"]:
-                test_dir = os.path.join(base, "ms-sso-openconnect", "browser-session")
-                try:
-                    os.makedirs(test_dir, exist_ok=True)
-                    test_file = os.path.join(test_dir, ".write-test")
-                    with open(test_file, "w") as f:
-                        f.write("test")
-                    os.remove(test_file)
-                    cache_dir = test_dir
+            cache_candidates = []
+            if real_user != "root":
+                cache_candidates.append(
+                    os.path.join(home, ".cache", "ms-sso-openconnect", "browser-session")
+                )
+            cache_candidates.extend([
+                "/var/cache/ms-sso-openconnect/browser-session",
+                "/tmp/ms-sso-openconnect/browser-session",
+            ])
+
+            for candidate in cache_candidates:
+                if _ensure_writable_dir(candidate):
+                    cache_dir = candidate
+                    if debug:
+                        print(f"    [DEBUG] Using browser session dir: {cache_dir}")
                     break
-                except Exception:
-                    continue
+
             if not cache_dir:
-                cache_dir = f"/tmp/ms-sso-openconnect-{os.getpid()}/browser-session"
-        os.makedirs(cache_dir, exist_ok=True)
+                session_tmp_dir = tempfile.mkdtemp(prefix="ms-sso-openconnect-auth-")
+                cache_dir = os.path.join(session_tmp_dir, "browser-session")
+                os.makedirs(cache_dir, exist_ok=True)
+                if debug:
+                    print(f"    [DEBUG] Falling back to temporary browser session dir: {cache_dir}")
 
         context = p.chromium.launch_persistent_context(
             cache_dir,
