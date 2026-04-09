@@ -8,6 +8,7 @@ from typing import Optional
 
 from .cookies import store_cookies, clear_cookies
 from .config import PROTOCOLS
+from .platform_info import get_openconnect_binary
 
 # Terminal colors
 GREEN = "\033[32m"
@@ -91,6 +92,7 @@ def connect_vpn(
     print(f"\n{GREEN}Connecting to VPN...{NC}\n")
 
     proto_flag = PROTOCOLS.get(protocol, {}).get("flag", "anyconnect")
+    openconnect_bin = get_openconnect_binary(protocol)
 
     # Track which cookie type we're using for --usergroup
     gp_cookie_type = None
@@ -143,7 +145,7 @@ def connect_vpn(
 
     if use_stdin_cookie:
         cmd = [
-            "openconnect",
+            openconnect_bin,
             "--verbose",
             f"--protocol={proto_flag}",
             "--passwd-on-stdin",
@@ -151,7 +153,7 @@ def connect_vpn(
         ]
     else:
         cmd = [
-            "openconnect",
+            openconnect_bin,
             "--verbose",
             f"--protocol={proto_flag}",
             f"--cookie={cookie_str}",
@@ -171,7 +173,7 @@ def connect_vpn(
         cmd.insert(2, "--no-dtls")
 
     # Display command (for user visibility)
-    display_cmd = f"openconnect --verbose --protocol={proto_flag}"
+    display_cmd = f"{shlex.quote(openconnect_bin)} --verbose --protocol={proto_flag}"
     if no_dtls:
         display_cmd += " --no-dtls"
     if protocol == "gp":

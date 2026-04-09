@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import ssl
+import socket
 import tempfile
 import threading
 import time
@@ -18,6 +19,7 @@ from typing import Optional
 
 from playwright.sync_api import sync_playwright
 
+from .platform_info import get_gp_client_os, get_gp_os_version
 from .totp import generate_totp
 
 
@@ -76,9 +78,22 @@ def _detect_desktop_user() -> Optional[str]:
 
 def _get_gp_prelogin(server: str, debug: bool = False) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Get prelogin-cookie and SAML request for GlobalProtect."""
-    url = f"https://{server}/global-protect/prelogin.esp?tmp=tmp&clientVer=4100&clientos=Linux"
+    url = f"https://{server}/global-protect/prelogin.esp"
     retry_env = os.environ.get("MS_SSO_GP_PRELOGIN_RETRIES", "3").strip()
     delay_env = os.environ.get("MS_SSO_GP_PRELOGIN_DELAY", "2").strip()
+    client_os = get_gp_client_os()
+    os_version = get_gp_os_version()
+    host_id = socket.gethostname() or "localhost"
+    request_body = urllib.parse.urlencode({
+        "tmp": "tmp",
+        "clientVer": "4100",
+        "clientos": client_os,
+        "os-version": os_version,
+        "host-id": host_id,
+        "ipv6-support": "yes",
+        "default-browser": "1",
+        "cas-support": "yes",
+    }).encode("utf-8")
     try:
         retries = max(1, int(retry_env))
     except Exception:
@@ -92,11 +107,12 @@ def _get_gp_prelogin(server: str, debug: bool = False) -> tuple[Optional[str], O
     for attempt in range(1, retries + 1):
         try:
             ctx = ssl.create_default_context()
-            req = urllib.request.Request(url)
+            req = urllib.request.Request(url, data=request_body, method="POST")
             req.add_header("User-Agent", "PAN GlobalProtect")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
             with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
                 if resp.status != 200:
-                    return None, None, None
+                    raise Exception(f"prelogin.esp returned HTTP {resp.status}")
                 content = resp.read().decode("utf-8")
                 root = ET.fromstring(content)
                 prelogin_cookie = None
@@ -116,6 +132,36 @@ def _get_gp_prelogin(server: str, debug: bool = False) -> tuple[Optional[str], O
                 print(f"[DEBUG] prelogin.esp error (attempt {attempt}/{retries}): {e}")
             if attempt < retries:
                 time.sleep(retry_delay)
+
+    # Some portals are stricter and still expect the legacy GET prelogin call.
+    fallback_url = f"{url}?tmp=tmp&clientVer=4100&clientos={urllib.parse.quote(client_os)}"
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(fallback_url)
+        req.add_header("User-Agent", "PAN GlobalProtect")
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            if resp.status != 200:
+                raise Exception(f"legacy prelogin.esp returned HTTP {resp.status}")
+            content = resp.read().decode("utf-8")
+            root = ET.fromstring(content)
+            prelogin_cookie = None
+            saml_request = None
+            gateway_ip = None
+            for elem in root.iter():
+                if elem.tag == "prelogin-cookie":
+                    prelogin_cookie = elem.text
+                elif elem.tag == "saml-request":
+                    saml_request = elem.text
+                elif elem.tag == "server-ip":
+                    gateway_ip = elem.text
+            if debug:
+                print(
+                    "[DEBUG] Falling back to legacy GP prelogin request "
+                    f"(clientos={client_os}, os-version={os_version}, host-id={host_id})"
+                )
+            return prelogin_cookie, saml_request, gateway_ip
+    except Exception as fallback_err:
+        last_err = fallback_err
 
     if debug and last_err is not None:
         print(f"[DEBUG] prelogin.esp failed after {retries} attempts: {last_err}")

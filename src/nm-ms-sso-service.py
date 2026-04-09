@@ -115,6 +115,7 @@ from core.cookies import (
     get_nm_stored_cookies,
     clear_nm_cookies,
 )
+from core.platform_info import get_openconnect_binary
 
 
 # NetworkManager VPN Plugin D-Bus interface
@@ -1010,6 +1011,7 @@ class VPNPluginService(dbus.service.Object):
             # Connect to VPN
             # We use subprocess so we can monitor and return control
             proto_flag = PROTOCOLS.get(protocol, {}).get('flag', 'anyconnect')
+            openconnect_bin = get_openconnect_binary(protocol)
             resolve_arg = self._get_openconnect_resolve_arg()
             reconnect_arg = "--reconnect-timeout=300"
             dpd_arg = "--force-dpd=30"
@@ -1018,7 +1020,7 @@ class VPNPluginService(dbus.service.Object):
                 cookie_str = cookies.get('prelogin-cookie', '')
                 log.debug(f"Using GlobalProtect prelogin-cookie (len={len(cookie_str)})")
                 cmd = [
-                    "openconnect",
+                    openconnect_bin,
                     "--verbose",
                     f"--protocol={proto_flag}",
                     reconnect_arg,
@@ -1049,7 +1051,7 @@ class VPNPluginService(dbus.service.Object):
                 if len(cookie_str) > 40:
                     log.debug(f"Cookie preview: {cookie_str[:20]}...{cookie_str[-20:]}")
                 cmd = [
-                    "openconnect",
+                    openconnect_bin,
                     "--verbose",
                     f"--protocol={proto_flag}",
                     reconnect_arg,
@@ -1060,7 +1062,7 @@ class VPNPluginService(dbus.service.Object):
                 if resolve_arg:
                     cmd.insert(3, resolve_arg)
                 log.debug(
-                    "OpenConnect command: openconnect --verbose "
+                    f"OpenConnect command: {openconnect_bin} --verbose "
                     f"--protocol={proto_flag} --cookie=[redacted] {gateway}"
                 )
                 # Optional sensitive debug dump; disabled by default.
@@ -1080,6 +1082,8 @@ class VPNPluginService(dbus.service.Object):
                 )
 
             log.info(f"OpenConnect started (PID {self.vpn_process.pid})")
+            if openconnect_bin != "openconnect":
+                log.info(f"Using protocol-specific OpenConnect binary: {openconnect_bin}")
             if resolve_arg:
                 log.info(f"Using {resolve_arg} for OpenConnect reconnects")
 
