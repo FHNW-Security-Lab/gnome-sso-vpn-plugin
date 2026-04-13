@@ -663,6 +663,8 @@ class VPNPluginService(dbus.service.Object):
             anyconnect_wait_existing_auth_seconds = 0
             anyconnect_fresh_retries = 0
             anyconnect_retry_delay_seconds = 0
+            anyconnect_unstable_session_seconds = 0
+            anyconnect_fast_reconnect_retries = 0
             if protocol == 'anyconnect':
                 anyconnect_wait_existing_auth_seconds = self._parse_positive_int(
                     os.environ.get("MS_SSO_NM_ANYCONNECT_WAIT_AUTH_SECONDS"),
@@ -674,6 +676,14 @@ class VPNPluginService(dbus.service.Object):
                 )
                 anyconnect_retry_delay_seconds = self._parse_positive_int(
                     os.environ.get("MS_SSO_NM_ANYCONNECT_RETRY_DELAY_SECONDS"),
+                    2,
+                )
+                anyconnect_unstable_session_seconds = self._parse_positive_int(
+                    os.environ.get("MS_SSO_NM_ANYCONNECT_UNSTABLE_SESSION_SECONDS"),
+                    20,
+                )
+                anyconnect_fast_reconnect_retries = self._parse_positive_int(
+                    os.environ.get("MS_SSO_NM_ANYCONNECT_FAST_RECONNECT_RETRIES"),
                     2,
                 )
             log.info(
@@ -691,8 +701,15 @@ class VPNPluginService(dbus.service.Object):
                     "AnyConnect wait-for-existing-auth window: "
                     f"{anyconnect_wait_existing_auth_seconds}s"
                 )
+                log.info(
+                    "AnyConnect unstable-session handling: "
+                    f"threshold={anyconnect_unstable_session_seconds}s, "
+                    f"fast-retries={anyconnect_fast_reconnect_retries}"
+                )
 
             reconnect_attempt = 0
+            anyconnect_fast_reconnect_attempt = 0
+            force_fresh_auth = False
             saml_keepalive_seconds = self._parse_positive_int(
                 os.environ.get("MS_SSO_NM_AUTH_KEEPALIVE_SECONDS"),
                 self._parse_positive_int(
@@ -707,6 +724,7 @@ class VPNPluginService(dbus.service.Object):
                 connection_ended = False
                 connection_uptime_seconds = 0
                 final_error = None
+                session_used_cache = False
 
                 for attempt in range(max_attempts):
                     log.info(f"Connection attempt {attempt + 1}/{max_attempts}")
@@ -718,7 +736,9 @@ class VPNPluginService(dbus.service.Object):
                     cookies = None
                     used_cache = False
 
-                    if attempt == 0 and skip_gp_cookie_cache:
+                    if attempt == 0 and force_fresh_auth:
+                        log.info("Skipping cached cookies for this cycle; forcing fresh authentication")
+                    elif attempt == 0 and skip_gp_cookie_cache:
                         log.info("GlobalProtect cookie cache disabled by configuration; forcing fresh authentication")
                     elif attempt == 0 and disable_cookie_cache:
                         log.info("Cookie cache disabled; forcing fresh authentication")
@@ -882,6 +902,7 @@ class VPNPluginService(dbus.service.Object):
                     if success:
                         connection_ended = True
                         connection_uptime_seconds = uptime_seconds
+                        session_used_cache = used_cache
                         log.info("VPN connection established and later ended")
                         break
                     elif used_cache and attempt < max_attempts - 1:
@@ -945,6 +966,35 @@ class VPNPluginService(dbus.service.Object):
                     continue
 
                 # Connection was up and then ended (e.g., network loss/session timeout).
+                if (
+                    protocol == 'anyconnect'
+                    and anyconnect_unstable_session_seconds > 0
+                    and 0 < connection_uptime_seconds < anyconnect_unstable_session_seconds
+                ):
+                    if session_used_cache:
+                        clear_nm_cookies(connection_name)
+                        force_fresh_auth = True
+                    else:
+                        force_fresh_auth = False
+
+                    if anyconnect_fast_reconnect_attempt < anyconnect_fast_reconnect_retries:
+                        anyconnect_fast_reconnect_attempt += 1
+                        delay_seconds = max(1, anyconnect_retry_delay_seconds)
+                        log.warning(
+                            "AnyConnect tunnel ended shortly after connect "
+                            f"(uptime={connection_uptime_seconds}s < {anyconnect_unstable_session_seconds}s); "
+                            f"retrying quickly in {delay_seconds}s "
+                            f"(fast attempt {anyconnect_fast_reconnect_attempt}/{anyconnect_fast_reconnect_retries})"
+                        )
+                        self._cleanup_dns()
+                        GLib.idle_add(self._emit_started_keepalive)
+                        GLib.idle_add(self._emit_initial_config)
+                        if not self._interruptible_sleep(delay_seconds, connect_generation):
+                            return
+                        continue
+
+                anyconnect_fast_reconnect_attempt = 0
+                force_fresh_auth = False
                 if connection_uptime_seconds >= reconnect_reset_seconds:
                     reconnect_attempt = 0
                 else:
@@ -1186,6 +1236,24 @@ class VPNPluginService(dbus.service.Object):
                 os.environ.get("MS_SSO_NM_GATEWAY_PROBE_FAIL_LIMIT"),
                 3,
             ))
+            gateway_probe_enabled = self._parse_bool(
+                os.environ.get(
+                    "MS_SSO_NM_ANYCONNECT_GATEWAY_PROBE"
+                    if protocol == 'anyconnect'
+                    else "MS_SSO_NM_GP_GATEWAY_PROBE"
+                )
+            )
+            if gateway_probe_enabled is None:
+                gateway_probe_enabled = self._parse_bool(
+                    os.environ.get("MS_SSO_NM_GATEWAY_PROBE")
+                )
+            if gateway_probe_enabled is None:
+                gateway_probe_enabled = protocol != 'anyconnect'
+            log.info(
+                "Gateway probe watchdog: "
+                f"{'enabled' if gateway_probe_enabled else 'disabled'} "
+                f"(timeout={gateway_probe_timeout}s, fail-limit={gateway_probe_fail_limit})"
+            )
             gateway_probe_failures = 0
             while self.vpn_process.poll() is None:
                 if self._is_connect_cancelled(connect_generation):
@@ -1218,21 +1286,22 @@ class VPNPluginService(dbus.service.Object):
                     else:
                         missing_tun_checks = 0
 
-                if self._probe_gateway(timeout_seconds=float(gateway_probe_timeout)):
-                    gateway_probe_failures = 0
-                else:
-                    gateway_probe_failures += 1
-                    log.warning(
-                        "Watchdog: gateway probe failed "
-                        f"({gateway_probe_failures}/{gateway_probe_fail_limit})"
-                    )
-                    if gateway_probe_failures >= gateway_probe_fail_limit:
-                        log.warning("Watchdog: uplink to VPN gateway appears down; restarting connection")
-                        try:
-                            self._stop_vpn_process(preserve_session=True, force=True)
-                        except Exception:
-                            pass
-                        break
+                if gateway_probe_enabled:
+                    if self._probe_gateway(timeout_seconds=float(gateway_probe_timeout)):
+                        gateway_probe_failures = 0
+                    else:
+                        gateway_probe_failures += 1
+                        log.warning(
+                            "Watchdog: gateway probe failed "
+                            f"({gateway_probe_failures}/{gateway_probe_fail_limit})"
+                        )
+                        if gateway_probe_failures >= gateway_probe_fail_limit:
+                            log.warning("Watchdog: uplink to VPN gateway appears down; restarting connection")
+                            try:
+                                self._stop_vpn_process(preserve_session=True, force=True)
+                            except Exception:
+                                pass
+                            break
                 time.sleep(watch_interval)
 
             # Wait for process to fully exit and report uptime
