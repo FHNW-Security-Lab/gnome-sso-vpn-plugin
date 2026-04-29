@@ -453,6 +453,73 @@ class VPNPluginService(dbus.service.Object):
 
         return output_buffer, openconnect_reported_up
 
+    def _get_tun_ipv4_config(self, tun_dev: str):
+        """Return (ip, prefix) for a tunnel device, or (None, 32)."""
+        try:
+            result = subprocess.run(
+                ['ip', '-4', 'addr', 'show', tun_dev],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as e:
+            log.warning(f"Could not read IPv4 config for {tun_dev}: {e}")
+            return None, 32
+
+        ip_addr = None
+        prefix = 32
+        for line in result.stdout.split('\n'):
+            if 'inet ' not in line:
+                continue
+            parts = line.strip().split()
+            if len(parts) < 2:
+                continue
+            addr_prefix = parts[1]
+            if '/' in addr_prefix:
+                ip_addr, prefix_str = addr_prefix.split('/', 1)
+                try:
+                    prefix = int(prefix_str)
+                except Exception:
+                    prefix = 32
+            else:
+                ip_addr = addr_prefix
+            break
+
+        return ip_addr, prefix
+
+    def _wait_for_usable_tunnel(
+            self,
+            protocol: str,
+            tun_dev: str,
+            connect_generation: Optional[int],
+            min_stable_seconds: int = 0,
+            timeout_seconds: int = 8,
+    ):
+        """Wait until the tunnel has IPv4 config and survives an optional stability window."""
+        deadline = time.monotonic() + max(1, timeout_seconds)
+        stable_since = None
+
+        while time.monotonic() < deadline:
+            if self._is_connect_cancelled(connect_generation):
+                return False, "Connect cancelled while validating tunnel", None, 32
+            if self.vpn_process and self.vpn_process.poll() is not None:
+                return False, "OpenConnect exited while validating tunnel", None, 32
+
+            ip_addr, prefix = self._get_tun_ipv4_config(tun_dev)
+            if ip_addr:
+                if min_stable_seconds <= 0:
+                    return True, None, ip_addr, prefix
+                if stable_since is None:
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= min_stable_seconds:
+                    return True, None, ip_addr, prefix
+            else:
+                stable_since = None
+
+            time.sleep(0.5)
+
+        return False, f"Tunnel {tun_dev} did not become usable with IPv4 config", None, 32
+
     def _stop_vpn_process(self, preserve_session: bool = True, force: bool = False) -> None:
         """Stop OpenConnect while letting vpnc-script clean up when possible."""
         if not self.vpn_process or self.vpn_process.poll() is not None:
@@ -905,6 +972,7 @@ class VPNPluginService(dbus.service.Object):
                         protocol,
                         cookies,
                         username,
+                        used_cache=used_cache,
                         connect_generation=connect_generation,
                         watchdog_interval_seconds=watchdog_interval_seconds,
                         watchdog_missing_tun_limit=watchdog_missing_tun_limit,
@@ -1057,6 +1125,7 @@ class VPNPluginService(dbus.service.Object):
             protocol,
             cookies,
             username=None,
+            used_cache=False,
             connect_generation: Optional[int] = None,
             watchdog_interval_seconds=5,
             watchdog_missing_tun_limit=3,
@@ -1230,8 +1299,33 @@ class VPNPluginService(dbus.service.Object):
                     return (False, "Cookie rejected by server", 0)
                 return (False, f"VPN connection timeout after {timeout}s", 0)
 
-            # Give vpnc-script a moment to configure DNS
-            time.sleep(1)
+            # A tun device alone is not enough. Cached AnyConnect cookies can
+            # sometimes produce a half-up tunnel that leaves DNS/routes slow or
+            # broken. Only report STARTED after IPv4 config exists, and require
+            # cached-cookie tunnels to survive a short stability window.
+            stable_seconds = self._parse_positive_int(
+                os.environ.get("MS_SSO_NM_ANYCONNECT_CACHE_STABLE_SECONDS"),
+                3 if protocol == 'anyconnect' and used_cache else 0,
+            )
+            usable, unusable_reason, ip_addr, prefix = self._wait_for_usable_tunnel(
+                protocol,
+                self.current_tun_device,
+                connect_generation,
+                min_stable_seconds=stable_seconds,
+            )
+            if not usable:
+                log.warning(f"VPN tunnel is not usable: {unusable_reason}")
+                try:
+                    if self.vpn_process and self.vpn_process.poll() is None:
+                        self._stop_vpn_process(preserve_session=True, force=True)
+                except Exception:
+                    pass
+                self._cleanup_dns()
+                if protocol == 'anyconnect' and used_cache:
+                    return (False, "Cached cookie produced an unusable tunnel", 0)
+                return (False, unusable_reason or "VPN tunnel is not usable", 0)
+
+            log.info(f"Validated tunnel {self.current_tun_device}: {ip_addr}/{prefix}")
 
             log.info(f"VPN DNS servers captured: {self.vpn_dns_servers}")
 
@@ -1656,23 +1750,18 @@ class VPNPluginService(dbus.service.Object):
             log.info(f"Emitting config for {tun_dev}, gateway {gateway}")
 
             # Get IP address from interface
-            result = subprocess.run(['ip', '-4', 'addr', 'show', tun_dev], capture_output=True, text=True)
-            ip_addr = None
-            prefix = 32
-            for line in result.stdout.split('\n'):
-                if 'inet ' in line:
-                    # Format: "inet 10.x.x.x/24 ..."
-                    parts = line.strip().split()
-                    if len(parts) >= 2:
-                        addr_prefix = parts[1]
-                        if '/' in addr_prefix:
-                            ip_addr, prefix_str = addr_prefix.split('/')
-                            prefix = int(prefix_str)
-                        else:
-                            ip_addr = addr_prefix
-                        break
-
+            ip_addr, prefix = self._get_tun_ipv4_config(tun_dev)
             log.info(f"Detected IP: {ip_addr}/{prefix}")
+            if not ip_addr:
+                log.warning(f"Refusing to emit connected state for {tun_dev}: no IPv4 address")
+                try:
+                    if self.vpn_process and self.vpn_process.poll() is None:
+                        self._stop_vpn_process(preserve_session=True, force=True)
+                except Exception:
+                    pass
+                self._cleanup_dns()
+                self._set_state(NM_VPN_SERVICE_STATE_STARTING)
+                return False
 
             # Use pre-resolved gateway IP (resolved before VPN connected, when external DNS was available)
             gateway_ip = getattr(self, 'current_gateway_ip', None)
