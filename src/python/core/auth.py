@@ -396,22 +396,51 @@ def do_saml_auth(
                 return True
             return False
 
+        def _has_usable_auth_artifact(cookies: Optional[dict[str, str]] = None) -> bool:
+            cookies = cookies or {}
+            if protocol == "anyconnect":
+                if saml_result.get("saml_response"):
+                    return True
+                if cookies.get("SAMLResponse"):
+                    return True
+                return bool(
+                    cookies.get("webvpn")
+                    and (cookies.get("webvpnc") or cookies.get("webvpnaac") or cookies.get("SVPNCOOKIE"))
+                )
+            return bool(
+                saml_result.get("prelogin_cookie")
+                or saml_result.get("portal_userauthcookie")
+                or cookies.get("prelogin-cookie")
+                or cookies.get("portal-userauthcookie")
+                or cookies.get("SVPNCOOKIE")
+            )
+
+        def _auth_capture_complete() -> bool:
+            if protocol == "anyconnect":
+                return bool(saml_result.get("saml_response"))
+            return bool(
+                saml_result.get("prelogin_cookie")
+                or saml_result.get("portal_userauthcookie")
+            )
+
         vpn_request_event = threading.Event()
         ui_change_event = threading.Event()
 
         def _wait_for_vpn_callback(timeout_ms: int = 60000) -> None:
-            if _is_vpn_url(page.url):
+            if _is_vpn_url(page.url) and protocol != "anyconnect":
                 return
-            if saml_result.get("saml_response") or saml_result.get("prelogin_cookie") or saml_result.get("portal_userauthcookie"):
+            if _auth_capture_complete():
                 return
             deadline = time.time() + (timeout_ms / 1000.0)
             while time.time() < deadline:
-                if saml_result.get("saml_response") or saml_result.get("prelogin_cookie") or saml_result.get("portal_userauthcookie"):
+                if _auth_capture_complete():
                     return
-                if _is_vpn_url(page.url):
+                if _is_vpn_url(page.url) and protocol != "anyconnect":
                     return
                 if vpn_request_event.wait(timeout=0.05):
-                    return
+                    if protocol != "anyconnect" or _auth_capture_complete():
+                        return
+                    vpn_request_event.clear()
 
         def handle_request(request):
             if _is_vpn_url(request.url):
@@ -790,10 +819,7 @@ def do_saml_auth(
                         session_cookies[c["name"]] = c["value"]
 
                 has_session = (
-                    session_cookies.get("webvpn")
-                    or session_cookies.get("SVPNCOOKIE")
-                    or saml_result.get("saml_response")
-                    or saml_result.get("prelogin_cookie")
+                    _has_usable_auth_artifact(session_cookies)
                 )
                 if has_session:
                     print("  -> Already authenticated (SSO session valid)")
@@ -816,9 +842,9 @@ def do_saml_auth(
                 timeout_seconds = max(timeout_seconds, 180)
             deadline = time.time() + timeout_seconds
             while time.time() < deadline:
-                if saml_result.get("saml_response") or saml_result.get("prelogin_cookie") or saml_result.get("portal_userauthcookie"):
+                if _auth_capture_complete():
                     break
-                if _is_vpn_url(page.url):
+                if _is_vpn_url(page.url) and protocol != "anyconnect":
                     break
 
                 progressed = False
@@ -1017,6 +1043,13 @@ def do_saml_auth(
 
             # Avoid returning only helper metadata without a real auth artifact
             if set(vpn_cookies.keys()) == {"_gateway_ip"}:
+                vpn_cookies = {}
+            if protocol == "anyconnect" and not _has_usable_auth_artifact(vpn_cookies):
+                if debug:
+                    print(
+                        "    [DEBUG] Ignoring incomplete AnyConnect auth result "
+                        f"(cookies={list(vpn_cookies.keys())})"
+                    )
                 vpn_cookies = {}
 
             if debug:
