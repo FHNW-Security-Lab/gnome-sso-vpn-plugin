@@ -29,6 +29,7 @@ static const SecretSchema ms_sso_schema = {
 #define KEY_GATEWAY        "gateway"
 #define KEY_PROTOCOL       "protocol"
 #define KEY_USERNAME       "username"
+#define KEY_GP_OS_VERSION  "gp-os-version"
 
 /* Secret keys */
 #define KEY_PASSWORD       "password"
@@ -48,6 +49,7 @@ struct _MsSsoEditorPrivate {
     GtkEntry *gateway;
     GtkDropDown *protocol;
     GtkEntry *username;
+    GtkEntry *gp_os_version;
     GtkPasswordEntry *password;
     GtkPasswordEntry *totp_secret;
 
@@ -213,6 +215,7 @@ update_connection(NMVpnEditor *editor, NMConnection *connection, GError **error)
     NMSettingConnection *s_con;
     const char *gateway;
     const char *username;
+    const char *gp_os_version;
     const char *password;
     const char *totp_secret;
     const char *connection_id;
@@ -222,6 +225,7 @@ update_connection(NMVpnEditor *editor, NMConnection *connection, GError **error)
     /* Get values from widgets */
     gateway = gtk_editable_get_text(GTK_EDITABLE(priv->gateway));
     username = gtk_editable_get_text(GTK_EDITABLE(priv->username));
+    gp_os_version = gtk_editable_get_text(GTK_EDITABLE(priv->gp_os_version));
     password = gtk_editable_get_text(GTK_EDITABLE(priv->password));
     totp_secret = gtk_editable_get_text(GTK_EDITABLE(priv->totp_secret));
     protocol_idx = gtk_drop_down_get_selected(priv->protocol);
@@ -253,6 +257,10 @@ update_connection(NMVpnEditor *editor, NMConnection *connection, GError **error)
     /* Set data items */
     nm_setting_vpn_add_data_item(s_vpn, KEY_GATEWAY, gateway);
     nm_setting_vpn_add_data_item(s_vpn, KEY_USERNAME, username);
+    if (gp_os_version && *gp_os_version)
+        nm_setting_vpn_add_data_item(s_vpn, KEY_GP_OS_VERSION, gp_os_version);
+    else
+        nm_setting_vpn_remove_data_item(s_vpn, KEY_GP_OS_VERSION);
 
     /* Set protocol */
     protocol = (protocol_idx == 0) ? PROTO_ANYCONNECT : PROTO_GP;
@@ -339,6 +347,22 @@ create_editor_widget(MsSsoEditor *self)
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(priv->username), 1, row, 1, 1);
     row++;
 
+    /* GlobalProtect OS Version */
+    label = gtk_label_new("GP OS Version:");
+    gtk_widget_set_halign(label, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(grid), label, 0, row, 1, 1);
+
+    priv->gp_os_version = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(priv->gp_os_version, "Ubuntu 26.04");
+    gtk_widget_set_tooltip_text(
+        GTK_WIDGET(priv->gp_os_version),
+        "OS version string reported to GlobalProtect prelogin and HIP. Leave empty for the default."
+    );
+    gtk_widget_set_hexpand(GTK_WIDGET(priv->gp_os_version), TRUE);
+    g_signal_connect(priv->gp_os_version, "changed", G_CALLBACK(stuff_changed_cb), self);
+    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(priv->gp_os_version), 1, row, 1, 1);
+    row++;
+
     /* Password */
     label = gtk_label_new("Password:");
     gtk_widget_set_halign(label, GTK_ALIGN_END);
@@ -387,6 +411,7 @@ load_connection(MsSsoEditor *self, NMConnection *connection)
     const char *gateway;
     const char *protocol;
     const char *username;
+    const char *gp_os_version;
     const char *password;
     const char *totp_secret;
     const char *connection_uuid;
@@ -420,6 +445,10 @@ load_connection(MsSsoEditor *self, NMConnection *connection)
     username = nm_setting_vpn_get_data_item(s_vpn, KEY_USERNAME);
     if (username)
         gtk_editable_set_text(GTK_EDITABLE(priv->username), username);
+
+    gp_os_version = nm_setting_vpn_get_data_item(s_vpn, KEY_GP_OS_VERSION);
+    if (gp_os_version)
+        gtk_editable_set_text(GTK_EDITABLE(priv->gp_os_version), gp_os_version);
 
     /* Load secrets - try NM first, then keyring */
     password = nm_setting_vpn_get_secret(s_vpn, KEY_PASSWORD);

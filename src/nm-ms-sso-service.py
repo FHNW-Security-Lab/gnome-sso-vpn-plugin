@@ -233,6 +233,7 @@ class VPNPluginService(dbus.service.Object):
         secrets['gateway'] = vpn_data.get('gateway', '')
         secrets['protocol'] = vpn_data.get('protocol', 'anyconnect')
         secrets['username'] = vpn_data.get('username', '')
+        secrets['gp_os_version'] = vpn_data.get('gp-os-version', '')
         secrets['disable_cookie_cache'] = vpn_data.get('disable-cookie-cache', '')
         secrets['disable_browser_session_cache'] = vpn_data.get('disable-browser-session-cache', '')
         secrets['enable_browser_session_cache'] = vpn_data.get('enable-browser-session-cache', '')
@@ -596,6 +597,7 @@ class VPNPluginService(dbus.service.Object):
             username = secrets['username']
             password = secrets['password']
             totp_secret = secrets['totp_secret']
+            gp_os_version = (secrets.get('gp_os_version') or '').strip()
             disable_cookie_cache = (
                 self._is_truthy(secrets.get('disable_cookie_cache'))
                 or self._is_truthy(os.environ.get("MS_SSO_NM_DISABLE_COOKIE_CACHE"))
@@ -634,6 +636,8 @@ class VPNPluginService(dbus.service.Object):
 
             log.info(f"Connecting to {gateway} via {protocol}")
             log.info(f"Username: {username}")
+            if protocol == 'gp':
+                log.info(f"GlobalProtect OS version: {gp_os_version or get_gp_os_version()}")
             log.debug(f"Password: {'(set)' if password else '(not set)'}")
             log.debug(f"TOTP: {'(set)' if totp_secret else '(not set)'}")
 
@@ -925,6 +929,7 @@ class VPNPluginService(dbus.service.Object):
                                 debug=True,  # Enable debug to see screenshots
                                 protocol=protocol,  # Pass protocol for correct SAML URL
                                 disable_browser_session_cache=disable_browser_session_cache,
+                                gp_os_version=gp_os_version or None,
                             )
                             log.info(f"SAML auth returned cookies: {list(cookies.keys()) if cookies else 'none'}")
                             # Optional sensitive debug dump; disabled by default.
@@ -973,6 +978,7 @@ class VPNPluginService(dbus.service.Object):
                         cookies,
                         username,
                         used_cache=used_cache,
+                        gp_os_version=gp_os_version,
                         connect_generation=connect_generation,
                         watchdog_interval_seconds=watchdog_interval_seconds,
                         watchdog_missing_tun_limit=watchdog_missing_tun_limit,
@@ -1126,6 +1132,7 @@ class VPNPluginService(dbus.service.Object):
             cookies,
             username=None,
             used_cache=False,
+            gp_os_version=None,
             connect_generation: Optional[int] = None,
             watchdog_interval_seconds=5,
             watchdog_missing_tun_limit=3,
@@ -1153,7 +1160,10 @@ class VPNPluginService(dbus.service.Object):
             if protocol == 'gp' and 'prelogin-cookie' in cookies:
                 cookie_str = cookies.get('prelogin-cookie', '')
                 gp_env = os.environ.copy()
-                gp_env.setdefault("MS_SSO_GP_OS_VERSION", get_gp_os_version())
+                if gp_os_version:
+                    gp_env["MS_SSO_GP_OS_VERSION"] = gp_os_version
+                else:
+                    gp_env.setdefault("MS_SSO_GP_OS_VERSION", get_gp_os_version())
                 gp_hip_wrapper = get_gp_hip_report_wrapper()
                 log.debug(f"Using GlobalProtect prelogin-cookie (len={len(cookie_str)})")
                 cmd = [

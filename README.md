@@ -65,6 +65,20 @@ sudo rm -rf /var/cache/ms-playwright /var/cache/ms-sso-openconnect
 If you also want to remove the configured VPN connection, delete it from
 NetworkManager or with `nmcli connection delete "<connection name>"`.
 
+## GlobalProtect OS Version
+
+For GlobalProtect, OpenConnect's `--os` option only accepts broad values such
+as `linux-64`; it cannot be set to a distro string. Configure the distro/version
+reported to GlobalProtect in the VPN editor's `GP OS Version` field. The value
+is sent as the prelogin `os-version` and in the HIP report. Empty uses the
+default `Ubuntu 26.04`.
+
+The same value can be configured with `nmcli`:
+
+```bash
+nmcli connection modify "<connection name>" +vpn.data gp-os-version "Ubuntu 26.04"
+```
+
 ## Nix Flake Usage
 
 Build package:

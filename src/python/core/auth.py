@@ -78,13 +78,17 @@ def _detect_desktop_user() -> Optional[str]:
     return None
 
 
-def _get_gp_prelogin(server: str, debug: bool = False) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _get_gp_prelogin(
+    server: str,
+    debug: bool = False,
+    gp_os_version: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Get prelogin-cookie and SAML request for GlobalProtect."""
     url = f"https://{server}/global-protect/prelogin.esp"
     retry_env = os.environ.get("MS_SSO_GP_PRELOGIN_RETRIES", "3").strip()
     delay_env = os.environ.get("MS_SSO_GP_PRELOGIN_DELAY", "2").strip()
     client_os = get_gp_client_os()
-    os_version = get_gp_os_version()
+    os_version = gp_os_version or get_gp_os_version()
     host_id = socket.gethostname() or "localhost"
     request_body = urllib.parse.urlencode({
         "tmp": "tmp",
@@ -181,6 +185,7 @@ def do_saml_auth(
     debug: bool = False,
     vpn_server_ip: Optional[str] = None,
     disable_browser_session_cache: bool = False,
+    gp_os_version: Optional[str] = None,
 ):
     """Complete Microsoft SAML authentication and return cookies."""
     vpn_server_raw = vpn_server
@@ -197,7 +202,11 @@ def do_saml_auth(
     gp_prelogin_cookie, gp_saml_request, gp_gateway_ip = None, None, None
     if protocol == "gp":
         print("  [1/6] Getting GlobalProtect prelogin info...")
-        gp_prelogin_cookie, gp_saml_request, gp_gateway_ip = _get_gp_prelogin(vpn_server, debug)
+        gp_prelogin_cookie, gp_saml_request, gp_gateway_ip = _get_gp_prelogin(
+            vpn_server,
+            debug,
+            gp_os_version=gp_os_version,
+        )
         if debug:
             print(f"    [DEBUG] prelogin-cookie: {gp_prelogin_cookie[:20] if gp_prelogin_cookie else None}...")
             print(f"    [DEBUG] gateway_ip: {gp_gateway_ip}")
