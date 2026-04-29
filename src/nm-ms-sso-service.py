@@ -620,6 +620,7 @@ class VPNPluginService(dbus.service.Object):
             disable_browser_session_cache = (
                 self._is_truthy(secrets.get('disable_browser_session_cache'))
                 or self._is_truthy(os.environ.get("MS_SSO_NM_DISABLE_BROWSER_SESSION_CACHE"))
+                or (protocol == 'gp' and not force_enable_browser_session_cache)
             )
             if force_enable_browser_session_cache:
                 disable_browser_session_cache = False
@@ -627,6 +628,11 @@ class VPNPluginService(dbus.service.Object):
                 "Browser session cache: "
                 f"{'disabled' if disable_browser_session_cache else 'enabled'}"
             )
+            if protocol == 'gp' and disable_browser_session_cache and not force_enable_browser_session_cache:
+                log.info(
+                    "GlobalProtect uses a fresh browser session by default; "
+                    "set enable-browser-session-cache=1 to reuse SSO browser state"
+                )
 
             if not gateway:
                 raise Exception("No gateway specified")
