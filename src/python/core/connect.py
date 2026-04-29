@@ -8,7 +8,7 @@ from typing import Optional
 
 from .cookies import store_cookies, clear_cookies
 from .config import PROTOCOLS
-from .platform_info import get_openconnect_binary
+from .platform_info import get_gp_hip_report_wrapper, get_gp_os_version, get_openconnect_binary
 
 # Terminal colors
 GREEN = "\033[32m"
@@ -161,9 +161,16 @@ def connect_vpn(
         ]
 
     # Add options for GlobalProtect
+    gp_env = None
+    gp_hip_wrapper = None
     if protocol == "gp":
+        gp_env = os.environ.copy()
+        gp_env.setdefault("MS_SSO_GP_OS_VERSION", get_gp_os_version())
+        gp_hip_wrapper = get_gp_hip_report_wrapper()
         cmd.insert(2, "--os=linux-64")
         cmd.insert(2, "--useragent=PAN GlobalProtect")
+        if gp_hip_wrapper:
+            cmd.insert(2, f"--csd-wrapper={gp_hip_wrapper}")
         if username:
             cmd.insert(2, f"--user={username}")
         if gp_cookie_type:
@@ -178,6 +185,8 @@ def connect_vpn(
         display_cmd += " --no-dtls"
     if protocol == "gp":
         display_cmd += " --useragent='PAN GlobalProtect' --os=linux-64"
+        if gp_hip_wrapper:
+            display_cmd += f" --csd-wrapper={gp_hip_wrapper}"
         if gp_cookie_type:
             display_cmd += f" --usergroup={gp_cookie_type}"
         if username:
@@ -213,6 +222,7 @@ def connect_vpn(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=gp_env,
         )
         os.close(read_fd)
 
@@ -244,7 +254,7 @@ def connect_vpn(
             priv_cmd = ["pkexec"] + cmd
         else:
             priv_cmd = ["sudo"] + cmd
-        process = subprocess.Popen(priv_cmd)
+        process = subprocess.Popen(priv_cmd, env=gp_env)
         returncode = process.wait()
 
     if returncode != 0:

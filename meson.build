@@ -57,6 +57,15 @@ install_data('src/nm-ms-sso-auth-dialog.py',
   install_mode: 'rwxr-xr-x',
 )
 
+# Install GlobalProtect HIP wrapper. Stock OpenConnect's HIP script reports a
+# hardcoded Linux distro; this wrapper keeps the GP prelogin and HIP OS strings
+# consistent.
+install_data('src/nm-ms-sso-gp-hipreport.py',
+  rename: 'nm-ms-sso-gp-hipreport',
+  install_dir: libexecdir,
+  install_mode: 'rwxr-xr-x',
+)
+
 # Install plugin registration file
 install_data('data/nm-ms-sso-service.name',
   install_dir: nm_vpnservicedir,

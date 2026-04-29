@@ -115,7 +115,7 @@ from core.cookies import (
     get_nm_stored_cookies,
     clear_nm_cookies,
 )
-from core.platform_info import get_openconnect_binary
+from core.platform_info import get_gp_hip_report_wrapper, get_gp_os_version, get_openconnect_binary
 
 
 # NetworkManager VPN Plugin D-Bus interface
@@ -1152,6 +1152,9 @@ class VPNPluginService(dbus.service.Object):
 
             if protocol == 'gp' and 'prelogin-cookie' in cookies:
                 cookie_str = cookies.get('prelogin-cookie', '')
+                gp_env = os.environ.copy()
+                gp_env.setdefault("MS_SSO_GP_OS_VERSION", get_gp_os_version())
+                gp_hip_wrapper = get_gp_hip_report_wrapper()
                 log.debug(f"Using GlobalProtect prelogin-cookie (len={len(cookie_str)})")
                 cmd = [
                     openconnect_bin,
@@ -1165,6 +1168,12 @@ class VPNPluginService(dbus.service.Object):
                     "--os=linux-64",
                     gateway,
                 ]
+                if gp_hip_wrapper:
+                    cmd.insert(-1, f"--csd-wrapper={gp_hip_wrapper}")
+                    log.info(
+                        "Using GlobalProtect HIP wrapper: "
+                        f"{gp_hip_wrapper} (OS={gp_env.get('MS_SSO_GP_OS_VERSION')})"
+                    )
                 if resolve_arg:
                     cmd.insert(3, resolve_arg)
                 # Add username if available (required for GlobalProtect)
@@ -1174,7 +1183,8 @@ class VPNPluginService(dbus.service.Object):
                     cmd,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT
+                    stderr=subprocess.STDOUT,
+                    env=gp_env,
                 )
                 self.vpn_process.stdin.write(f"{cookie_str}\n".encode())
                 self.vpn_process.stdin.flush()

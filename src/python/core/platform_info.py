@@ -8,6 +8,9 @@ import subprocess
 from typing import Optional
 
 
+DEFAULT_GP_OS_VERSION = "Ubuntu 26.04"
+
+
 def _read_os_release_pretty_name() -> Optional[str]:
     try:
         with open("/etc/os-release", "r", encoding="utf-8") as f:
@@ -55,11 +58,19 @@ def get_gp_client_os() -> str:
 
 
 def get_gp_os_version() -> str:
-    """Return a truthful OS version string for GlobalProtect prelogin."""
+    """Return the OS version string reported to GlobalProtect."""
     configured = (os.environ.get("MS_SSO_GP_OS_VERSION") or "").strip()
     if configured:
-        return configured
+        if configured.lower() != "auto":
+            return configured
+        detected = _detect_os_version()
+        if detected:
+            return detected
 
+    return DEFAULT_GP_OS_VERSION
+
+
+def _detect_os_version() -> Optional[str]:
     detected = _run_first_success(
         [
             ["lsb_release", "-ds"],
@@ -81,6 +92,23 @@ def get_gp_os_version() -> str:
         return detected
 
     return platform.platform()
+
+
+def get_gp_hip_report_wrapper() -> Optional[str]:
+    """Return the HIP report wrapper path for GlobalProtect, when available."""
+    configured = (os.environ.get("MS_SSO_GP_HIP_REPORT_WRAPPER") or "").strip()
+    if configured:
+        return configured
+
+    candidates = [
+        "/usr/libexec/nm-ms-sso-gp-hipreport",
+        "/usr/local/libexec/nm-ms-sso-gp-hipreport",
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
+    return None
 
 
 def get_openconnect_binary(protocol: str) -> str:
