@@ -649,11 +649,15 @@ class VPNPluginService(dbus.service.Object):
                     self._parse_positive_int(os.environ.get("MS_SSO_NM_RECONNECT_MAX_DELAY_SECONDS"), 60),
                 ),
             )
+            reconnect_default_max_attempts = 0 if protocol == 'anyconnect' else 5
             reconnect_max_attempts = self._parse_positive_int(
                 secrets.get('reconnect_max_attempts'),
                 self._parse_positive_int(
                     os.environ.get("MS_SSO_NM_GP_RECONNECT_MAX_ATTEMPTS") if protocol == 'gp' else None,
-                    self._parse_positive_int(os.environ.get("MS_SSO_NM_RECONNECT_MAX_ATTEMPTS"), 5),
+                    self._parse_positive_int(
+                        os.environ.get("MS_SSO_NM_RECONNECT_MAX_ATTEMPTS"),
+                        reconnect_default_max_attempts,
+                    ),
                 ),
             )
             reconnect_limit_label = "inf" if reconnect_max_attempts == 0 else str(reconnect_max_attempts)
@@ -672,7 +676,7 @@ class VPNPluginService(dbus.service.Object):
                 )
                 anyconnect_fresh_retries = self._parse_positive_int(
                     os.environ.get("MS_SSO_NM_ANYCONNECT_FRESH_RETRIES"),
-                    1,
+                    0,
                 )
                 anyconnect_retry_delay_seconds = self._parse_positive_int(
                     os.environ.get("MS_SSO_NM_ANYCONNECT_RETRY_DELAY_SECONDS"),
@@ -725,6 +729,7 @@ class VPNPluginService(dbus.service.Object):
                 connection_uptime_seconds = 0
                 final_error = None
                 session_used_cache = False
+                fresh_auth_attempts = 0
 
                 for attempt in range(max_attempts):
                     log.info(f"Connection attempt {attempt + 1}/{max_attempts}")
@@ -790,6 +795,7 @@ class VPNPluginService(dbus.service.Object):
 
                     if not cookies:
                         log.info("Performing SAML authentication...")
+                        fresh_auth_attempts += 1
                         self.auth_in_progress = True
                         self.saml_start_time = time.monotonic()
                         self._auth_started_guard_triggered = False
@@ -812,6 +818,7 @@ class VPNPluginService(dbus.service.Object):
 
                         keepalive_thread = threading.Thread(target=_saml_keepalive, daemon=True)
                         keepalive_thread.start()
+                        auth_failed = False
 
                         # Ensure playwright can find the browser.
                         import glob
@@ -865,15 +872,19 @@ class VPNPluginService(dbus.service.Object):
                             log.error(f"SAML auth error: {auth_err}")
                             import traceback
                             traceback.print_exc()
-                            raise Exception(f"SAML authentication error: {auth_err}")
+                            final_error = f"SAML authentication error: {auth_err}"
+                            auth_failed = True
                         finally:
                             self.auth_in_progress = False
                             self.saml_start_time = None
                             self._auth_started_guard_triggered = False
                             stop_keepalive.set()
 
+                        if auth_failed:
+                            break
                         if not cookies:
-                            raise Exception("SAML authentication returned no cookies")
+                            final_error = "SAML authentication returned no cookies"
+                            break
 
                         # Store fresh cookies unless cache is explicitly disabled.
                         # Store before cancellation check so NM-triggered reconnects can
@@ -914,6 +925,7 @@ class VPNPluginService(dbus.service.Object):
                         protocol == 'anyconnect'
                         and not used_cache
                         and attempt < max_attempts - 1
+                        and fresh_auth_attempts <= anyconnect_fresh_retries
                     ):
                         # First-time AnyConnect auth can be flaky on some deployments.
                         # Retry fresh auth once (or configured times) before failing.
@@ -1396,10 +1408,10 @@ class VPNPluginService(dbus.service.Object):
                 log.warning("Skipping GP initial Config emission until gateway IP is known")
                 return False
 
-            # tundev will be set in the full Config after interface is up
-            # During GlobalProtect SAML auth, avoid telling NM we already have IPv4
-            # config; otherwise it may time out waiting for Ip4Config.
-            has_ip4 = self.current_protocol != 'gp' and not self.auth_in_progress
+            # tundev and has-ip4 are only advertised in the full Config after the
+            # tunnel is up. Claiming IPv4 here can leave stale VPN routing state
+            # behind when reconnect/auth attempts fail.
+            has_ip4 = False
             config = dbus.Dictionary({
                 'gateway': dbus.UInt32(gateway_uint),
                 'has-ip4': dbus.Boolean(has_ip4),
@@ -1463,7 +1475,10 @@ class VPNPluginService(dbus.service.Object):
                 log.warning(f"Ignoring invalid {env_name} value: {value!r}")
 
         if protocol == 'anyconnect':
-            return 30
+            # AnyConnect should not be advertised as STARTED until OpenConnect
+            # has created a real tunnel. Otherwise failed/restarted auth flows
+            # can leave NetworkManager with stale VPN routing state.
+            return 0
         return 45
 
     def _should_emit_started_keepalive(self, protocol: str) -> bool:
