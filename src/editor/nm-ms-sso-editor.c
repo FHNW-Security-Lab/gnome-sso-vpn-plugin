@@ -353,7 +353,7 @@ create_editor_widget(MsSsoEditor *self)
     gtk_grid_attach(GTK_GRID(grid), label, 0, row, 1, 1);
 
     priv->gp_os_version = GTK_ENTRY(gtk_entry_new());
-    gtk_entry_set_placeholder_text(priv->gp_os_version, "Ubuntu 26.04");
+    gtk_entry_set_placeholder_text(priv->gp_os_version, "Ubuntu 26.04 LTS");
     gtk_widget_set_tooltip_text(
         GTK_WIDGET(priv->gp_os_version),
         "OS version string reported to GlobalProtect prelogin and HIP. Leave empty for the default."

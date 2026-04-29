@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 
-DEFAULT_GP_OS_VERSION = "Ubuntu 26.04"
+DEFAULT_GP_OS_VERSION = "Ubuntu 26.04 LTS"
 
 
 def _find_base_hipreport() -> str | None:

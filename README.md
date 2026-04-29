@@ -71,12 +71,12 @@ For GlobalProtect, OpenConnect's `--os` option only accepts broad values such
 as `linux-64`; it cannot be set to a distro string. Configure the distro/version
 reported to GlobalProtect in the VPN editor's `GP OS Version` field. The value
 is sent as the prelogin `os-version` and in the HIP report. Empty uses the
-default `Ubuntu 26.04`.
+default `Ubuntu 26.04 LTS`.
 
 The same value can be configured with `nmcli`:
 
 ```bash
-nmcli connection modify "<connection name>" +vpn.data gp-os-version "Ubuntu 26.04"
+nmcli connection modify "<connection name>" +vpn.data gp-os-version "Ubuntu 26.04 LTS"
 ```
 
 ## Nix Flake Usage

@@ -8,7 +8,7 @@ import subprocess
 from typing import Optional
 
 
-DEFAULT_GP_OS_VERSION = "Ubuntu 26.04"
+DEFAULT_GP_OS_VERSION = "Ubuntu 26.04 LTS"
 
 
 def _read_os_release_pretty_name() -> Optional[str]:
