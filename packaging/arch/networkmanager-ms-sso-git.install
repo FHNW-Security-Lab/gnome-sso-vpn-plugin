@@ -9,7 +9,15 @@ _setup_runtime_dirs() {
 }
 
 _playwright_browser_installed() {
-  find /var/cache/ms-playwright -maxdepth 1 -type d -name 'chromium-*' | grep -q .
+  PLAYWRIGHT_BROWSERS_PATH=/var/cache/ms-playwright python -c 'import os, sys
+from playwright.sync_api import sync_playwright
+p = sync_playwright().start()
+try:
+    executable = p.chromium.executable_path
+    ok = os.path.isfile(executable) and os.access(executable, os.X_OK)
+finally:
+    p.stop()
+sys.exit(0 if ok else 1)' >/dev/null 2>&1
 }
 
 _install_playwright_chromium() {

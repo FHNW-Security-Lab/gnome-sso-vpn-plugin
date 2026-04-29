@@ -9,6 +9,8 @@ import re
 import shutil
 import ssl
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -232,6 +234,41 @@ def do_saml_auth(
         except OSError:
             return False
 
+    def _install_playwright_chromium(browser_path: str) -> bool:
+        if _is_truthy(os.environ.get("MS_SSO_DISABLE_PLAYWRIGHT_AUTO_INSTALL")):
+            return False
+
+        env = os.environ.copy()
+        env["PLAYWRIGHT_BROWSERS_PATH"] = browser_path
+        commands = []
+        playwright_bin = shutil.which("playwright")
+        if playwright_bin:
+            commands.append([playwright_bin, "install", "chromium"])
+        commands.append([sys.executable, "-m", "playwright", "install", "chromium"])
+
+        os.makedirs(browser_path, exist_ok=True)
+        for command in commands:
+            try:
+                if debug:
+                    print(f"    [DEBUG] Installing Playwright Chromium into {browser_path}: {' '.join(command)}")
+                result = subprocess.run(
+                    command,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    return True
+                if debug:
+                    output = (result.stderr or result.stdout or "").strip()
+                    print(f"    [DEBUG] Playwright install failed ({result.returncode}): {output}")
+            except Exception as e:
+                if debug:
+                    print(f"    [DEBUG] Playwright install command failed: {e}")
+        return False
+
     force_ephemeral_browser_session = (
         _is_truthy(disable_browser_session_cache)
         or _is_truthy(os.environ.get("MS_SSO_DISABLE_BROWSER_SESSION_CACHE"))
@@ -302,12 +339,24 @@ def do_saml_auth(
                 if debug:
                     print(f"    [DEBUG] Falling back to temporary browser session dir: {cache_dir}")
 
-        context = p.chromium.launch_persistent_context(
-            cache_dir,
-            headless=headless,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        )
+        def _launch_context():
+            return p.chromium.launch_persistent_context(
+                cache_dir,
+                headless=headless,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            )
+
+        try:
+            context = _launch_context()
+        except Exception as e:
+            message = str(e)
+            browser_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "/var/cache/ms-playwright"
+            if "Executable doesn't exist" not in message or not _install_playwright_chromium(browser_path):
+                raise
+            if debug:
+                print("    [DEBUG] Retrying Playwright launch after Chromium runtime install")
+            context = _launch_context()
         page = context.pages[0] if context.pages else context.new_page()
 
         def _close_context() -> None:

@@ -987,7 +987,10 @@ class VPNPluginService(dbus.service.Object):
                             f"(fast attempt {anyconnect_fast_reconnect_attempt}/{anyconnect_fast_reconnect_retries})"
                         )
                         self._cleanup_dns()
-                        GLib.idle_add(self._emit_started_keepalive)
+                        # Keep NetworkManager in a reconnecting state until a new
+                        # tunnel is actually established. Advertising STARTED
+                        # here leaves stale VPN routing/DNS active.
+                        GLib.idle_add(self._emit_starting_keepalive)
                         GLib.idle_add(self._emit_initial_config)
                         if not self._interruptible_sleep(delay_seconds, connect_generation):
                             return
