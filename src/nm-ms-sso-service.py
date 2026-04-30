@@ -154,6 +154,7 @@ class VPNPluginService(dbus.service.Object):
         self.current_protocol = None
         self.current_gateway_host = None
         self.current_gateway_port = 443
+        self.current_dns_server_limit = 3
         self.owned_tun_devices = set()
         self.ipv6_leak_protection_enabled = False
         # Track GP connection timing so we can delay initial Config/UI state.
@@ -242,6 +243,7 @@ class VPNPluginService(dbus.service.Object):
         secrets['reconnect_delay_seconds'] = vpn_data.get('reconnect-delay-seconds', '')
         secrets['reconnect_max_delay_seconds'] = vpn_data.get('reconnect-max-delay-seconds', '')
         secrets['reconnect_max_attempts'] = vpn_data.get('reconnect-max-attempts', '')
+        secrets['dns_server_limit'] = vpn_data.get('dns-server-limit', '')
 
         # Extract secrets
         secrets['password'] = vpn_secrets.get('password', '')
@@ -560,6 +562,56 @@ class VPNPluginService(dbus.service.Object):
             pass
         return default
 
+    def _get_dns_server_limit(self, protocol: str, configured_value: str = "") -> int:
+        """Return how many VPN DNS servers to hand to NetworkManager."""
+        env_candidates = []
+        if protocol == 'gp':
+            env_candidates.append("MS_SSO_NM_GP_DNS_SERVER_LIMIT")
+        if protocol == 'anyconnect':
+            env_candidates.append("MS_SSO_NM_ANYCONNECT_DNS_SERVER_LIMIT")
+        env_candidates.append("MS_SSO_NM_DNS_SERVER_LIMIT")
+
+        default = 1 if protocol == 'gp' else 3
+        limit = self._parse_positive_int(configured_value, -1)
+        if limit >= 0:
+            return limit
+
+        for env_name in env_candidates:
+            limit = self._parse_positive_int(os.environ.get(env_name), -1)
+            if limit >= 0:
+                return limit
+
+        return default
+
+    def _normalize_dns_servers(self, dns_servers):
+        """Deduplicate textual IPv4 DNS servers and apply the active limit."""
+        normalized = []
+        seen = set()
+        for ns in dns_servers:
+            text = str(ns).strip()
+            if not text or text in seen:
+                continue
+            try:
+                parts = [int(x) for x in text.split('.')]
+                if len(parts) != 4 or any(part < 0 or part > 255 for part in parts):
+                    continue
+            except Exception:
+                continue
+            normalized.append(text)
+            seen.add(text)
+
+        limit = self.current_dns_server_limit
+        if limit == 0:
+            log.info("VPN DNS server emission disabled by configuration")
+            return []
+        if len(normalized) > limit:
+            dropped = normalized[limit:]
+            log.info(
+                "Limiting VPN DNS servers to "
+                f"{limit}: using {normalized[:limit]}, dropping {dropped}"
+            )
+        return normalized[:limit]
+
     def _is_connect_cancelled(self, connect_generation: Optional[int] = None) -> bool:
         """Return True when the active connect flow should abort."""
         if self.cancel_requested:
@@ -652,6 +704,11 @@ class VPNPluginService(dbus.service.Object):
             self.current_protocol = protocol
             self.current_gateway_host = self._parse_gateway_host(gateway)
             self.current_gateway_port = self._parse_gateway_port(gateway)
+            self.current_dns_server_limit = self._get_dns_server_limit(
+                protocol,
+                secrets.get('dns_server_limit', ''),
+            )
+            log.info(f"VPN DNS server limit: {self.current_dns_server_limit}")
 
             # IMPORTANT: Resolve gateway IP NOW, before VPN connects
             # After VPN connects, DNS switches to VPN DNS servers which can't resolve external hostnames
@@ -1829,7 +1886,7 @@ class VPNPluginService(dbus.service.Object):
                 ip_uint = struct.unpack('!I', bytes(ip_parts))[0]
 
                 # Get DNS servers - try multiple methods
-                dns_servers = []
+                dns_server_ips = []
 
                 # Method 1: Try resolvectl for systemd-resolved systems
                 try:
@@ -1851,7 +1908,7 @@ class VPNPluginService(dbus.service.Object):
                                                 # Convert IP to uint32 in host byte order (little-endian on x86)
                                                 # IP a.b.c.d becomes: a + b*256 + c*65536 + d*16777216
                                                 ns_uint = ns_parts[0] | (ns_parts[1] << 8) | (ns_parts[2] << 16) | (ns_parts[3] << 24)
-                                                dns_servers.append(dbus.UInt32(ns_uint))
+                                                dns_server_ips.append(ns)
                                                 log.info(f"Found DNS from resolvectl: {ns} -> {ns_uint}")
                                         except:
                                             pass
@@ -1859,20 +1916,20 @@ class VPNPluginService(dbus.service.Object):
                     log.info(f"resolvectl failed: {e}")
 
                 # Method 2: If no DNS yet, check stored DNS from OpenConnect output
-                if not dns_servers and hasattr(self, 'vpn_dns_servers') and self.vpn_dns_servers:
+                if not dns_server_ips and hasattr(self, 'vpn_dns_servers') and self.vpn_dns_servers:
                     for ns in self.vpn_dns_servers:
                         try:
                             ns_parts = [int(x) for x in ns.split('.')]
                             if len(ns_parts) == 4:
                                 # Convert IP to uint32 in host byte order (little-endian on x86)
                                 ns_uint = ns_parts[0] | (ns_parts[1] << 8) | (ns_parts[2] << 16) | (ns_parts[3] << 24)
-                                dns_servers.append(dbus.UInt32(ns_uint))
+                                dns_server_ips.append(ns)
                                 log.info(f"Using stored VPN DNS: {ns} -> {ns_uint}")
                         except:
                             pass
 
                 # Method 3: Fall back to resolv.conf
-                if not dns_servers:
+                if not dns_server_ips:
                     try:
                         result = subprocess.run(['cat', '/etc/resolv.conf'], capture_output=True, text=True)
                         for line in result.stdout.split('\n'):
@@ -1883,13 +1940,19 @@ class VPNPluginService(dbus.service.Object):
                                     if len(ns_parts) == 4:
                                         # Convert IP to uint32 in host byte order (little-endian on x86)
                                         ns_uint = ns_parts[0] | (ns_parts[1] << 8) | (ns_parts[2] << 16) | (ns_parts[3] << 24)
-                                        dns_servers.append(dbus.UInt32(ns_uint))
+                                        dns_server_ips.append(ns)
                                         log.info(f"Found DNS from resolv.conf: {ns} -> {ns_uint}")
                                 except:
                                     pass  # Skip non-IPv4 nameservers
                     except:
                         pass
 
+                dns_server_ips = self._normalize_dns_servers(dns_server_ips)
+                dns_servers = []
+                for ns in dns_server_ips:
+                    ns_parts = [int(x) for x in ns.split('.')]
+                    ns_uint = ns_parts[0] | (ns_parts[1] << 8) | (ns_parts[2] << 16) | (ns_parts[3] << 24)
+                    dns_servers.append(dbus.UInt32(ns_uint))
                 log.info(f"Total DNS servers found: {len(dns_servers)}")
 
                 # Build addresses array: each address is [addr, prefix, gateway]
@@ -1904,7 +1967,7 @@ class VPNPluginService(dbus.service.Object):
                 ip4_config = dbus.Dictionary({
                     'addresses': addr_array,
                     'routes': routes_array,
-                    'dns': dbus.Array(dns_servers[:3], signature='u') if dns_servers else dbus.Array([], signature='u'),
+                    'dns': dbus.Array(dns_servers, signature='u') if dns_servers else dbus.Array([], signature='u'),
                     'domains': dbus.Array([], signature='s'),
                 }, signature='sv')
                 self.Ip4Config(ip4_config)
