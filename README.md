@@ -79,9 +79,10 @@ The same value can be configured with `nmcli`:
 nmcli connection modify "<connection name>" +vpn.data gp-os-version "Ubuntu 26.04 LTS"
 ```
 
-GlobalProtect SAML uses a fresh browser session by default. This avoids stale
-cached IdP state that can hang before TOTP or return no login cookies. If your
-provider requires reusing browser SSO state, enable it explicitly:
+GlobalProtect and AnyConnect SAML use a fresh browser session by default. This
+avoids stale cached IdP state that can hang before TOTP or return no login
+cookies. If your provider requires reusing browser SSO state, enable it
+explicitly:
 
 ```bash
 nmcli connection modify "<connection name>" +vpn.data enable-browser-session-cache 1

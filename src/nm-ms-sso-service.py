@@ -668,11 +668,15 @@ class VPNPluginService(dbus.service.Object):
                     protocol == 'gp'
                     and self._is_truthy(os.environ.get("MS_SSO_NM_GP_ENABLE_BROWSER_SESSION_CACHE"))
                 )
+                or (
+                    protocol == 'anyconnect'
+                    and self._is_truthy(os.environ.get("MS_SSO_NM_ANYCONNECT_ENABLE_BROWSER_SESSION_CACHE"))
+                )
             )
             disable_browser_session_cache = (
                 self._is_truthy(secrets.get('disable_browser_session_cache'))
                 or self._is_truthy(os.environ.get("MS_SSO_NM_DISABLE_BROWSER_SESSION_CACHE"))
-                or (protocol == 'gp' and not force_enable_browser_session_cache)
+                or (protocol in {'gp', 'anyconnect'} and not force_enable_browser_session_cache)
             )
             if force_enable_browser_session_cache:
                 disable_browser_session_cache = False
@@ -680,9 +684,9 @@ class VPNPluginService(dbus.service.Object):
                 "Browser session cache: "
                 f"{'disabled' if disable_browser_session_cache else 'enabled'}"
             )
-            if protocol == 'gp' and disable_browser_session_cache and not force_enable_browser_session_cache:
+            if protocol in {'gp', 'anyconnect'} and disable_browser_session_cache and not force_enable_browser_session_cache:
                 log.info(
-                    "GlobalProtect uses a fresh browser session by default; "
+                    f"{protocol} uses a fresh browser session by default; "
                     "set enable-browser-session-cache=1 to reuse SSO browser state"
                 )
 
@@ -736,15 +740,14 @@ class VPNPluginService(dbus.service.Object):
             if self.current_gateway_ip:
                 self._clear_onlink_host_route(self.current_gateway_ip)
 
-            # Emit an initial Config early so NetworkManager doesn't time out while
-            # long-running SAML authentication is in progress (notably for GlobalProtect).
+            # Only GP gets pre-tunnel Config keepalives. For AnyConnect this can
+            # make NetworkManager show "connected" even though SAML produced no
+            # cookie and no tun device exists yet.
             if protocol == 'gp':
                 # Delay GP's first Config emission as well; keep UI in "connecting".
                 self.gp_connect_start_time = time.monotonic()
                 if os.environ.get("MS_SSO_NM_GP_EARLY_CONFIG", "").lower() in {"1", "true", "yes"}:
                     GLib.idle_add(self._emit_initial_config)
-            else:
-                GLib.idle_add(self._emit_initial_config)
             # NetworkManager expects the plugin to reach STARTED in a timely manner or it
             # may cancel the connection (observed ~60s). GlobalProtect SAML/MFA flows can
             # easily exceed that, so GP defaults to optimistic STARTED during auth.
@@ -942,7 +945,7 @@ class VPNPluginService(dbus.service.Object):
                             while not stop_keepalive.wait(max(1, saml_keepalive_seconds)):
                                 if _connect_cancelled():
                                     return
-                                if protocol != 'gp' or self._gp_initial_config_allowed():
+                                if protocol == 'gp' and self._gp_initial_config_allowed():
                                     GLib.idle_add(self._emit_initial_config)
                                 # Keep NetworkManager from thinking the connection stalled.
                                 if self._should_emit_started_keepalive(protocol):
@@ -1108,7 +1111,7 @@ class VPNPluginService(dbus.service.Object):
                         GLib.idle_add(self._emit_started_keepalive)
                     else:
                         GLib.idle_add(self._emit_starting_keepalive)
-                    if protocol != 'gp' or self._gp_initial_config_allowed():
+                    if protocol == 'gp' and self._gp_initial_config_allowed():
                         GLib.idle_add(self._emit_initial_config)
                     if not self._interruptible_sleep(delay_seconds, connect_generation):
                         return
@@ -1140,7 +1143,6 @@ class VPNPluginService(dbus.service.Object):
                         # tunnel is actually established. Advertising STARTED
                         # here leaves stale VPN routing/DNS active.
                         GLib.idle_add(self._emit_starting_keepalive)
-                        GLib.idle_add(self._emit_initial_config)
                         if not self._interruptible_sleep(delay_seconds, connect_generation):
                             return
                         continue
@@ -1176,7 +1178,7 @@ class VPNPluginService(dbus.service.Object):
                     GLib.idle_add(self._emit_started_keepalive)
                 else:
                     GLib.idle_add(self._emit_starting_keepalive)
-                if protocol != 'gp' or self._gp_initial_config_allowed():
+                if protocol == 'gp' and self._gp_initial_config_allowed():
                     GLib.idle_add(self._emit_initial_config)
                 if not self._interruptible_sleep(delay_seconds, connect_generation):
                     return
