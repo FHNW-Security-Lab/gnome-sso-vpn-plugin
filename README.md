@@ -88,13 +88,17 @@ explicitly:
 nmcli connection modify "<connection name>" +vpn.data enable-browser-session-cache 1
 ```
 
-GlobalProtect and AnyConnect emit only the first VPN DNS server by default.
-This avoids slow failover behavior when a secondary VPN DNS server is reachable
-but degraded. Override it if your VPN needs more DNS servers:
+GlobalProtect emits only the first VPN DNS server by default. This avoids slow
+failover behavior when a secondary VPN DNS server is reachable but degraded.
+Override it if your VPN needs more DNS servers:
 
 ```bash
 nmcli connection modify "<connection name>" +vpn.data dns-server-limit 2
 ```
+
+AnyConnect keeps all pushed VPN DNS servers by default. During reconnects, a
+tunnel that pushes VPN DNS is only accepted after at least one pushed DNS server
+responds.
 
 ## Nix Flake Usage
 

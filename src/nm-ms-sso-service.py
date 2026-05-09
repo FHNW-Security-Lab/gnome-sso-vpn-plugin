@@ -490,6 +490,46 @@ class VPNPluginService(dbus.service.Object):
 
         return ip_addr, prefix
 
+    def _build_dns_probe_query(self, name: str) -> tuple[bytes, bytes]:
+        """Build a minimal DNS A query and return (transaction_id, packet)."""
+        transaction_id = os.urandom(2)
+        labels = [part for part in name.strip(".").split(".") if part]
+        question = b"".join(
+            bytes([len(label.encode("ascii", errors="ignore"))])
+            + label.encode("ascii", errors="ignore")
+            for label in labels
+            if len(label.encode("ascii", errors="ignore")) <= 63
+        )
+        question += b"\x00\x00\x01\x00\x01"
+        header = transaction_id + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        return transaction_id, header + question
+
+    def _probe_dns_server(self, server: str, timeout_seconds: float = 2.0) -> bool:
+        """Return True if a VPN DNS server responds to a basic UDP query."""
+        query_name = self.current_gateway_host or self.current_gateway or "example.com"
+        try:
+            transaction_id, packet = self._build_dns_probe_query(query_name)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(timeout_seconds)
+                sock.sendto(packet, (server, 53))
+                response, _addr = sock.recvfrom(512)
+            return len(response) >= 12 and response[:2] == transaction_id
+        except Exception as e:
+            log.debug(f"DNS probe failed for {server}: {e}")
+            return False
+
+    def _vpn_dns_usable(self) -> bool:
+        """Return True if at least one pushed VPN DNS server responds."""
+        dns_servers = self._normalize_dns_servers(getattr(self, "vpn_dns_servers", []))
+        if not dns_servers:
+            return False
+        for server in dns_servers:
+            if self._probe_dns_server(server):
+                log.info(f"VPN DNS probe succeeded via {server}")
+                return True
+        log.warning(f"VPN DNS probe failed for all servers: {dns_servers}")
+        return False
+
     def _wait_for_usable_tunnel(
             self,
             protocol: str,
@@ -510,6 +550,10 @@ class VPNPluginService(dbus.service.Object):
 
             ip_addr, prefix = self._get_tun_ipv4_config(tun_dev)
             if ip_addr:
+                if protocol == 'anyconnect' and self.vpn_dns_servers and not self._vpn_dns_usable():
+                    stable_since = None
+                    time.sleep(0.5)
+                    continue
                 if min_stable_seconds <= 0:
                     return True, None, ip_addr, prefix
                 if stable_since is None:
@@ -521,6 +565,8 @@ class VPNPluginService(dbus.service.Object):
 
             time.sleep(0.5)
 
+        if protocol == 'anyconnect' and self.vpn_dns_servers:
+            return False, f"Tunnel {tun_dev} did not get usable VPN DNS", None, 32
         return False, f"Tunnel {tun_dev} did not become usable with IPv4 config", None, 32
 
     def _stop_vpn_process(self, preserve_session: bool = True, force: bool = False) -> None:
@@ -571,7 +617,7 @@ class VPNPluginService(dbus.service.Object):
             env_candidates.append("MS_SSO_NM_ANYCONNECT_DNS_SERVER_LIMIT")
         env_candidates.append("MS_SSO_NM_DNS_SERVER_LIMIT")
 
-        default = 1 if protocol in {'gp', 'anyconnect'} else 3
+        default = 1 if protocol == 'gp' else 3
         limit = self._parse_positive_int(configured_value, -1)
         if limit >= 0:
             return limit
