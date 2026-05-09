@@ -571,7 +571,7 @@ class VPNPluginService(dbus.service.Object):
             env_candidates.append("MS_SSO_NM_ANYCONNECT_DNS_SERVER_LIMIT")
         env_candidates.append("MS_SSO_NM_DNS_SERVER_LIMIT")
 
-        default = 1 if protocol == 'gp' else 3
+        default = 1 if protocol in {'gp', 'anyconnect'} else 3
         limit = self._parse_positive_int(configured_value, -1)
         if limit >= 0:
             return limit
