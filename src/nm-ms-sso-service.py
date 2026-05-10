@@ -155,6 +155,9 @@ class VPNPluginService(dbus.service.Object):
         self.current_gateway_host = None
         self.current_gateway_port = 443
         self.current_dns_server_limit = 3
+        self.vpn_dns_servers = []
+        self.vpn_domains = []
+        self.vpn_tunnel_all_dns = None
         self.owned_tun_devices = set()
         self.ipv6_leak_protection_enabled = False
         # Track GP connection timing so we can delay initial Config/UI state.
@@ -446,16 +449,34 @@ class VPNPluginService(dbus.service.Object):
                 output_buffer = output_buffer[-65536:]
 
             for line in text.split('\n'):
+                stripped = line.strip()
+                if not stripped:
+                    continue
                 line_lc = line.lower()
                 if 'DNS' in line.upper():
-                    log.info(f"OpenConnect DNS info: {line.strip()}")
+                    log.info(f"OpenConnect DNS info: {stripped}")
                     ips = re.findall(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b', line)
                     for ip in ips:
                         if ip not in self.vpn_dns_servers:
                             self.vpn_dns_servers.append(ip)
                             log.info(f"Captured VPN DNS: {ip}")
                 if 'domain' in line_lc or 'search' in line_lc:
-                    log.info(f"OpenConnect domain info: {line.strip()}")
+                    log.info(f"OpenConnect domain info: {stripped}")
+                    self._capture_vpn_domains(stripped)
+                if 'x-cstp-tunnel-all-dns' in line_lc:
+                    value = stripped.split(':', 1)[1].strip() if ':' in stripped else ''
+                    parsed = self._parse_bool(value)
+                    if parsed is not None:
+                        self.vpn_tunnel_all_dns = parsed
+                        log.info(f"Captured Tunnel-All-DNS: {self.vpn_tunnel_all_dns}")
+                if any(marker in line_lc for marker in (
+                    'x-cstp-split',
+                    'x-cstp-address',
+                    'x-cstp-netmask',
+                    'x-cstp-route',
+                    'route',
+                )):
+                    log.info(f"OpenConnect route info: {stripped}")
                 if (
                     "connected as " in line_lc
                     or "cstp connected" in line_lc
@@ -468,6 +489,26 @@ class VPNPluginService(dbus.service.Object):
                         log.info("OpenConnect reported tunnel session up")
 
         return output_buffer, openconnect_reported_up
+
+    def _capture_vpn_domains(self, line: str):
+        """Capture DNS/search domains reported by OpenConnect."""
+        if ':' not in line:
+            return
+        key, value = line.split(':', 1)
+        key_lc = key.lower()
+        if not any(token in key_lc for token in ('domain', 'search', 'split-dns')):
+            return
+        for domain in re.split(r'[\s,;]+', value.strip()):
+            domain = domain.strip().strip('.')
+            if not domain or domain == '-' or domain.lower() in {'none', 'false', 'true'}:
+                continue
+            if re.fullmatch(r'\d{1,3}(?:\.\d{1,3}){3}', domain):
+                continue
+            if not re.fullmatch(r'~?[A-Za-z0-9_.-]+', domain):
+                continue
+            if domain not in self.vpn_domains:
+                self.vpn_domains.append(domain)
+                log.info(f"Captured VPN DNS domain: {domain}")
 
     def _get_tun_ipv4_config(self, tun_dev: str):
         """Return (ip, prefix) for a tunnel device, or (None, 32)."""
@@ -685,6 +726,106 @@ class VPNPluginService(dbus.service.Object):
                 f"{limit}: using {normalized[:limit]}, dropping {dropped}"
             )
         return normalized[:limit]
+
+    def _normalize_vpn_domains(self):
+        """Return DNS domains to emit to NetworkManager."""
+        domains = []
+        seen = set()
+        for domain in getattr(self, "vpn_domains", []):
+            text = str(domain).strip().strip('.')
+            if not text:
+                continue
+            route_only = text.startswith('~')
+            bare = text[1:] if route_only else text
+            if not re.fullmatch(r'[A-Za-z0-9_.-]+', bare):
+                continue
+            if self.current_protocol == 'anyconnect' and not self.vpn_tunnel_all_dns:
+                text = f"~{bare}"
+            elif route_only:
+                text = f"~{bare}"
+            else:
+                text = bare
+            if text not in seen:
+                domains.append(text)
+                seen.add(text)
+        return domains
+
+    def _anyconnect_preserve_default_route(self) -> bool:
+        """Return True when AnyConnect should keep a default route over tun."""
+        preserve = self._parse_bool(os.environ.get("MS_SSO_NM_ANYCONNECT_PRESERVE_DEFAULT_ROUTE"))
+        if preserve is not None:
+            return preserve
+        # Full-tunnel DNS normally implies the server expects full-tunnel routing.
+        return bool(self.vpn_tunnel_all_dns)
+
+    def _remove_tun_default_routes(self, tun_dev: str):
+        """Best-effort cleanup for accidental full-tunnel defaults."""
+        if not tun_dev:
+            return False
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "route", "show", "default", "dev", tun_dev],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            defaults = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        except Exception as e:
+            log.info(f"Default route inspection failed for {tun_dev}: {e}")
+            return False
+
+        if not defaults:
+            return False
+
+        removed = False
+        for route in defaults:
+            try:
+                subprocess.run(
+                    ["ip", "-4", "route", "del", "default", "dev", tun_dev],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                removed = True
+                log.info(f"Removed VPN default route from {tun_dev}: {route}")
+            except Exception as e:
+                log.info(f"Default route cleanup failed for {tun_dev}: {e}")
+        return removed
+
+    def _apply_split_dns_resolved(self, tun_dev: str, domains):
+        """Force route-only DNS after NetworkManager has processed Ip4Config."""
+        if not tun_dev or self.current_protocol != 'anyconnect' or self.vpn_tunnel_all_dns:
+            return False
+        if not shutil.which("resolvectl"):
+            return False
+
+        route_domains = [domain for domain in domains if str(domain).startswith('~')]
+        try:
+            if route_domains:
+                subprocess.run(
+                    ["resolvectl", "domain", tun_dev, *route_domains],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                log.info(f"Applied route-only VPN DNS domains on {tun_dev}: {route_domains}")
+            subprocess.run(
+                ["resolvectl", "default-route", tun_dev, "false"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            log.info(f"Disabled DNS default route on {tun_dev}")
+        except Exception as e:
+            log.info(f"Split DNS adjustment failed for {tun_dev}: {e}")
+
+        if not self._anyconnect_preserve_default_route():
+            self._remove_tun_default_routes(tun_dev)
+        return False
 
     def _is_connect_cancelled(self, connect_generation: Optional[int] = None) -> bool:
         """Return True when the active connect flow should abort."""
@@ -1430,6 +1571,7 @@ class VPNPluginService(dbus.service.Object):
             # Initialize DNS server list
             self.vpn_dns_servers = []
             self.vpn_domains = []
+            self.vpn_tunnel_all_dns = None
 
             # Monitor for interface up and parse output for DNS
             # Wait for tun interface to come up
@@ -2107,6 +2249,11 @@ class VPNPluginService(dbus.service.Object):
                         pass
 
                 dns_server_ips = self._normalize_dns_servers(dns_server_ips)
+                dns_domains = self._normalize_vpn_domains()
+                if dns_domains:
+                    log.info(f"VPN DNS domains for NetworkManager: {dns_domains}")
+                if self.current_protocol == 'anyconnect' and not self.vpn_tunnel_all_dns:
+                    log.info("AnyConnect split-DNS mode active; avoiding VPN as global DNS/default route")
                 dns_servers = []
                 for ns in dns_server_ips:
                     ns_parts = [int(x) for x in ns.split('.')]
@@ -2127,10 +2274,18 @@ class VPNPluginService(dbus.service.Object):
                     'addresses': addr_array,
                     'routes': routes_array,
                     'dns': dbus.Array(dns_servers, signature='u') if dns_servers else dbus.Array([], signature='u'),
-                    'domains': dbus.Array([], signature='s'),
+                    'domains': dbus.Array(dns_domains, signature='s'),
                 }, signature='sv')
+                if self.current_protocol == 'anyconnect' and not self._anyconnect_preserve_default_route():
+                    ip4_config['never-default'] = dbus.Boolean(True)
                 self.Ip4Config(ip4_config)
-                log.info(f"Emitted Ip4Config signal: addr={ip_addr}/{prefix}, dns={len(dns_servers)} servers")
+                log.info(
+                    f"Emitted Ip4Config signal: addr={ip_addr}/{prefix}, "
+                    f"dns={len(dns_servers)} servers, domains={dns_domains}"
+                )
+                if self.current_protocol == 'anyconnect' and not self.vpn_tunnel_all_dns:
+                    GLib.timeout_add_seconds(1, self._apply_split_dns_resolved, tun_dev, dns_domains)
+                    GLib.timeout_add_seconds(3, self._apply_split_dns_resolved, tun_dev, dns_domains)
 
             self._apply_ipv6_leak_protection()
 
@@ -2233,6 +2388,7 @@ class VPNPluginService(dbus.service.Object):
         # Always clear in-memory DNS/tunnel state, even when no tun device was found.
         self.vpn_dns_servers = []
         self.vpn_domains = []
+        self.vpn_tunnel_all_dns = None
         self.current_tun_device = None
         self.owned_tun_devices.clear()
 
