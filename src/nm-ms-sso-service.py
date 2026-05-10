@@ -528,6 +528,13 @@ class VPNPluginService(dbus.service.Object):
         target.append(value)
         log.info(f"Captured AnyConnect split {route_type}: {value}")
 
+    def _ipv4_to_nm_uint32(self, ip_addr: str) -> int:
+        """Return NetworkManager's host-order IPv4 uint32 representation."""
+        parts = [int(x) for x in ip_addr.split('.')]
+        if len(parts) != 4 or any(part < 0 or part > 255 for part in parts):
+            raise ValueError(f"invalid IPv4 address: {ip_addr}")
+        return parts[0] | (parts[1] << 8) | (parts[2] << 16) | (parts[3] << 24)
+
     def _get_tun_ipv4_config(self, tun_dev: str):
         """Return (ip, prefix) for a tunnel device, or (None, 32)."""
         try:
@@ -1990,8 +1997,6 @@ class VPNPluginService(dbus.service.Object):
         Note: We DON'T include tundev here because NetworkManager will try to look it up
         immediately and fail if it doesn't exist yet.
         """
-        import struct
-
         try:
             if self.current_protocol != 'gp':
                 log.info(
@@ -2023,14 +2028,12 @@ class VPNPluginService(dbus.service.Object):
             else:
                 log.warning(f"No pre-resolved gateway IP available, gateway uint will be 0")
 
-            # Convert gateway IP to uint32 (network byte order)
+            # NetworkManager VPN config uses host-order uint32 for IPv4 values.
             gateway_uint = 0
             if gateway_ip:
                 try:
-                    gw_parts = [int(x) for x in gateway_ip.split('.')]
-                    if len(gw_parts) == 4:
-                        gateway_uint = struct.unpack('!I', bytes(gw_parts))[0]
-                        log.info(f"Gateway uint32: {gateway_uint} (0x{gateway_uint:08x})")
+                    gateway_uint = self._ipv4_to_nm_uint32(gateway_ip)
+                    log.info(f"Gateway host-order uint32: {gateway_uint} (0x{gateway_uint:08x})")
                 except Exception as e:
                     log.info(f"Warning: Could not convert gateway IP '{gateway_ip}': {e}")
 
@@ -2320,14 +2323,12 @@ class VPNPluginService(dbus.service.Object):
             else:
                 log.warning(f"No pre-resolved gateway IP available, gateway uint will be 0")
 
-            # Convert gateway IP to uint32 (network byte order)
+            # NetworkManager VPN config uses host-order uint32 for IPv4 values.
             gateway_uint = 0
             if gateway_ip:
                 try:
-                    gw_parts = [int(x) for x in gateway_ip.split('.')]
-                    if len(gw_parts) == 4:
-                        gateway_uint = struct.unpack('!I', bytes(gw_parts))[0]
-                        log.info(f"Gateway uint32: {gateway_uint} (0x{gateway_uint:08x})")
+                    gateway_uint = self._ipv4_to_nm_uint32(gateway_ip)
+                    log.info(f"Gateway host-order uint32: {gateway_uint} (0x{gateway_uint:08x})")
                 except Exception as e:
                     log.info(f"Warning: Could not convert gateway IP '{gateway_ip}': {e}")
 
@@ -2335,7 +2336,7 @@ class VPNPluginService(dbus.service.Object):
                 log.info(f"ERROR: Gateway is 0, NetworkManager will reject this!")
 
             # Emit Config signal with tunnel device info
-            # gateway must be uint32 (network byte order)
+            # gateway must be uint32 in NetworkManager host order
             config = dbus.Dictionary({
                 'tundev': dbus.String(tun_dev),
                 'gateway': dbus.UInt32(gateway_uint),
