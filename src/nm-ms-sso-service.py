@@ -1146,6 +1146,10 @@ class VPNPluginService(dbus.service.Object):
                         watchdog_missing_tun_limit=watchdog_missing_tun_limit,
                     )
 
+                    if _connect_cancelled():
+                        log.info("Connect cancelled after OpenConnect attempt; preserving cookie cache")
+                        return
+
                     if success:
                         connection_ended = True
                         connection_uptime_seconds = uptime_seconds
@@ -1153,10 +1157,24 @@ class VPNPluginService(dbus.service.Object):
                         log.info("VPN connection established and later ended")
                         break
                     elif used_cache and attempt < max_attempts - 1:
-                        # Cookie was rejected, clear cache and retry with fresh auth
-                        log.warning("Cookie rejected, clearing cache and re-authenticating...")
-                        clear_nm_cookies(connection_name)
-                        continue
+                        if (
+                            error_msg
+                            and 'cookie' in error_msg.lower()
+                            and (
+                                'reject' in error_msg.lower()
+                                or 'invalid' in error_msg.lower()
+                                or 'fail' in error_msg.lower()
+                            )
+                        ):
+                            log.warning("Cached cookie rejected, clearing cache and re-authenticating...")
+                            clear_nm_cookies(connection_name)
+                            continue
+                        log.warning(
+                            "Cached AnyConnect cookie did not establish a usable tunnel; "
+                            "preserving cache and letting reconnect retry it"
+                        )
+                        final_error = error_msg or "VPN connection failed"
+                        break
                     elif (
                         protocol == 'anyconnect'
                         and not used_cache
@@ -1522,9 +1540,9 @@ class VPNPluginService(dbus.service.Object):
             if protocol == 'anyconnect' and self.vpn_dns_servers:
                 dns_probe_timeout = self._parse_positive_int(
                     os.environ.get("MS_SSO_NM_ANYCONNECT_DNS_PROBE_AFTER_CONFIG_SECONDS"),
-                    20,
+                    0,
                 )
-                if not self._wait_for_vpn_dns_usable(connect_generation, timeout_seconds=dns_probe_timeout):
+                if dns_probe_timeout > 0 and not self._wait_for_vpn_dns_usable(connect_generation, timeout_seconds=dns_probe_timeout):
                     log.warning(
                         "VPN tunnel DNS did not become usable after NetworkManager config; "
                         "continuing with tunnel up to avoid reconnect/TOTP loop"
