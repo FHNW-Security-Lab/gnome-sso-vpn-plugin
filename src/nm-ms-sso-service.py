@@ -158,6 +158,8 @@ class VPNPluginService(dbus.service.Object):
         self.vpn_dns_servers = []
         self.vpn_domains = []
         self.vpn_tunnel_all_dns = None
+        self.vpn_split_excludes = []
+        self.vpn_split_includes = []
         self.owned_tun_devices = set()
         self.ipv6_leak_protection_enabled = False
         # Track GP connection timing so we can delay initial Config/UI state.
@@ -469,6 +471,10 @@ class VPNPluginService(dbus.service.Object):
                     if parsed is not None:
                         self.vpn_tunnel_all_dns = parsed
                         log.info(f"Captured Tunnel-All-DNS: {self.vpn_tunnel_all_dns}")
+                if 'x-cstp-split-exclude' in line_lc:
+                    self._capture_split_route(stripped, self.vpn_split_excludes, "exclude")
+                if 'x-cstp-split-include' in line_lc:
+                    self._capture_split_route(stripped, self.vpn_split_includes, "include")
                 if any(marker in line_lc for marker in (
                     'x-cstp-split',
                     'x-cstp-address',
@@ -509,6 +515,16 @@ class VPNPluginService(dbus.service.Object):
             if domain not in self.vpn_domains:
                 self.vpn_domains.append(domain)
                 log.info(f"Captured VPN DNS domain: {domain}")
+
+    def _capture_split_route(self, line: str, target: list, route_type: str):
+        """Capture split include/exclude route lines for routing decisions."""
+        if ':' not in line:
+            return
+        value = line.split(':', 1)[1].strip()
+        if not value or value in target:
+            return
+        target.append(value)
+        log.info(f"Captured AnyConnect split {route_type}: {value}")
 
     def _get_tun_ipv4_config(self, tun_dev: str):
         """Return (ip, prefix) for a tunnel device, or (None, 32)."""
@@ -755,6 +771,11 @@ class VPNPluginService(dbus.service.Object):
         preserve = self._parse_bool(os.environ.get("MS_SSO_NM_ANYCONNECT_PRESERVE_DEFAULT_ROUTE"))
         if preserve is not None:
             return preserve
+        if getattr(self, "vpn_split_excludes", []):
+            # Cisco split-exclude means "route everything through VPN except these".
+            return True
+        if getattr(self, "vpn_split_includes", []):
+            return False
         # Full-tunnel DNS normally implies the server expects full-tunnel routing.
         return bool(self.vpn_tunnel_all_dns)
 
@@ -1572,6 +1593,8 @@ class VPNPluginService(dbus.service.Object):
             self.vpn_dns_servers = []
             self.vpn_domains = []
             self.vpn_tunnel_all_dns = None
+            self.vpn_split_excludes = []
+            self.vpn_split_includes = []
 
             # Monitor for interface up and parse output for DNS
             # Wait for tun interface to come up
@@ -2389,6 +2412,8 @@ class VPNPluginService(dbus.service.Object):
         self.vpn_dns_servers = []
         self.vpn_domains = []
         self.vpn_tunnel_all_dns = None
+        self.vpn_split_excludes = []
+        self.vpn_split_includes = []
         self.current_tun_device = None
         self.owned_tun_devices.clear()
 
