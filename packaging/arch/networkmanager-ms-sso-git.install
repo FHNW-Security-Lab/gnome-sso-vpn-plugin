@@ -40,9 +40,20 @@ _install_playwright_chromium() {
   fi
 }
 
+_reload_networkmanager_plugin() {
+  # D-Bus-activated VPN helper processes can survive a NetworkManager restart
+  # on some systems. Kill stale helpers so upgrades actually run the new code.
+  pkill -f /usr/libexec/nm-ms-sso-service >/dev/null 2>&1 || true
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl try-restart NetworkManager.service >/dev/null 2>&1 || true
+  fi
+}
+
 post_install() {
   _setup_runtime_dirs
   _install_playwright_chromium
+  _reload_networkmanager_plugin
 }
 
 post_upgrade() {

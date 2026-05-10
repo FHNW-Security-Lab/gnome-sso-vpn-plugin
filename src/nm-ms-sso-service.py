@@ -802,6 +802,78 @@ class VPNPluginService(dbus.service.Object):
         # Full-tunnel DNS normally implies the server expects full-tunnel routing.
         return bool(self.vpn_tunnel_all_dns)
 
+    def _anyconnect_route_spec_to_cidr(self, route_spec: str) -> Optional[str]:
+        """Convert Cisco split route notation to a CIDR route string."""
+        try:
+            if not route_spec:
+                return None
+            text = str(route_spec).strip()
+            if "/" not in text:
+                return str(ipaddress.ip_network(text, strict=False))
+            addr, mask = text.split("/", 1)
+            if "." in mask:
+                return str(ipaddress.ip_network(f"{addr}/{mask}", strict=False))
+            return str(ipaddress.ip_network(text, strict=False))
+        except Exception as e:
+            log.info(f"Could not parse AnyConnect route spec {route_spec!r}: {e}")
+            return None
+
+    def _cleanup_anyconnect_physical_routes(self) -> None:
+        """Remove routes that vpnc-script may leave on the physical uplink."""
+        if self.current_protocol != 'anyconnect':
+            return
+
+        route_cidrs = []
+        for route_spec in getattr(self, "vpn_split_excludes", []):
+            cidr = self._anyconnect_route_spec_to_cidr(route_spec)
+            if cidr and cidr not in route_cidrs:
+                route_cidrs.append(cidr)
+        if getattr(self, "current_gateway_ip", None):
+            route_cidrs.append(f"{self.current_gateway_ip}/32")
+        if not route_cidrs:
+            return
+
+        tun_names = set(self.owned_tun_devices)
+        if self.current_tun_device:
+            tun_names.add(self.current_tun_device)
+        tun_names.update(self._list_tun_devices())
+
+        for cidr in route_cidrs:
+            try:
+                result = subprocess.run(
+                    ["ip", "-4", "route", "show", cidr],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+            except Exception as e:
+                log.info(f"Route inspection failed for {cidr}: {e}")
+                continue
+
+            for line in [line.strip() for line in result.stdout.splitlines() if line.strip()]:
+                if not line.startswith(cidr.split("/", 1)[0]) and not line.startswith(cidr):
+                    continue
+                if any(f" dev {tun_dev}" in line for tun_dev in tun_names):
+                    continue
+                try:
+                    delete = subprocess.run(
+                        ["ip", "-4", "route", "del", cidr],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=5,
+                    )
+                    if delete.returncode == 0:
+                        log.info(f"Removed leaked AnyConnect physical route: {line}")
+                    elif delete.stderr.strip():
+                        log.info(
+                            f"Could not remove leaked route {cidr}: "
+                            f"{delete.stderr.strip()}"
+                        )
+                except Exception as e:
+                    log.info(f"Leaked route cleanup failed for {cidr}: {e}")
+
     def _remove_tun_default_routes(self, tun_dev: str):
         """Best-effort cleanup for accidental full-tunnel defaults."""
         if not tun_dev:
@@ -841,6 +913,12 @@ class VPNPluginService(dbus.service.Object):
     def _apply_split_dns_resolved(self, tun_dev: str, domains):
         """Force route-only DNS after NetworkManager has processed Ip4Config."""
         if not tun_dev or self.current_protocol != 'anyconnect' or self.vpn_tunnel_all_dns:
+            return False
+        if self._anyconnect_preserve_default_route():
+            log.info(
+                "Keeping VPN DNS as a default resolver on full-tunnel/split-exclude "
+                f"AnyConnect link {tun_dev}"
+            )
             return False
         if not shutil.which("resolvectl"):
             return False
@@ -2341,7 +2419,13 @@ class VPNPluginService(dbus.service.Object):
                 if dns_domains:
                     log.info(f"VPN DNS domains for NetworkManager: {dns_domains}")
                 if self.current_protocol == 'anyconnect' and not self.vpn_tunnel_all_dns:
-                    log.info("AnyConnect split-DNS mode active; avoiding VPN as global DNS/default route")
+                    if self._anyconnect_preserve_default_route():
+                        log.info(
+                            "AnyConnect split-exclude/full-tunnel routing active; "
+                            "keeping VPN DNS available for global lookups"
+                        )
+                    else:
+                        log.info("AnyConnect split-DNS mode active; avoiding VPN as global DNS/default route")
                 dns_servers = []
                 for ns in dns_server_ips:
                     ns_parts = [int(x) for x in ns.split('.')]
@@ -2459,6 +2543,7 @@ class VPNPluginService(dbus.service.Object):
         """Attempt to clear DNS settings left behind on disconnect/failure."""
         self._remove_ipv6_leak_protection()
         self._cleanup_leaked_vpn_dns_links()
+        self._cleanup_anyconnect_physical_routes()
 
         tun_devs = set()
         if self.current_tun_device:
