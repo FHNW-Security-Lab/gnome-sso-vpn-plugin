@@ -1700,10 +1700,10 @@ class VPNPluginService(dbus.service.Object):
                 log.warning(f"Ignoring invalid {env_name} value: {value!r}")
 
         if protocol == 'anyconnect':
-            # AnyConnect should not be advertised as STARTED until OpenConnect
-            # has created a real tunnel. Otherwise failed/restarted auth flows
-            # can leave NetworkManager with stale VPN routing state.
-            return 0
+            # SAML/MFA can exceed NetworkManager's connect timeout. STARTED
+            # keepalive is safe here because we do not emit IP/DNS config until
+            # OpenConnect has created and validated a real tunnel.
+            return 45
         return 45
 
     def _should_emit_started_keepalive(self, protocol: str) -> bool:

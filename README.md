@@ -100,6 +100,10 @@ AnyConnect keeps all pushed VPN DNS servers by default. During reconnects, a
 tunnel that pushes VPN DNS is only accepted after at least one pushed DNS server
 responds.
 
+Slow AnyConnect SAML/MFA flows send a STARTED keepalive after 45 seconds to
+avoid NetworkManager's connect timeout. IP routes and DNS are still only emitted
+after OpenConnect has created and validated a real tunnel.
+
 ## Nix Flake Usage
 
 Build package:
