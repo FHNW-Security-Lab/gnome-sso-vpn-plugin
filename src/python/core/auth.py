@@ -405,13 +405,19 @@ def do_saml_auth(
                 return True
             return False
 
+        def _collect_vpn_cookies() -> dict[str, str]:
+            vpn_cookies = {}
+            for c in context.cookies():
+                if c.get("value") and _cookie_domain_matches(c.get("domain", "")):
+                    vpn_cookies[c["name"]] = c["value"]
+            return vpn_cookies
+
         def _has_usable_auth_artifact(cookies: Optional[dict[str, str]] = None) -> bool:
             cookies = cookies or {}
             if protocol == "anyconnect":
-                if saml_result.get("saml_response"):
-                    return True
-                if cookies.get("SAMLResponse"):
-                    return True
+                # OpenConnect's --cookie path cannot use a bare SAMLResponse. It
+                # needs the final Cisco WebVPN session cookies; otherwise the
+                # gateway rejects the cookie immediately.
                 return bool(
                     cookies.get("webvpn")
                     and (cookies.get("webvpnc") or cookies.get("webvpnaac") or cookies.get("SVPNCOOKIE"))
@@ -426,7 +432,7 @@ def do_saml_auth(
 
         def _auth_capture_complete() -> bool:
             if protocol == "anyconnect":
-                return bool(saml_result.get("saml_response"))
+                return _has_usable_auth_artifact(_collect_vpn_cookies())
             return bool(
                 saml_result.get("prelogin_cookie")
                 or saml_result.get("portal_userauthcookie")
@@ -1036,10 +1042,7 @@ def do_saml_auth(
 
             # Collect cookies
             all_cookies = context.cookies()
-            vpn_cookies = {}
-            for c in all_cookies:
-                if c.get("value") and _cookie_domain_matches(c.get("domain", "")):
-                    vpn_cookies[c["name"]] = c["value"]
+            vpn_cookies = _collect_vpn_cookies()
 
             if saml_result["saml_response"]:
                 vpn_cookies["SAMLResponse"] = saml_result["saml_response"]
