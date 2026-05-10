@@ -543,6 +543,27 @@ class VPNPluginService(dbus.service.Object):
         log.warning(f"VPN DNS probe failed for all servers: {dns_servers}")
         return False
 
+    def _wait_for_vpn_dns_usable(
+            self,
+            connect_generation: Optional[int],
+            timeout_seconds: int = 20,
+    ) -> bool:
+        """Wait until pushed VPN DNS responds after NetworkManager config is emitted."""
+        dns_servers = self._normalize_dns_servers(getattr(self, "vpn_dns_servers", []))
+        if not dns_servers:
+            return True
+
+        deadline = time.monotonic() + max(1, timeout_seconds)
+        while time.monotonic() < deadline:
+            if self._is_connect_cancelled(connect_generation):
+                return False
+            if self.vpn_process and self.vpn_process.poll() is not None:
+                return False
+            if self._vpn_dns_usable():
+                return True
+            time.sleep(1)
+        return False
+
     def _wait_for_usable_tunnel(
             self,
             protocol: str,
@@ -563,10 +584,6 @@ class VPNPluginService(dbus.service.Object):
 
             ip_addr, prefix = self._get_tun_ipv4_config(tun_dev)
             if ip_addr:
-                if protocol == 'anyconnect' and self.vpn_dns_servers and not self._vpn_dns_usable():
-                    stable_since = None
-                    time.sleep(0.5)
-                    continue
                 if min_stable_seconds <= 0:
                     return True, None, ip_addr, prefix
                 if stable_since is None:
@@ -578,8 +595,6 @@ class VPNPluginService(dbus.service.Object):
 
             time.sleep(0.5)
 
-        if protocol == 'anyconnect' and self.vpn_dns_servers:
-            return False, f"Tunnel {tun_dev} did not get usable VPN DNS", None, 32
         return False, f"Tunnel {tun_dev} did not become usable with IPv4 config", None, 32
 
     def _stop_vpn_process(self, preserve_session: bool = True, force: bool = False) -> None:
@@ -1160,7 +1175,14 @@ class VPNPluginService(dbus.service.Object):
                                 return
                         continue
                     else:
-                        if not used_cache:
+                        if (
+                            not used_cache
+                            and not (
+                                protocol == 'anyconnect'
+                                and error_msg
+                                and 'dns' in error_msg.lower()
+                            )
+                        ):
                             clear_nm_cookies(connection_name)
                         final_error = error_msg or "VPN connection failed"
                         break
@@ -1497,6 +1519,16 @@ class VPNPluginService(dbus.service.Object):
 
             # Emit full IP config now that interface is up
             GLib.idle_add(self._emit_connected)
+            if protocol == 'anyconnect' and self.vpn_dns_servers:
+                dns_probe_timeout = self._parse_positive_int(
+                    os.environ.get("MS_SSO_NM_ANYCONNECT_DNS_PROBE_AFTER_CONFIG_SECONDS"),
+                    20,
+                )
+                if not self._wait_for_vpn_dns_usable(connect_generation, timeout_seconds=dns_probe_timeout):
+                    log.warning(
+                        "VPN tunnel DNS did not become usable after NetworkManager config; "
+                        "continuing with tunnel up to avoid reconnect/TOTP loop"
+                    )
 
             # Watchdog loop: keep an eye on process and tunnel device.
             connected_at = time.monotonic()
