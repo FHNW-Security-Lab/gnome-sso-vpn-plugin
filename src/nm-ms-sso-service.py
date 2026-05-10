@@ -1808,16 +1808,19 @@ class VPNPluginService(dbus.service.Object):
                 log.warning(f"Ignoring invalid {env_name} value: {value!r}")
 
         if protocol == 'anyconnect':
-            # SAML/MFA can exceed NetworkManager's connect timeout. STARTED
-            # keepalive is safe here because we do not emit IP/DNS config until
-            # OpenConnect has created and validated a real tunnel.
-            return 45
+            # Do not report STARTED during AnyConnect SAML. NetworkManager/GNOME
+            # treats that as an active VPN even when no tun device exists yet.
+            # Gateway-only Config keepalives keep the activation alive without
+            # installing stale VPN routing/DNS.
+            return 0
         return 45
 
     def _should_emit_started_keepalive(self, protocol: str) -> bool:
         """Return True when we should send STARTED keepalive to avoid NM timeout."""
         if protocol == 'gp' and self._gp_early_started_enabled():
             return True
+        if protocol == 'anyconnect':
+            return False
 
         if not getattr(self, "auth_in_progress", False):
             return False
