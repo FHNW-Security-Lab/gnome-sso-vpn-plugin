@@ -535,6 +535,16 @@ class VPNPluginService(dbus.service.Object):
             raise ValueError(f"invalid IPv4 address: {ip_addr}")
         return parts[0] | (parts[1] << 8) | (parts[2] << 16) | (parts[3] << 24)
 
+    def _reverse_ipv4_octets(self, ip_addr: str) -> Optional[str]:
+        """Return an IPv4 address with reversed octets, or None if invalid."""
+        try:
+            parts = [int(x) for x in ip_addr.split('.')]
+            if len(parts) != 4 or any(part < 0 or part > 255 for part in parts):
+                return None
+            return '.'.join(str(part) for part in reversed(parts))
+        except Exception:
+            return None
+
     def _get_tun_ipv4_config(self, tun_dev: str):
         """Return (ip, prefix) for a tunnel device, or (None, 32)."""
         try:
@@ -837,6 +847,9 @@ class VPNPluginService(dbus.service.Object):
                 route_cidrs.append(cidr)
         if getattr(self, "current_gateway_ip", None):
             route_cidrs.append(f"{self.current_gateway_ip}/32")
+            reversed_gateway_ip = self._reverse_ipv4_octets(self.current_gateway_ip)
+            if reversed_gateway_ip and reversed_gateway_ip != self.current_gateway_ip:
+                route_cidrs.append(f"{reversed_gateway_ip}/32")
         if not route_cidrs:
             return
 
@@ -1083,6 +1096,7 @@ class VPNPluginService(dbus.service.Object):
             # Some networks inject a host route that forces ARP on LAN and breaks reachability.
             if self.current_gateway_ip:
                 self._clear_onlink_host_route(self.current_gateway_ip)
+                self._cleanup_anyconnect_physical_routes()
 
             # Only GP gets pre-tunnel Config keepalives. For AnyConnect this can
             # make NetworkManager show "connected" even though SAML produced no
@@ -2119,19 +2133,16 @@ class VPNPluginService(dbus.service.Object):
                 log.warning(f"Ignoring invalid {env_name} value: {value!r}")
 
         if protocol == 'anyconnect':
-            # Do not report STARTED during AnyConnect SAML. NetworkManager/GNOME
-            # treats that as an active VPN even when no tun device exists yet.
-            # Gateway-only Config keepalives keep the activation alive without
-            # installing stale VPN routing/DNS.
-            return 0
+            # FHNW SAML/TOTP often takes longer than NetworkManager's observed
+            # ~60s activation timeout. Emit STARTED shortly before that without
+            # pre-tunnel Config, so NM keeps waiting but gets no stale IP/DNS.
+            return 45
         return 45
 
     def _should_emit_started_keepalive(self, protocol: str) -> bool:
         """Return True when we should send STARTED keepalive to avoid NM timeout."""
         if protocol == 'gp' and self._gp_early_started_enabled():
             return True
-        if protocol == 'anyconnect':
-            return False
 
         if not getattr(self, "auth_in_progress", False):
             return False
