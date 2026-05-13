@@ -1311,8 +1311,8 @@ class VPNPluginService(dbus.service.Object):
                         self.saml_start_time = time.monotonic()
                         self._auth_started_guard_triggered = False
 
-                        # Keep NetworkManager from timing out while SAML is in progress by
-                        # periodically emitting an initial Config. (GP MFA can take >60s.)
+                        # Keep NetworkManager from timing out while SAML is in progress.
+                        # Some SSO/MFA flows exceed NM's observed ~60s activation timeout.
                         stop_keepalive = threading.Event()
 
                         def _saml_keepalive():
@@ -2012,13 +2012,13 @@ class VPNPluginService(dbus.service.Object):
         immediately and fail if it doesn't exist yet.
         """
         try:
-            if self.current_protocol != 'gp':
+            if self.current_protocol not in {'gp', 'anyconnect'}:
                 log.info(
                     "Skipping pre-tunnel initial Config for "
                     f"{self.current_protocol or 'unknown'}; waiting for real tunnel"
                 )
                 return False
-            if self.current_protocol == 'gp' and not self._gp_initial_config_allowed():
+            if not self._auth_initial_config_allowed(self.current_protocol or ''):
                 return False
 
             gateway = self.current_gateway or ''
@@ -2052,9 +2052,9 @@ class VPNPluginService(dbus.service.Object):
                     log.info(f"Warning: Could not convert gateway IP '{gateway_ip}': {e}")
 
             # Emit Config signal WITHOUT tundev - just gateway info.
-            # Do not emit gateway=0 for GP: NetworkManager treats it as invalid config.
-            if self.current_protocol == 'gp' and gateway_uint == 0:
-                log.warning("Skipping GP initial Config emission until gateway IP is known")
+            # Do not emit gateway=0: NetworkManager treats it as invalid config.
+            if gateway_uint == 0:
+                log.warning("Skipping initial Config emission until gateway IP is known")
                 return False
 
             # tundev and has-ip4 are only advertised in the full Config after the
@@ -2080,37 +2080,57 @@ class VPNPluginService(dbus.service.Object):
         """Return True when slow SAML auth may emit gateway-only Config."""
         if protocol == 'gp':
             return self._gp_initial_config_allowed()
-        # AnyConnect must not emit Config before a tun device exists. NM may
-        # otherwise mark the VPN active on the physical uplink and keep VPN DNS
-        # there after cancellation/failure, which breaks normal internet access.
+        if protocol == 'anyconnect':
+            return self._anyconnect_initial_config_allowed()
         return False
+
+    def _initial_config_delay_elapsed(self, protocol_label: str, env_name: str, default_seconds: int) -> bool:
+        """Return True when delayed gateway-only Config may be emitted."""
+        delay_env = os.environ.get(env_name, "").strip()
+        try:
+            delay_seconds = int(delay_env) if delay_env else default_seconds
+        except Exception:
+            delay_seconds = default_seconds
+        if delay_seconds < 0:
+            delay_seconds = default_seconds
+
+        start_time = None
+        if getattr(self, "auth_in_progress", False) and getattr(self, "saml_start_time", None):
+            start_time = self.saml_start_time
+        elif protocol_label == "GP" and getattr(self, "gp_connect_start_time", None):
+            start_time = self.gp_connect_start_time
+        if not start_time:
+            return False
+
+        elapsed = time.monotonic() - start_time
+        if elapsed < delay_seconds:
+            log.info(
+                f"Skipping initial Config for {protocol_label} to keep UI in connecting state "
+                f"(elapsed {elapsed:.0f}s < {delay_seconds}s)"
+            )
+            return False
+        return True
 
     def _gp_initial_config_allowed(self) -> bool:
         """Return True if GP initial Config may be emitted (delay elapsed or explicitly allowed)."""
         allow_early = os.environ.get("MS_SSO_NM_GP_EARLY_CONFIG", "").lower() in {"1", "true", "yes"}
         if allow_early:
             return True
-        delay_env = os.environ.get("MS_SSO_NM_GP_CONFIG_DELAY", "").strip()
-        try:
-            # Default below NetworkManager's observed connect timeout window.
-            delay_seconds = int(delay_env) if delay_env else 20
-        except Exception:
-            delay_seconds = 20
-        start_time = None
-        if getattr(self, "auth_in_progress", False) and getattr(self, "saml_start_time", None):
-            start_time = self.saml_start_time
-        elif getattr(self, "gp_connect_start_time", None):
-            start_time = self.gp_connect_start_time
-        if not start_time:
-            return False
-        elapsed = time.monotonic() - start_time
-        if elapsed < delay_seconds:
-            log.info(
-                "Skipping initial Config for GP to keep UI in connecting state "
-                f"(elapsed {elapsed:.0f}s < {delay_seconds}s)"
-            )
-            return False
-        return True
+        # Default below NetworkManager's observed connect timeout window.
+        return self._initial_config_delay_elapsed("GP", "MS_SSO_NM_GP_CONFIG_DELAY", 20)
+
+    def _anyconnect_initial_config_allowed(self) -> bool:
+        """Return True if AnyConnect gateway-only Config may be emitted during slow auth."""
+        allow_early = os.environ.get("MS_SSO_NM_ANYCONNECT_EARLY_CONFIG", "").lower() in {"1", "true", "yes"}
+        if allow_early:
+            return True
+        # This emits no tundev and has-ip4=false, so it keeps NM alive without
+        # installing tunnel DNS/routes before OpenConnect creates the interface.
+        return self._initial_config_delay_elapsed(
+            "AnyConnect",
+            "MS_SSO_NM_ANYCONNECT_CONFIG_DELAY",
+            30,
+        )
 
     def _get_auth_started_guard_seconds(self, protocol: str) -> int:
         """Return seconds after which we emit STARTED keepalive during slow auth."""
