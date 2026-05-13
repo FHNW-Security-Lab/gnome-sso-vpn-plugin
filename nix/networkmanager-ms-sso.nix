@@ -14,6 +14,9 @@
 , writeShellScriptBin
 , iproute2
 , procps
+, systemd
+, openresolv
+, coreutils
 , playwright-driver
 , ms-sso-openconnect-core
 }:
@@ -62,11 +65,15 @@ python3Packages.buildPythonApplication rec {
       openconnect
       iproute2
       procps
+      systemd
+      openresolv
+      coreutils
     ])
     "--set" "HOME" "/var/cache/ms-sso-openconnect"
     "--set" "SUDO_USER" "ms-sso-openconnect"
     "--set" "PLAYWRIGHT_BROWSERS_PATH" "/var/cache/ms-playwright"
     "--set" "XDG_CACHE_HOME" "/var/cache/ms-sso-openconnect/.cache"
+    "--set" "MS_SSO_GP_HIP_REPORT_WRAPPER" "${placeholder "out"}/libexec/nm-ms-sso-gp-hipreport"
     "--prefix" "GI_TYPELIB_PATH" ":" (lib.makeSearchPath "lib/girepository-1.0" [
       networkmanager
       gtk4
@@ -96,7 +103,15 @@ python3Packages.buildPythonApplication rec {
 
   passthru = {
     networkManagerPlugin = "VPN/nm-ms-sso-service.name";
-    networkManagerRuntimeDeps = [ openconnect vpnc-scripts iproute2 procps ];
+    networkManagerRuntimeDeps = [
+      openconnect
+      vpnc-scripts
+      iproute2
+      procps
+      systemd
+      openresolv
+      coreutils
+    ];
     networkManagerTmpfilesRules = [
       "L+ /var/cache/ms-playwright - - - - ${playwright-driver.browsers}"
       "d /var/cache/ms-sso-openconnect 0755 root root -"

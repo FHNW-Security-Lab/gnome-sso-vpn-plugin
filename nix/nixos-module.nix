@@ -59,6 +59,10 @@ in
       pkgs.networkmanager-ms-sso
     ];
 
+    services.dbus.packages = [
+      pkgs.networkmanager-ms-sso
+    ];
+
     systemd.services.NetworkManager.serviceConfig.ExecStartPre =
       lib.optional cfg.autoKillStale
         "-${lib.getExe' pkgs.procps "pkill"} -KILL -f nm-ms-sso-service";
