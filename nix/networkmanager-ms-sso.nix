@@ -108,9 +108,6 @@ python3Packages.buildPythonApplication rec {
       vpnc-scripts
       iproute2
       procps
-      systemd
-      openresolv
-      coreutils
     ];
     networkManagerTmpfilesRules = [
       "L+ /var/cache/ms-playwright - - - - ${playwright-driver.browsers}"
