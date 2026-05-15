@@ -25,6 +25,16 @@ let
   openconnectWrapped = writeShellScriptBin "openconnect" ''
     exec ${lib.getExe openconnect} --script ${lib.getExe' vpnc-scripts "vpnc-script"} "$@"
   '';
+  runtimeTmpfilesRules =
+    lib.filter (rule: rule != "")
+      (lib.splitString "\n" (builtins.readFile ../data/networkmanager-ms-sso.tmpfiles));
+  nixRuntimeTmpfilesRules =
+    map
+      (rule:
+        if lib.hasPrefix "d /var/cache/ms-playwright " rule
+        then "L+ /var/cache/ms-playwright - - - - ${playwright-driver.browsers}"
+        else rule)
+      runtimeTmpfilesRules;
 in
 python3Packages.buildPythonApplication rec {
   pname = "networkmanager-ms-sso";
@@ -69,10 +79,6 @@ python3Packages.buildPythonApplication rec {
       openresolv
       coreutils
     ])
-    "--set" "HOME" "/var/cache/ms-sso-openconnect"
-    "--set" "SUDO_USER" "ms-sso-openconnect"
-    "--set" "PLAYWRIGHT_BROWSERS_PATH" "/var/cache/ms-playwright"
-    "--set" "XDG_CACHE_HOME" "/var/cache/ms-sso-openconnect/.cache"
     "--set" "MS_SSO_GP_HIP_REPORT_WRAPPER" "${placeholder "out"}/libexec/nm-ms-sso-gp-hipreport"
     "--prefix" "GI_TYPELIB_PATH" ":" (lib.makeSearchPath "lib/girepository-1.0" [
       networkmanager
@@ -109,10 +115,7 @@ python3Packages.buildPythonApplication rec {
       iproute2
       procps
     ];
-    networkManagerTmpfilesRules = [
-      "L+ /var/cache/ms-playwright - - - - ${playwright-driver.browsers}"
-      "d /var/cache/ms-sso-openconnect 0755 root root -"
-    ];
+    networkManagerTmpfilesRules = nixRuntimeTmpfilesRules;
   };
 
   doCheck = false;

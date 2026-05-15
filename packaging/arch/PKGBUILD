@@ -67,6 +67,6 @@ build() {
 package() {
   meson install -C "${srcdir}/build" --destdir "${pkgdir}"
   install -Dm644 \
-    "${srcdir}/${_repo_name}/packaging/arch/networkmanager-ms-sso.conf" \
+    "${srcdir}/${_repo_name}/data/networkmanager-ms-sso.tmpfiles" \
     "${pkgdir}/usr/lib/tmpfiles.d/networkmanager-ms-sso.conf"
 }
