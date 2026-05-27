@@ -24,6 +24,7 @@ import logging
 import socket
 import ipaddress
 import shutil
+import stat
 from pathlib import Path
 from typing import Optional
 
@@ -391,6 +392,72 @@ class VPNPluginService(dbus.service.Object):
         except Exception:
             pass
         return tun_devs
+
+    def _tun_char_device_ready(self) -> bool:
+        """Return True when /dev/net/tun can be opened."""
+        try:
+            fd = os.open("/dev/net/tun", os.O_RDWR | os.O_NONBLOCK)
+            os.close(fd)
+            return True
+        except OSError as e:
+            log.info(f"TUN device check failed: {e}")
+            return False
+
+    def _create_tun_char_device(self) -> None:
+        """Best-effort creation of the standard /dev/net/tun character device."""
+        try:
+            os.makedirs("/dev/net", exist_ok=True)
+            if not os.path.exists("/dev/net/tun"):
+                os.mknod(
+                    "/dev/net/tun",
+                    stat.S_IFCHR | 0o666,
+                    os.makedev(10, 200),
+                )
+                log.info("Created missing /dev/net/tun character device")
+            os.chmod("/dev/net/tun", 0o666)
+        except PermissionError as e:
+            log.warning(f"No permission to create /dev/net/tun: {e}")
+        except FileExistsError:
+            pass
+        except Exception as e:
+            log.warning(f"Could not create /dev/net/tun: {e}")
+
+    def _ensure_tun_available(self) -> bool:
+        """Ensure OpenConnect can open /dev/net/tun before consuming cookies."""
+        if self._tun_char_device_ready():
+            return True
+
+        modprobe = shutil.which("modprobe")
+        if modprobe:
+            try:
+                result = subprocess.run(
+                    [modprobe, "tun"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    log.info("Loaded tun kernel module")
+                else:
+                    log.warning(
+                        "modprobe tun failed: "
+                        f"{(result.stderr or result.stdout).strip()}"
+                    )
+            except Exception as e:
+                log.warning(f"modprobe tun failed: {e}")
+        else:
+            log.warning("modprobe not found in PATH; cannot auto-load tun module")
+
+        self._create_tun_char_device()
+
+        for _ in range(20):
+            if self._tun_char_device_ready():
+                return True
+            time.sleep(0.25)
+
+        log.error("TUN device unavailable: /dev/net/tun cannot be opened")
+        return False
 
     def _parse_gateway_host(self, gateway: str) -> str:
         """Return the hostname part of the configured VPN gateway."""
@@ -1626,6 +1693,13 @@ class VPNPluginService(dbus.service.Object):
             resolve_arg = self._get_openconnect_resolve_arg()
             reconnect_arg = "--reconnect-timeout=300"
             dpd_arg = "--force-dpd=30"
+
+            if not self._ensure_tun_available():
+                return (
+                    False,
+                    "TUN device unavailable: could not open /dev/net/tun",
+                    0,
+                )
 
             if protocol == 'gp' and 'prelogin-cookie' in cookies:
                 cookie_str = cookies.get('prelogin-cookie', '')

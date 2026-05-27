@@ -17,6 +17,7 @@
 , systemd
 , openresolv
 , coreutils
+, kmod
 , playwright-driver
 , ms-sso-openconnect-core
 }:
@@ -78,6 +79,7 @@ python3Packages.buildPythonApplication rec {
       systemd
       openresolv
       coreutils
+      kmod
     ])
     "--set" "MS_SSO_GP_HIP_REPORT_WRAPPER" "${placeholder "out"}/libexec/nm-ms-sso-gp-hipreport"
     "--prefix" "GI_TYPELIB_PATH" ":" (lib.makeSearchPath "lib/girepository-1.0" [
