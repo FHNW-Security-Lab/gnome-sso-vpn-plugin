@@ -440,10 +440,14 @@ class VPNPluginService(dbus.service.Object):
                 if result.returncode == 0:
                     log.info("Loaded tun kernel module")
                 else:
-                    log.warning(
-                        "modprobe tun failed: "
-                        f"{(result.stderr or result.stdout).strip()}"
-                    )
+                    output = (result.stderr or result.stdout).strip()
+                    log.warning(f"modprobe tun failed: {output}")
+                    if "Module tun not found in directory" in output:
+                        log.error(
+                            "Kernel module mismatch detected: running kernel "
+                            f"{os.uname().release} has no tun module installed. "
+                            "Reboot into the installed kernel or install matching kernel modules."
+                        )
             except Exception as e:
                 log.warning(f"modprobe tun failed: {e}")
         else:
@@ -458,6 +462,14 @@ class VPNPluginService(dbus.service.Object):
 
         log.error("TUN device unavailable: /dev/net/tun cannot be opened")
         return False
+
+    def _tun_unavailable_message(self) -> str:
+        """Return a user-actionable TUN prerequisite error."""
+        return (
+            "TUN device unavailable: could not open /dev/net/tun. "
+            f"Running kernel is {os.uname().release}; reboot into the installed kernel "
+            "or install matching kernel modules so modprobe tun succeeds."
+        )
 
     def _parse_gateway_host(self, gateway: str) -> str:
         """Return the hostname part of the configured VPN gateway."""
@@ -1165,6 +1177,9 @@ class VPNPluginService(dbus.service.Object):
                 self._clear_onlink_host_route(self.current_gateway_ip)
                 self._cleanup_anyconnect_physical_routes()
 
+            if protocol in {'anyconnect', 'gp'} and not self._ensure_tun_available():
+                raise Exception(self._tun_unavailable_message())
+
             # Only GP gets pre-tunnel Config keepalives. For AnyConnect this can
             # make NetworkManager show "connected" even though SAML produced no
             # cookie and no tun device exists yet.
@@ -1697,7 +1712,7 @@ class VPNPluginService(dbus.service.Object):
             if not self._ensure_tun_available():
                 return (
                     False,
-                    "TUN device unavailable: could not open /dev/net/tun",
+                    self._tun_unavailable_message(),
                     0,
                 )
 
