@@ -79,13 +79,13 @@ The same value can be configured with `nmcli`:
 nmcli connection modify "<connection name>" +vpn.data gp-os-version "Ubuntu 26.04 LTS"
 ```
 
-GlobalProtect and AnyConnect SAML use a fresh browser session by default. This
-avoids stale cached IdP state that can hang before TOTP or return no login
-cookies. If your provider requires reusing browser SSO state, enable it
-explicitly:
+GlobalProtect and AnyConnect SAML reuse a browser session by default. This keeps
+Microsoft/IdP SSO state across reconnects, avoids repeated TOTP prompts, and
+makes long-running AnyConnect deployments such as FHNW less fragile. If a stale
+IdP session causes problems, force a fresh browser session explicitly:
 
 ```bash
-nmcli connection modify "<connection name>" +vpn.data enable-browser-session-cache 1
+nmcli connection modify "<connection name>" +vpn.data disable-browser-session-cache 1
 ```
 
 GlobalProtect emits only the first VPN DNS server by default. This avoids slow
@@ -100,9 +100,10 @@ AnyConnect keeps all pushed VPN DNS servers by default. During reconnects, a
 tunnel that pushes VPN DNS is only accepted after at least one pushed DNS server
 responds.
 
-Slow AnyConnect SAML/MFA flows emit a gateway-only keepalive during auth to
-avoid NetworkManager's connect timeout. IP routes and DNS are still only emitted
-after OpenConnect has created and validated a real tunnel.
+AnyConnect does not emit a pre-tunnel "started" state by default. This avoids a
+half-connected NetworkManager state where the UI shows a tunnel but no VPN IP,
+routes, or DNS are usable yet. IP routes and DNS are only emitted after
+OpenConnect has created and validated a real tunnel.
 
 ## Nix Flake Usage
 

@@ -17,7 +17,7 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from typing import Optional
+from typing import Callable, Optional
 
 from playwright.sync_api import sync_playwright
 
@@ -186,6 +186,7 @@ def do_saml_auth(
     vpn_server_ip: Optional[str] = None,
     disable_browser_session_cache: bool = False,
     gp_os_version: Optional[str] = None,
+    cancel_callback: Optional[Callable[[], bool]] = None,
 ):
     """Complete Microsoft SAML authentication and return cookies."""
     vpn_server_raw = vpn_server
@@ -198,6 +199,18 @@ def do_saml_auth(
         vpn_server_netloc = vpn_server_raw
 
     vpn_url = f"https://{vpn_server_netloc}"
+
+    def _cancelled() -> bool:
+        if not cancel_callback:
+            return False
+        try:
+            return bool(cancel_callback())
+        except Exception:
+            return False
+
+    def _raise_if_cancelled() -> None:
+        if _cancelled():
+            raise RuntimeError("SAML authentication cancelled")
 
     gp_prelogin_cookie, gp_saml_request, gp_gateway_ip = None, None, None
     if protocol == "gp":
@@ -316,6 +329,7 @@ def do_saml_auth(
             break
 
     with sync_playwright() as p:
+        _raise_if_cancelled()
         session_tmp_dir = None
         if force_ephemeral_browser_session:
             session_tmp_dir = tempfile.mkdtemp(prefix="ms-sso-openconnect-auth-")
@@ -348,12 +362,39 @@ def do_saml_auth(
                 if debug:
                     print(f"    [DEBUG] Falling back to temporary browser session dir: {cache_dir}")
 
+        def _chromium_executable_path() -> Optional[str]:
+            configured = os.environ.get("MS_SSO_PLAYWRIGHT_EXECUTABLE", "").strip()
+            if configured:
+                return configured
+            try:
+                executable = p.chromium.executable_path
+                if executable and os.path.exists(executable):
+                    return executable
+            except Exception:
+                pass
+            return None
+
         def _launch_context():
+            executable_path = _chromium_executable_path()
+            if debug and executable_path:
+                print(f"    [DEBUG] Using Chromium executable: {executable_path}")
             return p.chromium.launch_persistent_context(
                 cache_dir,
                 headless=headless,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                executable_path=executable_path,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1280,720",
+                ],
+                viewport={"width": 1280, "height": 720},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                locale="de-CH",
             )
 
         try:
@@ -366,6 +407,10 @@ def do_saml_auth(
             if debug:
                 print("    [DEBUG] Retrying Playwright launch after Chromium runtime install")
             context = _launch_context()
+        try:
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        except Exception:
+            pass
         page = context.pages[0] if context.pages else context.new_page()
 
         def _close_context() -> None:
@@ -442,12 +487,14 @@ def do_saml_auth(
         ui_change_event = threading.Event()
 
         def _wait_for_vpn_callback(timeout_ms: int = 60000) -> None:
+            _raise_if_cancelled()
             if _is_vpn_url(page.url) and protocol != "anyconnect":
                 return
             if _auth_capture_complete():
                 return
             deadline = time.time() + (timeout_ms / 1000.0)
             while time.time() < deadline:
+                _raise_if_cancelled()
                 if _auth_capture_complete():
                     return
                 if _is_vpn_url(page.url) and protocol != "anyconnect":
@@ -756,6 +803,7 @@ def do_saml_auth(
         def _wait_until_ready(timeout_seconds: float = 1.0) -> None:
             deadline = time.monotonic() + timeout_seconds
             while time.monotonic() < deadline:
+                _raise_if_cancelled()
                 if (
                     _is_vpn_url(page.url)
                     or saml_result.get("saml_response")
@@ -779,6 +827,7 @@ def do_saml_auth(
             wait_targets = ["domcontentloaded", "load", "networkidle"]
             for attempt in range(3):
                 for wait_until in wait_targets:
+                    _raise_if_cancelled()
                     try:
                         page.goto(url, timeout=timeout_ms, wait_until=wait_until)
                         _wait_until_ready(0.5)
@@ -806,6 +855,7 @@ def do_saml_auth(
             return False
 
         try:
+            _raise_if_cancelled()
             if protocol == "gp" and gp_saml_request:
                 try:
                     start_url = base64.b64decode(gp_saml_request).decode("utf-8")
@@ -826,6 +876,7 @@ def do_saml_auth(
                 print("    [DEBUG] Screenshot: /tmp/vpn-step1-portal.png")
 
             _wait_until_ready(0.5)
+            _raise_if_cancelled()
             if _is_vpn_url(page.url):
                 all_cookies = context.cookies()
                 session_cookies = {}
@@ -851,12 +902,16 @@ def do_saml_auth(
             filled_password = False
             filled_otp = False
             adfs_submit_attempts = 0
+            blank_login_reloads = 0
+            last_progress_time = time.monotonic()
 
-            timeout_seconds = int(os.environ.get("MS_SSO_SAML_TIMEOUT", "90"))
+            default_saml_timeout = "55" if protocol == "anyconnect" else "90"
+            timeout_seconds = int(os.environ.get("MS_SSO_SAML_TIMEOUT", default_saml_timeout))
             if protocol == "gp":
                 timeout_seconds = max(timeout_seconds, 180)
             deadline = time.time() + timeout_seconds
             while time.time() < deadline:
+                _raise_if_cancelled()
                 if _auth_capture_complete():
                     break
                 if _is_vpn_url(page.url) and protocol != "anyconnect":
@@ -1030,15 +1085,34 @@ def do_saml_auth(
                     progressed = True
 
                 if progressed:
+                    last_progress_time = time.monotonic()
                     try:
                         page.wait_for_load_state("domcontentloaded", timeout=1500)
                     except Exception:
                         pass
                     _wait_until_ready(0.2)
                 else:
+                    if (
+                        blank_login_reloads < 2
+                        and "login.microsoftonline.com" in page.url.lower()
+                        and not _auth_ui_ready()
+                        and time.monotonic() - last_progress_time > 8
+                    ):
+                        try:
+                            blank_login_reloads += 1
+                            last_progress_time = time.monotonic()
+                            if debug:
+                                print("    [DEBUG] Microsoft login page stayed blank; reloading")
+                            page.reload(timeout=15000, wait_until="domcontentloaded")
+                            _wait_until_ready(1.0)
+                            continue
+                        except Exception as reload_error:
+                            if debug:
+                                print(f"    [DEBUG] Microsoft login reload failed: {reload_error}")
                     _wait_until_ready(0.1)
 
             _wait_for_vpn_callback(timeout_seconds * 1000)
+            _raise_if_cancelled()
 
             # Collect cookies
             all_cookies = context.cookies()
@@ -1062,6 +1136,11 @@ def do_saml_auth(
                         "    [DEBUG] Ignoring incomplete AnyConnect auth result "
                         f"(cookies={list(vpn_cookies.keys())})"
                     )
+                    try:
+                        page.screenshot(path="/tmp/vpn-auth-incomplete.png")
+                        print("    [DEBUG] Screenshot: /tmp/vpn-auth-incomplete.png")
+                    except Exception:
+                        pass
                 vpn_cookies = {}
 
             if debug:

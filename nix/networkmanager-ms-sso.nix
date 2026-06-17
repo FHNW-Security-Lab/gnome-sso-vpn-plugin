@@ -81,6 +81,7 @@ python3Packages.buildPythonApplication rec {
       coreutils
       kmod
     ])
+    "--set" "PLAYWRIGHT_BROWSERS_PATH" "${playwright-driver.browsers}"
     "--set" "MS_SSO_GP_HIP_REPORT_WRAPPER" "${placeholder "out"}/libexec/nm-ms-sso-gp-hipreport"
     "--prefix" "GI_TYPELIB_PATH" ":" (lib.makeSearchPath "lib/girepository-1.0" [
       networkmanager
