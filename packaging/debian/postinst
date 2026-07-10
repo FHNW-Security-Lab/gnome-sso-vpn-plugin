@@ -5,31 +5,41 @@ case "$1" in
     configure)
         echo "Setting up MS SSO OpenConnect VPN plugin..."
 
-        # Install playwright Python package system-wide
-        echo "Checking playwright installation..."
-        if ! python3 -c "import playwright" 2>/dev/null; then
-            echo "Installing playwright Python package..."
-            pip3 install --break-system-packages playwright || \
-            pip3 install playwright || {
-                echo "ERROR: Could not install playwright via pip."
-                echo "Please run manually: sudo pip3 install playwright"
+        echo "Checking Playwright driver..."
+        if ! python3 -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); p.stop()' 2>/dev/null; then
+            echo "Installing a coherent Playwright Python/Node runtime..."
+            # Ubuntu's Python package can exist without its matching Node
+            # driver. Overlay a complete upstream runtime without trying to
+            # uninstall distro-owned files.
+            pip3 install --break-system-packages --ignore-installed 'playwright>=1.55,<2' || \
+            pip3 install --ignore-installed 'playwright>=1.55,<2' || {
+                echo "ERROR: Could not install the Playwright runtime."
                 exit 1
             }
-        else
-            echo "Playwright Python package already installed."
         fi
 
-        # Always install chromium browser for playwright (uses python3 -m to ensure correct module)
-        echo "Installing Chromium browser for playwright (this may take a few minutes)..."
-        # Use python3 -m playwright to ensure we use the correct module
-        # Install with --with-deps to get system dependencies
-        python3 -m playwright install chromium --with-deps || \
-        python3 -m playwright install chromium || {
-            echo "ERROR: Could not install Chromium browser for playwright."
-            echo "Please run manually: sudo python3 -m playwright install chromium --with-deps"
-            exit 1
-        }
-        echo "Chromium browser installed successfully."
+        # Avoid nested apt from dpkg. Reuse either the package-owned cache or a
+        # compatible legacy cache, and only download Chromium when both fail.
+        if env PLAYWRIGHT_BROWSERS_PATH=/var/cache/ms-playwright \
+            python3 -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True, args=["--no-sandbox"]); b.close(); p.stop()' 2>/dev/null || \
+            python3 -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True, args=["--no-sandbox"]); b.close(); p.stop()' 2>/dev/null; then
+            echo "Playwright Chromium runtime already installed."
+        else
+            echo "Installing Chromium runtime for Playwright..."
+            mkdir -p /var/cache/ms-playwright
+            PLAYWRIGHT_BROWSERS_PATH=/var/cache/ms-playwright \
+                python3 -m playwright install chromium || {
+                    echo "ERROR: Could not install Chromium for Playwright."
+                    echo "Please run manually: sudo PLAYWRIGHT_BROWSERS_PATH=/var/cache/ms-playwright python3 -m playwright install chromium"
+                    exit 1
+                }
+            if ! env PLAYWRIGHT_BROWSERS_PATH=/var/cache/ms-playwright \
+                python3 -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True, args=["--no-sandbox"]); b.close(); p.stop()' 2>/dev/null; then
+                echo "ERROR: Chromium was installed but cannot start; required system libraries may be missing."
+                exit 1
+            fi
+            echo "Chromium runtime installed successfully."
+        fi
 
         # Restart NetworkManager to pick up the new plugin
         if systemctl is-active --quiet NetworkManager; then

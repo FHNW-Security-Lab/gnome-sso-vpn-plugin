@@ -252,6 +252,7 @@ class VPNPluginService(dbus.service.Object):
         secrets['reconnect_max_delay_seconds'] = vpn_data.get('reconnect-max-delay-seconds', '')
         secrets['reconnect_max_attempts'] = vpn_data.get('reconnect-max-attempts', '')
         secrets['dns_server_limit'] = vpn_data.get('dns-server-limit', '')
+        secrets['mfa_preference'] = vpn_data.get('mfa-preference', '')
 
         # Extract secrets
         secrets['password'] = vpn_secrets.get('password', '')
@@ -336,6 +337,12 @@ class VPNPluginService(dbus.service.Object):
                 or cookies.get('SVPNCOOKIE')
             )
         )
+
+    @staticmethod
+    def _is_cookie_rejection(error_msg) -> bool:
+        """Return True when OpenConnect explicitly rejected a session cookie."""
+        text = str(error_msg or '').lower()
+        return 'cookie' in text and any(token in text for token in ('reject', 'invalid', 'fail'))
 
     def _gp_early_started_enabled(self) -> bool:
         """Whether GP should optimistically report STARTED during auth."""
@@ -525,6 +532,13 @@ class VPNPluginService(dbus.service.Object):
                 break
 
             if not chunk:
+                partial = getattr(self, "_vpn_stdout_partial", "")
+                if partial:
+                    openconnect_reported_up = self._process_vpn_output_line(
+                        partial,
+                        openconnect_reported_up,
+                    )
+                    self._vpn_stdout_partial = ""
                 break
 
             text = chunk.decode('utf-8', errors='replace')
@@ -532,51 +546,65 @@ class VPNPluginService(dbus.service.Object):
             if len(output_buffer) > 65536:
                 output_buffer = output_buffer[-65536:]
 
-            for line in text.split('\n'):
-                stripped = line.strip()
-                if not stripped:
+            pending = getattr(self, "_vpn_stdout_partial", "") + text
+            self._vpn_stdout_partial = ""
+            for line in pending.splitlines(keepends=True):
+                if not line.endswith(('\n', '\r')):
+                    self._vpn_stdout_partial = line
                     continue
-                line_lc = line.lower()
-                if 'DNS' in line.upper():
-                    log.info(f"OpenConnect DNS info: {stripped}")
-                    ips = re.findall(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b', line)
-                    for ip in ips:
-                        if ip not in self.vpn_dns_servers:
-                            self.vpn_dns_servers.append(ip)
-                            log.info(f"Captured VPN DNS: {ip}")
-                if 'domain' in line_lc or 'search' in line_lc:
-                    log.info(f"OpenConnect domain info: {stripped}")
-                    self._capture_vpn_domains(stripped)
-                if 'x-cstp-tunnel-all-dns' in line_lc:
-                    value = stripped.split(':', 1)[1].strip() if ':' in stripped else ''
-                    parsed = self._parse_bool(value)
-                    if parsed is not None:
-                        self.vpn_tunnel_all_dns = parsed
-                        log.info(f"Captured Tunnel-All-DNS: {self.vpn_tunnel_all_dns}")
-                if 'x-cstp-split-exclude' in line_lc:
-                    self._capture_split_route(stripped, self.vpn_split_excludes, "exclude")
-                if 'x-cstp-split-include' in line_lc:
-                    self._capture_split_route(stripped, self.vpn_split_includes, "include")
-                if any(marker in line_lc for marker in (
-                    'x-cstp-split',
-                    'x-cstp-address',
-                    'x-cstp-netmask',
-                    'x-cstp-route',
-                    'route',
-                )):
-                    log.info(f"OpenConnect route info: {stripped}")
-                if (
-                    "connected as " in line_lc
-                    or "cstp connected" in line_lc
-                    or "esp session established" in line_lc
-                    or "dtls connected" in line_lc
-                    or "tun opened" in line_lc
-                ):
-                    if not openconnect_reported_up:
-                        openconnect_reported_up = True
-                        log.info("OpenConnect reported tunnel session up")
+                openconnect_reported_up = self._process_vpn_output_line(
+                    line.rstrip('\r\n'),
+                    openconnect_reported_up,
+                )
 
         return output_buffer, openconnect_reported_up
+
+    def _process_vpn_output_line(self, line: str, openconnect_reported_up: bool) -> bool:
+        """Parse one complete OpenConnect output line."""
+        stripped = line.strip()
+        if not stripped:
+            return openconnect_reported_up
+
+        line_lc = line.lower()
+        if 'DNS' in line.upper():
+            log.info(f"OpenConnect DNS info: {stripped}")
+            ips = re.findall(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b', line)
+            for ip in ips:
+                if ip not in self.vpn_dns_servers:
+                    self.vpn_dns_servers.append(ip)
+                    log.info(f"Captured VPN DNS: {ip}")
+        if 'domain' in line_lc or 'search' in line_lc:
+            log.info(f"OpenConnect domain info: {stripped}")
+            self._capture_vpn_domains(stripped)
+        if 'x-cstp-tunnel-all-dns' in line_lc:
+            value = stripped.split(':', 1)[1].strip() if ':' in stripped else ''
+            parsed = self._parse_bool(value)
+            if parsed is not None:
+                self.vpn_tunnel_all_dns = parsed
+                log.info(f"Captured Tunnel-All-DNS: {self.vpn_tunnel_all_dns}")
+        if 'x-cstp-split-exclude' in line_lc:
+            self._capture_split_route(stripped, self.vpn_split_excludes, "exclude")
+        if 'x-cstp-split-include' in line_lc:
+            self._capture_split_route(stripped, self.vpn_split_includes, "include")
+        if any(marker in line_lc for marker in (
+            'x-cstp-split',
+            'x-cstp-address',
+            'x-cstp-netmask',
+            'x-cstp-route',
+            'route',
+        )):
+            log.info(f"OpenConnect route info: {stripped}")
+        if (
+            "connected as " in line_lc
+            or "cstp connected" in line_lc
+            or "esp session established" in line_lc
+            or "dtls connected" in line_lc
+            or "tun opened" in line_lc
+        ):
+            if not openconnect_reported_up:
+                log.info("OpenConnect reported tunnel session up")
+            return True
+        return openconnect_reported_up
 
     def _capture_vpn_domains(self, line: str):
         """Capture DNS/search domains reported by OpenConnect."""
@@ -1087,6 +1115,14 @@ class VPNPluginService(dbus.service.Object):
             password = secrets['password']
             totp_secret = secrets['totp_secret']
             gp_os_version = (secrets.get('gp_os_version') or '').strip()
+            mfa_preference = str(
+                secrets.get('mfa_preference')
+                or os.environ.get("MS_SSO_MFA_PREFERENCE")
+                or "auto"
+            ).strip().lower()
+            if mfa_preference not in {'auto', 'totp', 'push'}:
+                log.warning(f"Ignoring invalid MFA preference: {mfa_preference!r}")
+                mfa_preference = 'auto'
             disable_cookie_cache = (
                 self._is_truthy(secrets.get('disable_cookie_cache'))
                 or self._is_truthy(os.environ.get("MS_SSO_NM_DISABLE_COOKIE_CACHE"))
@@ -1120,6 +1156,7 @@ class VPNPluginService(dbus.service.Object):
                 "Browser session cache: "
                 f"{'disabled' if disable_browser_session_cache else 'enabled'}"
             )
+            log.info(f"MFA preference: {mfa_preference}")
             if protocol in {'gp', 'anyconnect'} and disable_browser_session_cache and not force_enable_browser_session_cache:
                 log.info(
                     f"{protocol} uses a fresh browser session by configuration; "
@@ -1187,14 +1224,14 @@ class VPNPluginService(dbus.service.Object):
                 # Delay GP's first Config emission as well; keep UI in "connecting".
                 self.gp_connect_start_time = time.monotonic()
                 if os.environ.get("MS_SSO_NM_GP_EARLY_CONFIG", "").lower() in {"1", "true", "yes"}:
-                    GLib.idle_add(self._emit_initial_config)
+                    GLib.idle_add(self._emit_initial_config, connect_generation)
             # NetworkManager expects the plugin to reach STARTED in a timely manner or it
             # may cancel the connection (observed ~60s). GlobalProtect SAML/MFA flows can
             # easily exceed that, so GP defaults to optimistic STARTED during auth.
             # Set MS_SSO_NM_GP_EARLY_STARTED=0 to keep "Connecting" until tunnel up.
             if protocol == 'gp':
                 if self._gp_early_started_enabled():
-                    GLib.idle_add(self._emit_started_for_auth)
+                    GLib.idle_add(self._emit_started_for_auth, connect_generation)
 
             # Connection name for cookie cache
             connection_name = f"nm-{gateway}"
@@ -1307,6 +1344,7 @@ class VPNPluginService(dbus.service.Object):
                 final_error = None
                 session_used_cache = False
                 fresh_auth_attempts = 0
+                terminal_auth_failure = False
 
                 for attempt in range(max_attempts):
                     log.info(f"Connection attempt {attempt + 1}/{max_attempts}")
@@ -1410,12 +1448,12 @@ class VPNPluginService(dbus.service.Object):
                                 if _connect_cancelled():
                                     return
                                 if self._auth_initial_config_allowed(protocol):
-                                    GLib.idle_add(self._emit_initial_config)
+                                    GLib.idle_add(self._emit_initial_config, connect_generation)
                                 # Keep NetworkManager from thinking the connection stalled.
                                 if self._should_emit_started_keepalive(protocol):
-                                    GLib.idle_add(self._emit_started_keepalive)
+                                    GLib.idle_add(self._emit_started_keepalive, connect_generation)
                                 else:
-                                    GLib.idle_add(self._emit_starting_keepalive)
+                                    GLib.idle_add(self._emit_starting_keepalive, connect_generation)
 
                         keepalive_thread = threading.Thread(target=_saml_keepalive, daemon=True)
                         keepalive_thread.start()
@@ -1456,11 +1494,19 @@ class VPNPluginService(dbus.service.Object):
                                 totp_secret=totp_secret,
                                 auto_totp=True,
                                 headless=True,
-                                debug=True,  # Enable debug to see screenshots
+                                debug=self._is_truthy(os.environ.get("MS_SSO_NM_DEBUG_AUTH")),
                                 protocol=protocol,  # Pass protocol for correct SAML URL
                                 disable_browser_session_cache=disable_browser_session_cache,
                                 gp_os_version=gp_os_version or None,
                                 cancel_callback=_connect_cancelled,
+                                progress_callback=lambda event: log.info(
+                                    f"SAML flow: {event}"
+                                ),
+                                mfa_preference=mfa_preference,
+                                notification_helper_path=os.path.join(
+                                    os.path.dirname(os.path.abspath(__file__)),
+                                    "nm-ms-sso-notify",
+                                ),
                             )
                             log.info(f"SAML auth returned cookies: {list(cookies.keys()) if cookies else 'none'}")
                             if protocol == 'anyconnect' and cookies and not self._has_usable_anyconnect_cookies(cookies):
@@ -1492,9 +1538,11 @@ class VPNPluginService(dbus.service.Object):
                             stop_keepalive.set()
 
                         if auth_failed:
+                            terminal_auth_failure = True
                             break
                         if not cookies:
                             final_error = "SAML authentication returned no cookies"
+                            terminal_auth_failure = True
                             break
 
                         # Store fresh cookies unless cache is explicitly disabled.
@@ -1527,6 +1575,7 @@ class VPNPluginService(dbus.service.Object):
                         log.info("Connect cancelled after OpenConnect attempt; preserving cookie cache")
                         return
 
+                    cookie_rejected = self._is_cookie_rejection(error_msg)
                     if success:
                         connection_ended = True
                         connection_uptime_seconds = uptime_seconds
@@ -1534,15 +1583,7 @@ class VPNPluginService(dbus.service.Object):
                         log.info("VPN connection established and later ended")
                         break
                     elif used_cache and attempt < max_attempts - 1:
-                        if (
-                            error_msg
-                            and 'cookie' in error_msg.lower()
-                            and (
-                                'reject' in error_msg.lower()
-                                or 'invalid' in error_msg.lower()
-                                or 'fail' in error_msg.lower()
-                            )
-                        ):
+                        if cookie_rejected:
                             log.warning("Cached cookie rejected, clearing cache and re-authenticating...")
                             clear_nm_cookies(connection_name)
                             continue
@@ -1570,6 +1611,8 @@ class VPNPluginService(dbus.service.Object):
                                 return
                         continue
                     else:
+                        if not used_cache and cookie_rejected:
+                            terminal_auth_failure = True
                         if (
                             not used_cache
                             and not (
@@ -1586,6 +1629,11 @@ class VPNPluginService(dbus.service.Object):
                     return
 
                 if not connection_ended:
+                    if terminal_auth_failure:
+                        # Credential/MFA failures are not transport failures. A
+                        # watchdog retry would only launch another browser/MFA
+                        # flow inside the same NetworkManager activation.
+                        raise Exception(final_error or "SAML authentication failed")
                     reconnect_attempt += 1
                     if not auto_reconnect:
                         raise Exception(final_error or "VPN connection failed")
@@ -1606,11 +1654,11 @@ class VPNPluginService(dbus.service.Object):
                         f"retrying in {delay_seconds}s (attempt {reconnect_attempt}/{reconnect_limit_label})"
                     )
                     if protocol == 'gp' and self._gp_early_started_enabled():
-                        GLib.idle_add(self._emit_started_keepalive)
+                        GLib.idle_add(self._emit_started_keepalive, connect_generation)
                     else:
-                        GLib.idle_add(self._emit_starting_keepalive)
+                        GLib.idle_add(self._emit_starting_keepalive, connect_generation)
                     if protocol == 'gp' and self._gp_initial_config_allowed():
-                        GLib.idle_add(self._emit_initial_config)
+                        GLib.idle_add(self._emit_initial_config, connect_generation)
                     if not self._interruptible_sleep(delay_seconds, connect_generation):
                         return
                     continue
@@ -1640,7 +1688,7 @@ class VPNPluginService(dbus.service.Object):
                         # Keep NetworkManager in a reconnecting state until a new
                         # tunnel is actually established. Advertising STARTED
                         # here leaves stale VPN routing/DNS active.
-                        GLib.idle_add(self._emit_starting_keepalive)
+                        GLib.idle_add(self._emit_starting_keepalive, connect_generation)
                         if not self._interruptible_sleep(delay_seconds, connect_generation):
                             return
                         continue
@@ -1653,7 +1701,7 @@ class VPNPluginService(dbus.service.Object):
                     reconnect_attempt += 1
 
                 if not auto_reconnect:
-                    GLib.idle_add(self._emit_disconnected)
+                    GLib.idle_add(self._emit_disconnected, connect_generation)
                     return
                 if reconnect_max_attempts > 0 and reconnect_attempt > reconnect_max_attempts:
                     raise Exception(
@@ -1673,11 +1721,11 @@ class VPNPluginService(dbus.service.Object):
                     f"(attempt {reconnect_attempt}/{reconnect_limit_label})"
                 )
                 if protocol == 'gp' and self._gp_early_started_enabled():
-                    GLib.idle_add(self._emit_started_keepalive)
+                    GLib.idle_add(self._emit_started_keepalive, connect_generation)
                 else:
-                    GLib.idle_add(self._emit_starting_keepalive)
+                    GLib.idle_add(self._emit_starting_keepalive, connect_generation)
                 if protocol == 'gp' and self._gp_initial_config_allowed():
-                    GLib.idle_add(self._emit_initial_config)
+                    GLib.idle_add(self._emit_initial_config, connect_generation)
                 if not self._interruptible_sleep(delay_seconds, connect_generation):
                     return
 
@@ -1686,7 +1734,7 @@ class VPNPluginService(dbus.service.Object):
             log.error(f"Connection error: {error_msg}")
             import traceback
             traceback.print_exc()
-            GLib.idle_add(lambda msg=error_msg: self._emit_failure(msg))
+            GLib.idle_add(self._emit_failure, error_msg, connect_generation)
 
     def _attempt_vpn_connection(
             self,
@@ -1719,6 +1767,9 @@ class VPNPluginService(dbus.service.Object):
             resolve_arg = self._get_openconnect_resolve_arg()
             reconnect_arg = "--reconnect-timeout=300"
             dpd_arg = "--force-dpd=30"
+            # Capture existing tunnel devices before OpenConnect can create its
+            # interface; a fast process must not make the new tun look stale.
+            baseline_tun_devs = self._list_tun_devices()
 
             if not self._ensure_tun_available():
                 return (
@@ -1773,9 +1824,6 @@ class VPNPluginService(dbus.service.Object):
             else:
                 cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
                 log.debug(f"Using AnyConnect cookie (len={len(cookie_str)})")
-                # Log first/last parts of cookie for debugging (without revealing sensitive parts)
-                if len(cookie_str) > 40:
-                    log.debug(f"Cookie preview: {cookie_str[:20]}...{cookie_str[-20:]}")
                 cmd = [
                     openconnect_bin,
                     "--verbose",
@@ -1821,6 +1869,7 @@ class VPNPluginService(dbus.service.Object):
             self.vpn_tunnel_all_dns = None
             self.vpn_split_excludes = []
             self.vpn_split_includes = []
+            self._vpn_stdout_partial = ""
 
             # Monitor for interface up and parse output for DNS
             # Wait for tun interface to come up
@@ -1830,7 +1879,6 @@ class VPNPluginService(dbus.service.Object):
             connected = False
             output_buffer = ""
             openconnect_reported_up = False
-            baseline_tun_devs = self._list_tun_devices()
 
             # Set stdout to non-blocking so we can read while checking interface
             import fcntl
@@ -1947,7 +1995,12 @@ class VPNPluginService(dbus.service.Object):
             log.info(f"VPN DNS servers captured: {self.vpn_dns_servers}")
 
             # Emit full IP config now that interface is up
-            GLib.idle_add(self._emit_connected)
+            GLib.idle_add(
+                self._emit_connected,
+                connect_generation,
+                vpn_process,
+                self.current_tun_device,
+            )
             if protocol == 'anyconnect' and self.vpn_dns_servers:
                 dns_probe_timeout = self._parse_positive_int(
                     os.environ.get("MS_SSO_NM_ANYCONNECT_DNS_PROBE_AFTER_CONFIG_SECONDS"),
@@ -2105,12 +2158,15 @@ class VPNPluginService(dbus.service.Object):
                 return (False, "Cookie rejected by server", 0)
             return (False, error_msg, 0)
 
-    def _emit_initial_config(self):
+    def _emit_initial_config(self, connect_generation: Optional[int] = None):
         """Emit initial Config signal before interface is created (called from main thread).
 
         Note: We DON'T include tundev here because NetworkManager will try to look it up
         immediately and fail if it doesn't exist yet.
         """
+        if connect_generation is not None and self._is_connect_cancelled(connect_generation):
+            log.info(f"Skipping stale initial config for generation {connect_generation}")
+            return False
         try:
             if self.current_protocol not in {'gp', 'anyconnect'}:
                 log.info(
@@ -2391,8 +2447,10 @@ class VPNPluginService(dbus.service.Object):
         finally:
             self.ipv6_leak_protection_enabled = False
 
-    def _emit_starting_keepalive(self):
+    def _emit_starting_keepalive(self, connect_generation: Optional[int] = None):
         """Emit a keepalive STARTING state to reduce NM connect timeouts."""
+        if connect_generation is not None and self._is_connect_cancelled(connect_generation):
+            return False
         try:
             # Intentionally emit even if our internal state didn't change.
             self.StateChanged(NM_VPN_SERVICE_STATE_STARTING)
@@ -2400,21 +2458,25 @@ class VPNPluginService(dbus.service.Object):
             pass
         return False
 
-    def _emit_started_for_auth(self):
+    def _emit_started_for_auth(self, connect_generation: Optional[int] = None):
         """Enter STARTED while authentication is still in progress.
 
         NetworkManager may cancel VPN connections that stay in STARTING too long.
         This is common for GlobalProtect SAML flows with MFA. We later emit the
         full Config/Ip4Config once the tunnel device exists.
         """
+        if connect_generation is not None and self._is_connect_cancelled(connect_generation):
+            return False
         try:
             self._set_state(NM_VPN_SERVICE_STATE_STARTED)
         except Exception:
             pass
         return False
 
-    def _emit_started_keepalive(self):
+    def _emit_started_keepalive(self, connect_generation: Optional[int] = None):
         """Emit a keepalive STARTED state."""
+        if connect_generation is not None and self._is_connect_cancelled(connect_generation):
+            return False
         try:
             # Keep local property state consistent with emitted signal.
             if self.state != NM_VPN_SERVICE_STATE_STARTED:
@@ -2425,13 +2487,25 @@ class VPNPluginService(dbus.service.Object):
             pass
         return False
 
-    def _emit_connected(self):
+    def _emit_connected(
+            self,
+            connect_generation: Optional[int] = None,
+            vpn_process=None,
+            tun_device: Optional[str] = None,
+    ):
         """Emit IP config after interface is up (called from main thread)."""
         import struct
 
+        if (
+            (connect_generation is not None and self._is_connect_cancelled(connect_generation))
+            or (vpn_process is not None and vpn_process is not self.vpn_process)
+        ):
+            log.info(f"Skipping stale connected callback for generation {connect_generation}")
+            return False
+
         try:
             # Get IP configuration from tun device
-            tun_dev = self.current_tun_device or 'tun0'
+            tun_dev = tun_device or self.current_tun_device or 'tun0'
             gateway = self.current_gateway or ''
 
             log.info(f"Emitting config for {tun_dev}, gateway {gateway}")
@@ -2442,8 +2516,14 @@ class VPNPluginService(dbus.service.Object):
             if not ip_addr:
                 log.warning(f"Refusing to emit connected state for {tun_dev}: no IPv4 address")
                 try:
-                    if self.vpn_process and self.vpn_process.poll() is None:
-                        self._stop_vpn_process(preserve_session=True, force=True)
+                    process = vpn_process or self.vpn_process
+                    if process and process.poll() is None:
+                        self._stop_vpn_process(
+                            preserve_session=True,
+                            force=True,
+                            process=process,
+                            connect_generation=connect_generation,
+                        )
                 except Exception:
                     pass
                 self._cleanup_dns()
@@ -2599,21 +2679,38 @@ class VPNPluginService(dbus.service.Object):
             # Now set state to started
             self._set_state(NM_VPN_SERVICE_STATE_STARTED)
         except Exception as e:
-            log.info(f"Error emitting config: {e}")
+            log.error(f"Error emitting config: {e}")
             import traceback
             traceback.print_exc()
-            self._set_state(NM_VPN_SERVICE_STATE_STARTED)
+            self.cancel_requested = True
+            try:
+                process = vpn_process or self.vpn_process
+                if process and process.poll() is None:
+                    self._stop_vpn_process(
+                        preserve_session=True,
+                        force=True,
+                        process=process,
+                        connect_generation=connect_generation,
+                    )
+            except Exception:
+                pass
+            self._emit_failure(str(e))
 
         return False
 
-    def _emit_disconnected(self):
+    def _emit_disconnected(self, connect_generation: Optional[int] = None):
         """Emit disconnected state (called from main thread)."""
+        if connect_generation is not None and self._is_connect_cancelled(connect_generation):
+            return False
         self._cleanup_dns()
         self._set_state(NM_VPN_SERVICE_STATE_STOPPED)
         return False
 
-    def _emit_failure(self, message):
+    def _emit_failure(self, message, connect_generation: Optional[int] = None):
         """Emit failure (called from main thread)."""
+        if connect_generation is not None and self._is_connect_cancelled(connect_generation):
+            log.info(f"Skipping stale failure callback for generation {connect_generation}")
+            return False
         self._cleanup_dns()
         self.Failure(NM_VPN_PLUGIN_FAILURE_CONNECT_FAILED)
         self._set_state(NM_VPN_SERVICE_STATE_STOPPED)

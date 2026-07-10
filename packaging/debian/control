@@ -3,7 +3,7 @@ Section: net
 Priority: optional
 Maintainer: MS SSO OpenConnect Maintainers <maintainers@example.com>
 Build-Depends: debhelper-compat (= 13),
-               meson (>= 0.53.0),
+               meson (>= 0.56.0),
                pkg-config,
                libnm-dev (>= 1.2.0),
                libgtk-4-dev (>= 4.0),
@@ -18,15 +18,22 @@ Depends: ${shlibs:Depends},
          ${misc:Depends},
          network-manager (>= 1.2.0),
          openconnect,
+         iproute2,
          python3,
          python3-pip,
          python3-gi,
-         python3-pyotp,
          python3-dbus,
+         python3-keyring,
+         python3-platformdirs,
+         util-linux,
          gir1.2-nm-1.0,
          gir1.2-gtk-4.0,
          gir1.2-adw-1,
-         gir1.2-secret-1
+         gir1.2-secret-1,
+         libasound2t64,
+         libatk-bridge2.0-0t64,
+         libnss3,
+         libxcomposite1
 Recommends: gnome-control-center
 Description: NetworkManager VPN plugin for MS SSO OpenConnect
  This package provides a NetworkManager VPN plugin for connecting

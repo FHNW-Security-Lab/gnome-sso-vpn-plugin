@@ -38,6 +38,8 @@ static const SecretSchema ms_sso_schema = {
 /* Protocol values */
 #define PROTO_ANYCONNECT   "anyconnect"
 #define PROTO_GP           "gp"
+#define DEFAULT_ANYCONNECT_TIMEOUT 180U
+#define DEFAULT_GP_TIMEOUT         300U
 
 /*
  * Editor Private Data
@@ -265,6 +267,16 @@ update_connection(NMVpnEditor *editor, NMConnection *connection, GError **error)
     /* Set protocol */
     protocol = (protocol_idx == 0) ? PROTO_ANYCONNECT : PROTO_GP;
     nm_setting_vpn_add_data_item(s_vpn, KEY_PROTOCOL, protocol);
+
+    /* SAML/MFA can legitimately exceed NetworkManager's 60-second default.
+     * Preserve explicit user values, but give new and legacy default profiles
+     * enough time to authenticate and bring up a real tunnel. */
+    if (nm_setting_vpn_get_timeout(s_vpn) == 0) {
+        guint timeout = (protocol_idx == 0)
+            ? DEFAULT_ANYCONNECT_TIMEOUT
+            : DEFAULT_GP_TIMEOUT;
+        g_object_set(s_vpn, NM_SETTING_VPN_TIMEOUT, timeout, NULL);
+    }
 
     /* Set secrets in NM connection (for NM's internal handling) */
     if (password && *password) {

@@ -18,6 +18,7 @@
 , openresolv
 , coreutils
 , kmod
+, util-linux
 , playwright-driver
 , ms-sso-openconnect-core
 }:
@@ -65,7 +66,6 @@ python3Packages.buildPythonApplication rec {
     dbus-python
     keyring
     secretstorage
-    pyotp
     playwright
     ms-sso-openconnect-core
   ];
@@ -80,6 +80,7 @@ python3Packages.buildPythonApplication rec {
       openresolv
       coreutils
       kmod
+      util-linux
     ])
     "--set" "PLAYWRIGHT_BROWSERS_PATH" "${playwright-driver.browsers}"
     "--set" "MS_SSO_GP_HIP_REPORT_WRAPPER" "${placeholder "out"}/libexec/nm-ms-sso-gp-hipreport"
@@ -117,6 +118,7 @@ python3Packages.buildPythonApplication rec {
       vpnc-scripts
       iproute2
       procps
+      util-linux
     ];
     networkManagerTmpfilesRules = nixRuntimeTmpfilesRules;
   };

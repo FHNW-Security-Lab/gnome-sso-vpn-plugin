@@ -20,6 +20,13 @@ Standalone GNOME NetworkManager plugin for MS SSO OpenConnect.
 
 Output artifacts are placed under `dist/`.
 
+Install the exact package path printed by the build with APT so its runtime
+dependencies are resolved automatically. For example:
+
+```bash
+sudo apt install "$PWD/dist/network-manager-ms-sso_2.0.1-1_amd64.deb"
+```
+
 ## Build Or Install On Arch
 
 Arch packaging is provided as an AUR-style `-git` package in `packaging/arch/`.
@@ -88,6 +95,25 @@ IdP session causes problems, force a fresh browser session explicitly:
 nmcli connection modify "<connection name>" +vpn.data disable-browser-session-cache 1
 ```
 
+Microsoft MFA is adaptive and TOTP-first by default (`mfa-preference=auto`).
+When a TOTP secret is configured, a visible code field is filled automatically.
+If Microsoft first shows a passkey or Authenticator number-matching prompt, the
+plugin chooses password/another sign-in method and switches to the registered
+TOTP method instead of waiting for phone approval. A persistent number-matching
+notification is used only when adaptive mode has no configured TOTP secret, or when
+`mfa-preference=push` explicitly requests phone approval. A mandatory passkey
+still cannot be completed because the headless VPN service has no interactive
+browser/OS hardware UI.
+
+You can force a registered MFA method for troubleshooting:
+
+```bash
+nmcli connection modify "<connection name>" +vpn.data mfa-preference push
+nmcli connection modify "<connection name>" +vpn.data mfa-preference totp
+```
+
+Use `auto`, `push`, or `totp`; `auto` is recommended.
+
 GlobalProtect emits only the first VPN DNS server by default. This avoids slow
 failover behavior when a secondary VPN DNS server is reachable but degraded.
 Override it if your VPN needs more DNS servers:
@@ -96,14 +122,22 @@ Override it if your VPN needs more DNS servers:
 nmcli connection modify "<connection name>" +vpn.data dns-server-limit 2
 ```
 
-AnyConnect keeps all pushed VPN DNS servers by default. During reconnects, a
-tunnel that pushes VPN DNS is only accepted after at least one pushed DNS server
-responds.
+AnyConnect keeps all pushed VPN DNS servers by default. The plugin waits for a
+real tunnel interface with IPv4 configuration before publishing the VPN routes
+and DNS settings to NetworkManager.
 
 AnyConnect does not emit a pre-tunnel "started" state by default. This avoids a
 half-connected NetworkManager state where the UI shows a tunnel but no VPN IP,
 routes, or DNS are usable yet. IP routes and DNS are only emitted after
 OpenConnect has created and validated a real tunnel.
+
+AnyConnect profiles created or saved through this editor use a 180-second
+NetworkManager activation timeout so slow SAML/MFA can finish without a forced
+reconnect. Existing profiles can be updated once with:
+
+```bash
+nmcli connection modify "<connection name>" vpn.timeout 180
+```
 
 ## Nix Flake Usage
 

@@ -57,6 +57,13 @@ install_data('src/nm-ms-sso-auth-dialog.py',
   install_mode: 'rwxr-xr-x',
 )
 
+# Run as the active desktop user to display and close MFA number-match prompts.
+install_data('src/nm-ms-sso-notify.py',
+  rename: 'nm-ms-sso-notify',
+  install_dir: libexecdir,
+  install_mode: 'rwxr-xr-x',
+)
+
 # Install GlobalProtect HIP wrapper. Stock OpenConnect's HIP script reports a
 # hardcoded Linux distro; this wrapper keeps the GP prelogin and HIP OS strings
 # consistent.

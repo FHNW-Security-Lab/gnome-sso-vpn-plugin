@@ -17,8 +17,8 @@ depends=(
   'python-gobject'
   'python-dbus'
   'python-keyring'
-  'python-pyotp'
   'python-playwright'
+  'util-linux'
 )
 makedepends=(
   'git'

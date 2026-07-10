@@ -11,7 +11,6 @@ python3Packages.buildPythonPackage rec {
 
   propagatedBuildInputs = with python3Packages; [
     keyring
-    pyotp
     playwright
     secretstorage
   ];

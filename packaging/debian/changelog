@@ -1,3 +1,15 @@
+network-manager-ms-sso (2.0.1-1) unstable; urgency=medium
+
+  * Make FHNW AnyConnect first-time authentication choose TOTP reliably
+  * Adapt to TOTP, Authenticator number matching, and passkey fallback flows
+  * Use a single bounded SAML deadline and faster browser navigation
+  * Preserve split OpenConnect output lines during tunnel detection
+  * Set explicit NetworkManager VPN activation timeouts for SAML/MFA
+  * Declare and preflight all Debian runtime dependencies
+  * Avoid repeated browser downloads and nested APT during package configuration
+
+ -- MS SSO OpenConnect Maintainers <maintainers@example.com>  Fri, 10 Jul 2026 13:26:22 +0200
+
 network-manager-ms-sso (2.0.0-1) unstable; urgency=medium
 
   * Version 2.0.0 release
