@@ -84,6 +84,7 @@ python3Packages.buildPythonApplication rec {
     ])
     "--set" "PLAYWRIGHT_BROWSERS_PATH" "${playwright-driver.browsers}"
     "--set" "MS_SSO_GP_HIP_REPORT_WRAPPER" "${placeholder "out"}/libexec/nm-ms-sso-gp-hipreport"
+    "--set" "MS_SSO_GP_HIP_REPORT_BASE" "${openconnect}/libexec/openconnect/hipreport.sh"
     "--prefix" "GI_TYPELIB_PATH" ":" (lib.makeSearchPath "lib/girepository-1.0" [
       networkmanager
       gtk4

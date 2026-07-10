@@ -78,13 +78,26 @@ For GlobalProtect, OpenConnect's `--os` option only accepts broad values such
 as `linux-64`; it cannot be set to a distro string. Configure the distro/version
 reported to GlobalProtect in the VPN editor's `GP OS Version` field. The value
 is sent as the prelogin `os-version` and in the HIP report. Empty uses the
-default `Ubuntu 26.04 LTS`.
+host's detected `/etc/os-release` name (for example Ubuntu, Arch Linux, or
+NixOS). Set an explicit value only when a gateway requires a compatibility
+override.
 
 The same value can be configured with `nmcli`:
 
 ```bash
-nmcli connection modify "<connection name>" +vpn.data gp-os-version "Ubuntu 26.04 LTS"
+nmcli connection modify "<connection name>" +vpn.data "gp-os-version=Ubuntu 26.04 LTS"
 ```
+
+GlobalProtect profiles authenticate through the portal by default. When the
+profile gateway itself provides SAML, direct gateway authentication avoids the
+second portal-to-gateway credential prompt and shortens the connection setup:
+
+```bash
+nmcli connection modify "<connection name>" +vpn.data "gp-auth-interface=gateway"
+```
+
+Use `portal` for deployments that require portal discovery. This setting only
+affects GlobalProtect; AnyConnect profiles keep their existing connection path.
 
 GlobalProtect and AnyConnect SAML reuse a browser session by default. This keeps
 Microsoft/IdP SSO state across reconnects, avoids repeated TOTP prompts, and
@@ -92,7 +105,7 @@ makes long-running AnyConnect deployments such as FHNW less fragile. If a stale
 IdP session causes problems, force a fresh browser session explicitly:
 
 ```bash
-nmcli connection modify "<connection name>" +vpn.data disable-browser-session-cache 1
+nmcli connection modify "<connection name>" +vpn.data "disable-browser-session-cache=1"
 ```
 
 Microsoft MFA is adaptive and TOTP-first by default (`mfa-preference=auto`).
@@ -108,8 +121,8 @@ browser/OS hardware UI.
 You can force a registered MFA method for troubleshooting:
 
 ```bash
-nmcli connection modify "<connection name>" +vpn.data mfa-preference push
-nmcli connection modify "<connection name>" +vpn.data mfa-preference totp
+nmcli connection modify "<connection name>" +vpn.data "mfa-preference=push"
+nmcli connection modify "<connection name>" +vpn.data "mfa-preference=totp"
 ```
 
 Use `auto`, `push`, or `totp`; `auto` is recommended.
@@ -119,7 +132,7 @@ failover behavior when a secondary VPN DNS server is reachable but degraded.
 Override it if your VPN needs more DNS servers:
 
 ```bash
-nmcli connection modify "<connection name>" +vpn.data dns-server-limit 2
+nmcli connection modify "<connection name>" +vpn.data "dns-server-limit=2"
 ```
 
 AnyConnect keeps all pushed VPN DNS servers by default. The plugin waits for a

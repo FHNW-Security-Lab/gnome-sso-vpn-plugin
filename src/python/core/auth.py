@@ -31,6 +31,9 @@ MICROSOFT_TOTP_DIRECT_SELECTORS = (
     "[data-value='SoftwareOath']",
 )
 
+MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS = 20.0
+MICROSOFT_TOTP_MAX_SUBMISSIONS = 2
+
 MICROSOFT_TOTP_METHOD_LABELS = (
     "Use a verification code",
     "Enter a verification code",
@@ -41,6 +44,8 @@ MICROSOFT_TOTP_METHOD_LABELS = (
     "Prüfcode aus meiner mobilen App verwenden",
     "Prüfcode verwenden",
     "Bestätigungscode verwenden",
+    "Einen Prüfcode verwenden",
+    "Code aus der Authenticator-App verwenden",
 )
 
 MICROSOFT_ALTERNATE_MFA_LABELS = (
@@ -58,6 +63,14 @@ MICROSOFT_ALTERNATE_MFA_LABELS = (
     "Andere Möglichkeit zur Anmeldung",
     "Andere Überprüfungsoption verwenden",
     "Andere Methode verwenden",
+    "Weitere Anmeldemethoden",
+)
+
+MICROSOFT_ALTERNATE_MFA_SELECTORS = (
+    "#idA_SAASTO_Proofs",
+    "#idA_SAOTCS_SwitchProof",
+    "#idA_SAASTO_SwitchProof",
+    "#idA_PWD_SwitchToCredPicker",
 )
 
 MICROSOFT_PUSH_DIRECT_SELECTORS = (
@@ -75,12 +88,19 @@ MICROSOFT_PUSH_METHOD_LABELS = (
 )
 
 MICROSOFT_PASSWORD_METHOD_LABELS = (
+    "Use my password",
     "Use your password instead",
     "Use password instead",
     "Sign in with your password",
     "Stattdessen Kennwort verwenden",
     "Mit Kennwort anmelden",
     "Mit Ihrem Kennwort anmelden",
+    "Mein Kennwort verwenden",
+    "Stattdessen Ihr Kennwort verwenden",
+)
+
+MICROSOFT_PASSWORD_DIRECT_SELECTORS = (
+    "#idA_PWD_SwitchToPassword",
 )
 
 MICROSOFT_PASSKEY_MARKERS = (
@@ -90,14 +110,22 @@ MICROSOFT_PASSKEY_MARKERS = (
     "Passkey verwenden",
     "Mit einem Passkey anmelden",
     "Gesichtserkennung, Fingerabdruck, PIN oder Sicherheitsschlüssel",
+    "Mit Ihrem Passkey anmelden",
+    "Mit einem Hauptschlüssel anmelden",
+    "Anmeldung mit einem Hauptschlüssel",
 )
 
 MICROSOFT_NUMBER_MATCH_MARKERS = (
+    "Enter the number shown to sign in",
+    "Geben Sie die Nummer ein",
+    "Geben Sie die angezeigte Zahl ein",
+)
+
+MICROSOFT_AUTHENTICATOR_PUSH_MARKERS = (
     "Approve sign in request",
     "Approve a sign-in request",
-    "Enter the number shown to sign in",
     "Anmeldeanforderung bestätigen",
-    "Geben Sie die Nummer ein",
+    "Anmeldeanforderung genehmigen",
 )
 
 MICROSOFT_NUMBER_MATCH_SELECTORS = (
@@ -183,6 +211,63 @@ def _has_number_match_evidence(
     return marker_visible or selector_visible
 
 
+def _adaptive_mfa_action(
+    prefer_totp: bool,
+    otp_input_visible: bool,
+    authenticator_challenge_visible: bool,
+    totp_choice_visible: bool,
+    picker_transition_pending: bool,
+) -> str:
+    """Choose the next adaptive action without ever preferring phone over TOTP."""
+    if prefer_totp and otp_input_visible:
+        return "submit-totp"
+    if not authenticator_challenge_visible:
+        return "select-totp" if prefer_totp and totp_choice_visible else "none"
+    if not prefer_totp:
+        return "phone"
+    if totp_choice_visible:
+        return "select-totp"
+    if picker_transition_pending:
+        return "wait-for-picker"
+    return "open-alternate-methods"
+
+
+def _should_submit_totp_counter(
+    last_submitted_counter: Optional[int],
+    current_counter: int,
+) -> bool:
+    """Submit once per TOTP window and allow a fresh window to recover a stall."""
+    return (
+        last_submitted_counter is None
+        or last_submitted_counter != current_counter
+    )
+
+
+def _merge_saml_artifacts(
+    cookies: dict[str, str],
+    saml_result: dict,
+    protocol: str,
+    gp_prelogin_cookie: Optional[str] = None,
+    gp_gateway_ip: Optional[str] = None,
+) -> dict[str, str]:
+    """Merge captured SAML/GP headers without dropping their paired username."""
+    merged = dict(cookies)
+    if saml_result.get("saml_response"):
+        merged["SAMLResponse"] = saml_result["saml_response"]
+    if saml_result.get("prelogin_cookie"):
+        merged["prelogin-cookie"] = saml_result["prelogin_cookie"]
+    if protocol == "gp":
+        if saml_result.get("portal_userauthcookie"):
+            merged["portal-userauthcookie"] = saml_result["portal_userauthcookie"]
+        if saml_result.get("saml_username"):
+            merged["saml-username"] = saml_result["saml_username"]
+        if gp_prelogin_cookie and "prelogin-cookie" not in merged:
+            merged["prelogin-cookie"] = gp_prelogin_cookie
+        if gp_gateway_ip:
+            merged["_gateway_ip"] = gp_gateway_ip
+    return merged
+
+
 def _parse_saml_timeout(protocol: str, value: Optional[str] = None) -> int:
     """Return a safe SAML timeout for the selected protocol."""
     default_timeout = 180 if protocol == "gp" else 120
@@ -260,15 +345,24 @@ def _get_gp_prelogin(
     server: str,
     debug: bool = False,
     gp_os_version: Optional[str] = None,
+    gp_auth_interface: str = "portal",
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Get prelogin-cookie and SAML request for GlobalProtect."""
-    url = f"https://{server}/global-protect/prelogin.esp"
+    gp_auth_interface = str(gp_auth_interface or "portal").strip().lower()
+    if gp_auth_interface not in {"portal", "gateway"}:
+        gp_auth_interface = "portal"
+    prelogin_path = (
+        "ssl-vpn/prelogin.esp"
+        if gp_auth_interface == "gateway"
+        else "global-protect/prelogin.esp"
+    )
+    url = f"https://{server}/{prelogin_path}"
     retry_env = os.environ.get("MS_SSO_GP_PRELOGIN_RETRIES", "3").strip()
     delay_env = os.environ.get("MS_SSO_GP_PRELOGIN_DELAY", "2").strip()
     client_os = get_gp_client_os()
     os_version = gp_os_version or get_gp_os_version()
     host_id = socket.gethostname() or "localhost"
-    request_body = urllib.parse.urlencode({
+    request_params = {
         "tmp": "tmp",
         "clientVer": "4100",
         "clientos": client_os,
@@ -277,7 +371,8 @@ def _get_gp_prelogin(
         "ipv6-support": "yes",
         "default-browser": "1",
         "cas-support": "yes",
-    }).encode("utf-8")
+    }
+    request_body = urllib.parse.urlencode(request_params).encode("utf-8")
     try:
         retries = max(1, int(retry_env))
     except Exception:
@@ -318,7 +413,7 @@ def _get_gp_prelogin(
                 time.sleep(retry_delay)
 
     # Some portals are stricter and still expect the legacy GET prelogin call.
-    fallback_url = f"{url}?tmp=tmp&clientVer=4100&clientos={urllib.parse.quote(client_os)}"
+    fallback_url = f"{url}?{urllib.parse.urlencode(request_params)}"
     try:
         ctx = ssl.create_default_context()
         req = urllib.request.Request(fallback_url)
@@ -364,6 +459,7 @@ def do_saml_auth(
     vpn_server_ip: Optional[str] = None,
     disable_browser_session_cache: bool = False,
     gp_os_version: Optional[str] = None,
+    gp_auth_interface: str = "portal",
     cancel_callback: Optional[Callable[[], bool]] = None,
     progress_callback: Optional[Callable[[str], None]] = None,
     mfa_preference: Optional[str] = None,
@@ -419,6 +515,7 @@ def do_saml_auth(
             vpn_server,
             debug,
             gp_os_version=gp_os_version,
+            gp_auth_interface=gp_auth_interface,
         )
         if debug:
             print(f"    [DEBUG] prelogin-cookie: {gp_prelogin_cookie[:20] if gp_prelogin_cookie else None}...")
@@ -878,6 +975,25 @@ def do_saml_auth(
                     continue
             return None
 
+        def _first_usable_input(locator, limit: int = 20):
+            """Return a visible, enabled, editable input and ignore stale panels."""
+            try:
+                count = min(locator.count(), limit)
+            except Exception:
+                return None
+            for index in range(count):
+                candidate = locator.nth(index)
+                try:
+                    if (
+                        candidate.is_visible()
+                        and candidate.is_enabled()
+                        and candidate.is_editable()
+                    ):
+                        return candidate
+                except Exception:
+                    continue
+            return None
+
         def _find_visible_in_frames(selectors: list[str]):
             for frame in page.frames:
                 for sel in selectors:
@@ -900,12 +1016,35 @@ def do_saml_auth(
                         continue
             return None
 
+        def _find_usable_input_by_ids(ids: list[str]):
+            for frame in page.frames:
+                for element_id in ids:
+                    try:
+                        candidate = _first_usable_input(frame.locator(f"#{element_id}"))
+                        if candidate is not None:
+                            return candidate
+                    except Exception:
+                        continue
+            return None
+
         def _find_input_by_labels(labels: list[str]):
             patterns = [re.compile(re.escape(label), re.IGNORECASE) for label in labels]
             for frame in page.frames:
                 for pattern in patterns:
                     try:
                         candidate = _first_visible(frame.get_by_label(pattern))
+                        if candidate is not None:
+                            return candidate
+                    except Exception:
+                        continue
+            return None
+
+        def _find_usable_input_by_labels(labels: list[str]):
+            patterns = [re.compile(re.escape(label), re.IGNORECASE) for label in labels]
+            for frame in page.frames:
+                for pattern in patterns:
+                    try:
+                        candidate = _first_usable_input(frame.get_by_label(pattern))
                         if candidate is not None:
                             return candidate
                     except Exception:
@@ -1009,6 +1148,10 @@ def do_saml_auth(
             for frame in page.frames:
                 for loc in _iter_visible_inputs(frame):
                     try:
+                        if kind == "otp" and not (
+                            loc.is_enabled() and loc.is_editable()
+                        ):
+                            continue
                         attrs = {
                             "type": loc.get_attribute("type") or "",
                             "name": loc.get_attribute("name") or "",
@@ -1034,8 +1177,8 @@ def do_saml_auth(
 
         def _find_otp_input():
             return (
-                _find_input_by_ids(["idTxtBx_SAOTCC_OTC", "idTxtBx_SAOTCC_OTP", "otp", "otc", "code"])
-                or _find_input_by_labels([
+                _find_usable_input_by_ids(["idTxtBx_SAOTCC_OTC", "idTxtBx_SAOTCC_OTP", "otp", "otc", "code"])
+                or _find_usable_input_by_labels([
                     "Verification code",
                     "Security code",
                     "Code",
@@ -1123,7 +1266,7 @@ def do_saml_auth(
                         try:
                             candidate = _first_visible(frame.get_by_role(role, name=pattern))
                             if candidate is not None:
-                                candidate.click()
+                                candidate.click(timeout=1500)
                                 return True
                         except Exception:
                             continue
@@ -1135,7 +1278,7 @@ def do_saml_auth(
                                 try:
                                     value = _normalize_text(candidate.get_attribute("value"))
                                     if value and pattern.search(value) and candidate.is_visible():
-                                        candidate.click()
+                                        candidate.click(timeout=1500)
                                         return True
                                 except Exception:
                                     continue
@@ -1144,7 +1287,7 @@ def do_saml_auth(
                     try:
                         candidate = _first_visible(frame.get_by_text(pattern, exact=False))
                         if candidate is not None:
-                            candidate.click()
+                            candidate.click(timeout=1500)
                             return True
                     except Exception:
                         continue
@@ -1169,6 +1312,11 @@ def do_saml_auth(
                                 return True
                     except Exception:
                         continue
+                    try:
+                        if _first_visible(frame.get_by_text(pattern, exact=False)) is not None:
+                            return True
+                    except Exception:
+                        continue
             return False
 
         def _click_known_ids(ids: list[str]) -> bool:
@@ -1177,7 +1325,7 @@ def do_saml_auth(
                     try:
                         candidate = _first_visible(frame.locator(f"#{element_id}"))
                         if candidate is not None:
-                            candidate.click()
+                            candidate.click(timeout=1000)
                             return True
                     except Exception:
                         continue
@@ -1188,7 +1336,7 @@ def do_saml_auth(
             if loc is None:
                 return False
             try:
-                loc.click()
+                loc.click(timeout=1000)
                 return True
             except Exception:
                 return False
@@ -1256,22 +1404,24 @@ def do_saml_auth(
             return False
 
         def _open_alternate_methods() -> bool:
-            if _click_action(list(MICROSOFT_ALTERNATE_MFA_LABELS)):
+            if _click_first_selector(MICROSOFT_ALTERNATE_MFA_SELECTORS):
                 return True
-            return _click_known_ids([
-                "idA_SAASTO_Proofs",
-                "idA_SAOTCS_SwitchProof",
-                "idA_SAASTO_SwitchProof",
-            ])
+            return _click_action(list(MICROSOFT_ALTERNATE_MFA_LABELS))
 
-        def _method_picker_visible() -> bool:
+        def _totp_method_visible() -> bool:
             if _find_visible_in_frames(list(MICROSOFT_TOTP_DIRECT_SELECTORS)) is not None:
                 return True
+            return _action_available(list(MICROSOFT_TOTP_METHOD_LABELS))
+
+        def _push_method_visible() -> bool:
             if _find_visible_in_frames(list(MICROSOFT_PUSH_DIRECT_SELECTORS)) is not None:
                 return True
-            return _action_available(
-                list(MICROSOFT_TOTP_METHOD_LABELS) + list(MICROSOFT_PUSH_METHOD_LABELS)
-            )
+            return _action_available(list(MICROSOFT_PUSH_METHOD_LABELS))
+
+        def _password_method_visible() -> bool:
+            if _find_visible_in_frames(list(MICROSOFT_PASSWORD_DIRECT_SELECTORS)) is not None:
+                return True
+            return _action_available(list(MICROSOFT_PASSWORD_METHOD_LABELS))
 
         def _select_totp_method() -> bool:
             if _click_first_selector(MICROSOFT_TOTP_DIRECT_SELECTORS):
@@ -1282,6 +1432,11 @@ def do_saml_auth(
             if _click_first_selector(MICROSOFT_PUSH_DIRECT_SELECTORS):
                 return True
             return _click_action(list(MICROSOFT_PUSH_METHOD_LABELS))
+
+        def _select_password_method() -> bool:
+            if _click_first_selector(MICROSOFT_PASSWORD_DIRECT_SELECTORS):
+                return True
+            return _click_action(list(MICROSOFT_PASSWORD_METHOD_LABELS))
 
         def _number_match_state() -> tuple[bool, Optional[str]]:
             marker_visible = _page_has_text(list(MICROSOFT_NUMBER_MATCH_MARKERS))
@@ -1324,7 +1479,7 @@ def do_saml_auth(
                 page.keyboard.press("Escape")
             except Exception:
                 pass
-            if _click_action(list(MICROSOFT_PASSWORD_METHOD_LABELS)):
+            if _select_password_method():
                 return "passkey-password-fallback-selected"
             if _open_alternate_methods():
                 return "passkey-alternate-methods-opened"
@@ -1517,18 +1672,20 @@ def do_saml_auth(
                 )
                 if has_session:
                     print("  -> Already authenticated (SSO session valid)")
-                    if saml_result["saml_response"]:
-                        session_cookies["SAMLResponse"] = saml_result["saml_response"]
-                    if saml_result["prelogin_cookie"]:
-                        session_cookies["prelogin-cookie"] = saml_result["prelogin_cookie"]
-                    if gp_prelogin_cookie and "prelogin-cookie" not in session_cookies:
-                        session_cookies["prelogin-cookie"] = gp_prelogin_cookie
+                    session_cookies = _merge_saml_artifacts(
+                        session_cookies,
+                        saml_result,
+                        protocol,
+                        gp_prelogin_cookie,
+                        gp_gateway_ip,
+                    )
                     _close_context()
                     return session_cookies
 
             filled_username = False
             filled_password = False
             last_totp_counter = None
+            totp_submission_attempts = 0
             adfs_submit_attempts = 0
             blank_login_reloads = 0
             last_progress_time = time.monotonic()
@@ -1538,9 +1695,13 @@ def do_saml_auth(
             totp_disabled_for_attempt = False
             totp_error_before_submit = None
             last_number_match = None
-            alternate_method_attempts = 0
             otp_alternate_attempts = 0
             method_selection_pending = None
+            mfa_picker_pending_until = 0.0
+            mfa_method_pending_until = 0.0
+            number_match_switch_deadline = 0.0
+            number_match_detected_reported = False
+            primary_credential_picker_pending_until = 0.0
 
             while time.monotonic() < deadline:
                 _raise_if_cancelled()
@@ -1558,8 +1719,17 @@ def do_saml_auth(
                 # Microsoft's MFA panels can retain the previous controls for
                 # several seconds while the next method loads. Do not click or
                 # reinterpret that stale panel during the transition.
-                can_switch_mfa = time.monotonic() - last_mfa_switch_time >= 8.0
-                number_match_detected, number_match = _number_match_state()
+                now = time.monotonic()
+                can_switch_mfa = (
+                    now - last_mfa_switch_time
+                    >= MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
+                )
+                actual_number_match_detected, number_match = _number_match_state()
+                authenticator_push_detected = (
+                    actual_number_match_detected
+                    or _page_has_text(list(MICROSOFT_AUTHENTICATOR_PUSH_MARKERS))
+                )
+                number_match_detected = authenticator_push_detected
 
                 # The old OTP form can remain visible while Microsoft's method
                 # picker becomes ready. Once the picker is genuinely visible,
@@ -1570,7 +1740,7 @@ def do_saml_auth(
                         otp_alternate_attempts
                         or method_selection_pending == "Authenticator push"
                     )
-                    and _method_picker_visible()
+                    and _push_method_visible()
                 ):
                     otp_loc = None
 
@@ -1602,15 +1772,15 @@ def do_saml_auth(
                 ):
                     if method_selection_pending == "Authenticator push":
                         if not can_switch_mfa:
-                            _wait_until_ready(0.2)
+                            _interruptible_pause(0.2)
                             continue
                         raise RuntimeError(
                             "Microsoft did not transition to Authenticator phone approval"
                         )
-                    if otp_alternate_attempts and not can_switch_mfa:
-                        _wait_until_ready(0.2)
+                    if not can_switch_mfa:
+                        _interruptible_pause(0.2)
                         continue
-                    if otp_alternate_attempts < 2 and can_switch_mfa:
+                    if otp_alternate_attempts < 2:
                         otp_alternate_attempts += 1
                         if _open_alternate_methods():
                             _report_progress("mfa-alternate-methods-opened")
@@ -1647,51 +1817,79 @@ def do_saml_auth(
                     totp_available,
                     totp_disabled_for_attempt,
                 )
+                totp_choice_visible = bool(
+                    not otp_loc and _totp_method_visible()
+                )
+                picker_transition_pending = now < mfa_picker_pending_until
+                adaptive_action = _adaptive_mfa_action(
+                    prefer_totp=should_prefer_totp,
+                    otp_input_visible=bool(otp_loc),
+                    authenticator_challenge_visible=number_match_detected,
+                    totp_choice_visible=totp_choice_visible,
+                    picker_transition_pending=picker_transition_pending,
+                )
 
                 # A real verification-code input always wins over stale text
                 # left behind by the previous Authenticator challenge panel.
-                if otp_loc and should_prefer_totp:
+                if adaptive_action == "submit-totp":
                     number_match_detected = False
-                    alternate_method_attempts = 0
                     method_selection_pending = None
-
-                # Microsoft can retain the old number-matching text while the
-                # alternative-method picker becomes interactive. Once that
-                # picker is visible, handle it immediately instead of waiting
-                # for the stale challenge panel to disappear.
-                if (
-                    number_match_detected
-                    and should_prefer_totp
-                    and (
-                        alternate_method_attempts
-                        or method_selection_pending == "TOTP"
-                    )
-                    and _method_picker_visible()
-                ):
-                    number_match_detected = False
+                    mfa_picker_pending_until = 0.0
+                    mfa_method_pending_until = 0.0
+                    number_match_switch_deadline = 0.0
+                    number_match_detected_reported = False
 
                 if number_match_detected:
                     if should_prefer_totp:
+                        if not number_match_detected_reported:
+                            _report_progress(
+                                "mfa-number-match-detected"
+                                if actual_number_match_detected
+                                else "mfa-authenticator-push-detected"
+                            )
+                            number_match_detected_reported = True
+                        if number_match_switch_deadline <= 0.0:
+                            number_match_switch_deadline = (
+                                now + MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
+                            )
                         if method_selection_pending == "TOTP":
-                            if not can_switch_mfa:
-                                _wait_until_ready(0.2)
+                            if now < mfa_method_pending_until:
+                                _interruptible_pause(0.2)
                                 continue
                             raise RuntimeError(
                                 "Microsoft did not transition to the configured TOTP method"
                             )
-                        if alternate_method_attempts and not can_switch_mfa:
-                            _wait_until_ready(0.2)
-                            continue
-                        if alternate_method_attempts < 2 and can_switch_mfa:
-                            alternate_method_attempts += 1
-                            if _open_alternate_methods():
-                                _report_progress("mfa-alternate-methods-opened")
-                                last_mfa_switch_time = time.monotonic()
+
+                        if adaptive_action == "select-totp":
+                            if _select_totp_method():
+                                method_selection_pending = "TOTP"
+                                mfa_method_pending_until = (
+                                    now + MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
+                                )
+                                mfa_picker_pending_until = 0.0
+                                number_match_switch_deadline = 0.0
+                                _report_progress("mfa-totp-direct-selected")
+                                last_mfa_switch_time = now
                                 _interruptible_pause(0.25)
                                 continue
-                            if alternate_method_attempts < 2:
-                                _interruptible_pause(0.5)
+                        elif adaptive_action == "wait-for-picker":
+                            _interruptible_pause(0.2)
+                            continue
+                        elif (
+                            adaptive_action == "open-alternate-methods"
+                            and now < number_match_switch_deadline
+                        ):
+                            if _open_alternate_methods():
+                                _report_progress("mfa-alternate-methods-opened")
+                                last_mfa_switch_time = now
+                                mfa_picker_pending_until = (
+                                    now + MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
+                                )
+                                _interruptible_pause(0.25)
                                 continue
+                        if now < number_match_switch_deadline:
+                            _interruptible_pause(0.5)
+                            continue
                         raise RuntimeError(
                             "Microsoft showed Authenticator number matching but did not "
                             "offer the configured TOTP method after switching sign-in methods"
@@ -1705,11 +1903,16 @@ def do_saml_auth(
                             "Phone approval is disabled while a TOTP secret is configured; "
                             "update the TOTP secret or explicitly set mfa-preference=push"
                         )
-                    if not number_match:
+                    if actual_number_match_detected and not number_match:
                         raise RuntimeError(
                             "Microsoft Authenticator number matching is required, but the "
                             "two-digit approval number could not be read unambiguously"
                         )
+                    if not actual_number_match_detected:
+                        # Ordinary approve/deny push has no two-digit value.
+                        # Explicit push mode waits for the IdP callback.
+                        _interruptible_pause(0.2)
+                        continue
                     if number_match != last_number_match:
                         if _notify_number_match(number_match):
                             _report_progress("mfa-number-match-notified")
@@ -1721,32 +1924,101 @@ def do_saml_auth(
                         last_number_match = number_match
                         totp_disabled_for_attempt = True
                         method_selection_pending = None
-                    _wait_until_ready(0.2)
+                    _interruptible_pause(0.2)
                     continue
+                else:
+                    number_match_detected_reported = False
+                    if not picker_transition_pending:
+                        number_match_switch_deadline = 0.0
 
                 if last_number_match is not None:
                     _close_number_match_notification()
                     last_number_match = None
 
-                if not otp_loc and _method_picker_visible():
-                    alternate_method_attempts = 0
-                    otp_alternate_attempts = 0
-                    prefer_totp = (
-                        mfa_preference != "push"
-                        and totp_available
-                        and not totp_disabled_for_attempt
-                    )
-                    requested_method = "TOTP" if prefer_totp else "Authenticator push"
-                    if method_selection_pending:
-                        if not can_switch_mfa:
-                            _wait_until_ready(0.2)
-                            continue
-                        raise RuntimeError(
-                            f"Microsoft did not transition after selecting {method_selection_pending}"
+                # After clicking away from number matching, Microsoft can leave
+                # a blank or partially rendered panel before the TOTP tile
+                # appears. Poll that transition without running generic clicks.
+                if not otp_loc and should_prefer_totp and picker_transition_pending:
+                    if totp_choice_visible and _select_totp_method():
+                        method_selection_pending = "TOTP"
+                        mfa_method_pending_until = (
+                            now + MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
                         )
+                        mfa_picker_pending_until = 0.0
+                        _report_progress("mfa-totp-method-selected")
+                        last_mfa_switch_time = now
+                        _interruptible_pause(0.25)
+                        continue
+                    _interruptible_pause(0.2)
+                    continue
+                if (
+                    not otp_loc
+                    and should_prefer_totp
+                    and mfa_picker_pending_until > 0.0
+                ):
+                    raise RuntimeError(
+                        "Microsoft did not render the configured TOTP method after "
+                        "opening alternate sign-in methods"
+                    )
+
+                # Once a method is selected, suppress unrelated account and
+                # generic form actions until its input appears or the bounded
+                # transition expires.
+                if not otp_loc and method_selection_pending:
+                    if now < mfa_method_pending_until:
+                        _interruptible_pause(0.2)
+                        continue
+                    raise RuntimeError(
+                        f"Microsoft did not transition after selecting {method_selection_pending}"
+                    )
+
+                if not otp_loc and primary_credential_picker_pending_until > 0.0:
+                    if _password_method_visible() and _select_password_method():
+                        primary_credential_picker_pending_until = 0.0
+                        _report_progress("passkey-password-fallback-selected")
+                        _interruptible_pause(0.25)
+                        continue
+                    if now < primary_credential_picker_pending_until:
+                        _interruptible_pause(0.2)
+                        continue
+                    raise RuntimeError(
+                        "Microsoft did not offer password sign-in after leaving the passkey prompt"
+                    )
+
+                if not otp_loc and _page_has_text(list(MICROSOFT_PASSKEY_MARKERS)):
+                    passkey_action = _leave_passkey_prompt()
+                    if passkey_action:
+                        _report_progress(passkey_action)
+                        last_mfa_switch_time = now
+                        if passkey_action == "passkey-alternate-methods-opened":
+                            primary_credential_picker_pending_until = (
+                                now + MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
+                            )
+                        _interruptible_pause(0.25)
+                    else:
+                        raise RuntimeError(
+                            "Microsoft requested an interactive passkey and did not offer "
+                            "password or another sign-in method"
+                        )
+                    continue
+
+                prefer_totp = (
+                    mfa_preference != "push"
+                    and totp_available
+                    and not totp_disabled_for_attempt
+                )
+                requested_method_visible = (
+                    _totp_method_visible() if prefer_totp else _push_method_visible()
+                )
+                if not otp_loc and requested_method_visible:
+                    otp_alternate_attempts = 0
+                    requested_method = "TOTP" if prefer_totp else "Authenticator push"
                     selected = _select_totp_method() if prefer_totp else _select_push_method()
                     if selected:
                         method_selection_pending = requested_method
+                        mfa_method_pending_until = (
+                            now + MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
+                        )
                         _report_progress(
                             "mfa-totp-method-selected"
                             if prefer_totp
@@ -1759,21 +2031,9 @@ def do_saml_auth(
                         f"Microsoft did not offer the requested {requested_method} MFA method"
                     )
 
-                if not otp_loc and _page_has_text(list(MICROSOFT_PASSKEY_MARKERS)):
-                    passkey_action = _leave_passkey_prompt()
-                    if passkey_action:
-                        _report_progress(passkey_action)
-                        last_mfa_switch_time = time.monotonic()
-                        _interruptible_pause(0.25)
-                    else:
-                        raise RuntimeError(
-                            "Microsoft requested an interactive passkey and did not offer "
-                            "password or another sign-in method"
-                        )
-                    continue
-
                 if otp_loc:
                     method_selection_pending = None
+                    mfa_method_pending_until = 0.0
 
                 # Step 2: account selection / alternate account
                 if _page_has_text(["Pick an account", "issue looking up your account"]):
@@ -1920,28 +2180,48 @@ def do_saml_auth(
                             otp_input_reported = True
                         try:
                             totp_counter = int(time.time() // 30)
-                            if last_totp_counter is None:
+                            if _should_submit_totp_counter(
+                                last_totp_counter,
+                                totp_counter,
+                            ):
+                                if (
+                                    totp_submission_attempts
+                                    >= MICROSOFT_TOTP_MAX_SUBMISSIONS
+                                ):
+                                    raise RuntimeError(
+                                        "Microsoft TOTP form did not progress after one "
+                                        "fresh-code retry"
+                                    )
                                 # Avoid submitting a code that will expire while the
                                 # Microsoft form is processing it.
                                 valid_for = seconds_until_totp_rotation()
                                 if valid_for < 5.0:
                                     _interruptible_pause(valid_for + 0.1)
                                     totp_counter = int(time.time() // 30)
-                                totp_code = generate_totp(totp_secret)
-                                if not re.fullmatch(r"[0-9]{6,8}", totp_code or ""):
-                                    raise ValueError("invalid generated TOTP")
-                                otp_loc.fill(totp_code)
-                                totp_error_before_submit = _totp_error_signature(otp_loc)
-                                progressed = True
-                                submitted = _submit_otp(otp_loc)
-                                if not submitted:
-                                    raise RuntimeError("Could not submit the Microsoft verification code form")
-                                if submitted:
-                                    last_totp_counter = totp_counter
-                                    totp_submitted = True
-                                    _report_progress("mfa-totp-submitted")
+                                if _should_submit_totp_counter(
+                                    last_totp_counter,
+                                    totp_counter,
+                                ):
+                                    totp_code = generate_totp(totp_secret)
+                                    if not re.fullmatch(r"[0-9]{6,8}", totp_code or ""):
+                                        raise ValueError("invalid generated TOTP")
+                                    otp_loc.fill(totp_code)
+                                    totp_error_before_submit = _totp_error_signature(otp_loc)
+                                    progressed = True
+                                    submitted = _submit_otp(otp_loc)
+                                    if not submitted:
+                                        raise RuntimeError("Could not submit the Microsoft verification code form")
+                                    if submitted:
+                                        last_totp_counter = totp_counter
+                                        totp_submission_attempts += 1
+                                        totp_submitted = True
+                                        _report_progress("mfa-totp-submitted")
+                                else:
+                                    waiting_for_fresh_totp = True
                             else:
                                 waiting_for_fresh_totp = True
+                        except RuntimeError:
+                            raise
                         except Exception as exc:
                             raise RuntimeError(
                                 "Could not generate or submit the configured TOTP code"
@@ -1957,7 +2237,7 @@ def do_saml_auth(
                 if waiting_for_fresh_totp:
                     # Do not let generic Continue/Next fallbacks resubmit the
                     # same code while Microsoft is still processing it.
-                    _wait_until_ready(0.1)
+                    _interruptible_pause(0.1)
                     continue
 
                 # Microsoft can present a localized "Stay signed in?" page
@@ -2052,14 +2332,13 @@ def do_saml_auth(
             all_cookies = context.cookies()
             vpn_cookies = _collect_vpn_cookies()
 
-            if saml_result["saml_response"]:
-                vpn_cookies["SAMLResponse"] = saml_result["saml_response"]
-            if saml_result["prelogin_cookie"]:
-                vpn_cookies["prelogin-cookie"] = saml_result["prelogin_cookie"]
-            if gp_prelogin_cookie and "prelogin-cookie" not in vpn_cookies:
-                vpn_cookies["prelogin-cookie"] = gp_prelogin_cookie
-            if gp_gateway_ip:
-                vpn_cookies["_gateway_ip"] = gp_gateway_ip
+            vpn_cookies = _merge_saml_artifacts(
+                vpn_cookies,
+                saml_result,
+                protocol,
+                gp_prelogin_cookie,
+                gp_gateway_ip,
+            )
 
             # Avoid returning only helper metadata without a real auth artifact
             if set(vpn_cookies.keys()) == {"_gateway_ip"}:

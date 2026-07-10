@@ -2,9 +2,12 @@
 
 import importlib.util
 import logging.handlers
+import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +43,22 @@ class FakeStdout:
 class FakeProcess:
     def __init__(self, reads):
         self.stdout = FakeStdout(reads)
+
+
+class FakeStdin:
+    def __init__(self):
+        self.data = b""
+        self.flushed = False
+        self.closed = False
+
+    def write(self, data):
+        self.data += data
+
+    def flush(self):
+        self.flushed = True
+
+    def close(self):
+        self.closed = True
 
 
 class OpenConnectOutputTests(unittest.TestCase):
@@ -118,6 +137,86 @@ class OpenConnectOutputTests(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertEqual(calls, [])
+
+    def test_gp_cookie_stdin_is_closed_after_one_line(self):
+        stream = FakeStdin()
+        process = SimpleNamespace(stdin=stream)
+
+        self.service._write_gp_cookie_and_close(process, "secret-cookie")
+
+        self.assertEqual(stream.data, b"secret-cookie\n")
+        self.assertTrue(stream.flushed)
+        self.assertTrue(stream.closed)
+
+    def test_gp_cookie_selection_prefers_reusable_portal_cookie(self):
+        selected = self.service._select_gp_cookie({
+            "prelogin-cookie": "one-time",
+            "portal-userauthcookie": "reusable",
+        })
+
+        self.assertEqual(
+            selected,
+            ("reusable", "portal:portal-userauthcookie", True),
+        )
+        self.assertTrue(self.service._has_reusable_gp_cookie({
+            "portal-userauthcookie": "reusable",
+        }))
+        self.assertFalse(self.service._has_reusable_gp_cookie({
+            "prelogin-cookie": "one-time",
+        }))
+
+    def test_gp_gateway_cookie_selection_skips_portal_handoff(self):
+        selected = self.service._select_gp_cookie(
+            {"prelogin-cookie": "one-time"},
+            auth_interface="gateway",
+        )
+
+        self.assertEqual(
+            selected,
+            ("one-time", "gateway:prelogin-cookie", True),
+        )
+
+    def test_gp_command_uses_returned_identity_and_hip_for_all_cookie_types(self):
+        command = self.service._build_gp_openconnect_command(
+            openconnect_bin="openconnect",
+            proto_flag="gp",
+            gateway="vpn.example.edu",
+            usergroup="portal:portal-userauthcookie",
+            username="saml-returned-user",
+            resolve_arg="--resolve=vpn.example.edu:192.0.2.10",
+            hip_wrapper="/usr/libexec/nm-ms-sso-gp-hipreport",
+        )
+
+        self.assertIn("--passwd-on-stdin", command)
+        self.assertFalse(any("portal-cookie" in arg for arg in command))
+        self.assertIn("--user=saml-returned-user", command)
+        self.assertIn("--usergroup=portal:portal-userauthcookie", command)
+        self.assertIn("--useragent=PAN GlobalProtect", command)
+        self.assertIn("--os=linux-64", command)
+        self.assertIn("--csd-wrapper=/usr/libexec/nm-ms-sso-gp-hipreport", command)
+
+    def test_gp_optimistic_connection_state_defaults_off(self):
+        with patch.dict(os.environ, {
+            "MS_SSO_NM_GP_EARLY_STARTED": "",
+            "MS_SSO_NM_GP_EARLY_CONFIG": "",
+            "MS_SSO_NM_GP_CONFIG_DELAY": "",
+        }):
+            self.assertFalse(self.service._gp_early_started_enabled())
+            self.assertFalse(self.service._gp_initial_config_allowed())
+
+        with patch.dict(os.environ, {
+            "MS_SSO_NM_GP_EARLY_STARTED": "1",
+            "MS_SSO_NM_GP_EARLY_CONFIG": "1",
+        }):
+            self.assertTrue(self.service._gp_early_started_enabled())
+            self.assertTrue(self.service._gp_initial_config_allowed())
+
+    def test_timeout_diagnostic_never_echoes_openconnect_output(self):
+        output = "Password: super-secret\nHIP report pending"
+        diagnostic = self.service._classify_openconnect_timeout(output)
+
+        self.assertEqual(diagnostic, "waiting for additional credential input")
+        self.assertNotIn("super-secret", diagnostic)
 
 
 if __name__ == "__main__":

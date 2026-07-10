@@ -17,6 +17,7 @@ depends=(
   'python-gobject'
   'python-dbus'
   'python-keyring'
+  'python-platformdirs'
   'python-playwright'
   'util-linux'
 )

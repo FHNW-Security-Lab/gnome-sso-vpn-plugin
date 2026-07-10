@@ -60,12 +60,12 @@ def get_gp_client_os() -> str:
 def get_gp_os_version() -> str:
     """Return the OS version string reported to GlobalProtect."""
     configured = (os.environ.get("MS_SSO_GP_OS_VERSION") or "").strip()
-    if configured:
-        if configured.lower() != "auto":
-            return configured
-        detected = _detect_os_version()
-        if detected:
-            return detected
+    if configured and configured.lower() != "auto":
+        return configured
+
+    detected = _detect_os_version()
+    if detected:
+        return detected
 
     return DEFAULT_GP_OS_VERSION
 

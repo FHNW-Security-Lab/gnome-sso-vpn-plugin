@@ -243,6 +243,7 @@ class VPNPluginService(dbus.service.Object):
         secrets['protocol'] = vpn_data.get('protocol', 'anyconnect')
         secrets['username'] = vpn_data.get('username', '')
         secrets['gp_os_version'] = vpn_data.get('gp-os-version', '')
+        secrets['gp_auth_interface'] = vpn_data.get('gp-auth-interface', '')
         secrets['disable_cookie_cache'] = vpn_data.get('disable-cookie-cache', '')
         secrets['disable_browser_session_cache'] = vpn_data.get('disable-browser-session-cache', '')
         secrets['enable_browser_session_cache'] = vpn_data.get('enable-browser-session-cache', '')
@@ -344,12 +345,101 @@ class VPNPluginService(dbus.service.Object):
         text = str(error_msg or '').lower()
         return 'cookie' in text and any(token in text for token in ('reject', 'invalid', 'fail'))
 
+    @staticmethod
+    def _write_gp_cookie_and_close(process, cookie: str) -> None:
+        """Send one GP cookie line and EOF so OpenConnect cannot wait on stdin."""
+        stream = getattr(process, "stdin", None)
+        if stream is None:
+            raise RuntimeError("OpenConnect stdin is unavailable")
+        try:
+            stream.write(f"{cookie}\n".encode())
+            stream.flush()
+        finally:
+            stream.close()
+
+    @staticmethod
+    def _select_gp_cookie(cookies, auth_interface: str = 'portal'):
+        """Return (value, usergroup, stdin) for the strongest GP auth artifact."""
+        auth_interface = str(auth_interface or 'portal').strip().lower()
+        if auth_interface not in {'portal', 'gateway'}:
+            auth_interface = 'portal'
+        if cookies.get('portal-userauthcookie'):
+            return (
+                cookies['portal-userauthcookie'],
+                f'{auth_interface}:portal-userauthcookie',
+                True,
+            )
+        if cookies.get('prelogin-cookie'):
+            return (
+                cookies['prelogin-cookie'],
+                f'{auth_interface}:prelogin-cookie',
+                True,
+            )
+        raise RuntimeError("GlobalProtect authentication returned no usable cookie")
+
+    @staticmethod
+    def _has_reusable_gp_cookie(cookies) -> bool:
+        """Portal user-auth cookies are reusable; prelogin cookies may be single-use."""
+        return bool(cookies and cookies.get('portal-userauthcookie'))
+
+    @staticmethod
+    def _build_gp_openconnect_command(
+            openconnect_bin: str,
+            proto_flag: str,
+            gateway: str,
+            usergroup: str,
+            username: Optional[str] = None,
+            resolve_arg: Optional[str] = None,
+            hip_wrapper: Optional[str] = None,
+    ) -> list[str]:
+        """Build a GP command with the same identity flags for every cookie type."""
+        cmd = [openconnect_bin, "--verbose", f"--protocol={proto_flag}"]
+        if resolve_arg:
+            cmd.append(resolve_arg)
+        cmd.extend(["--reconnect-timeout=300", "--force-dpd=30"])
+        # GP SAML artifacts are authentication-form secrets, not final VPN
+        # session cookies. Keep them out of argv and close stdin after one line.
+        cmd.append("--passwd-on-stdin")
+        cmd.extend([
+            "--useragent=PAN GlobalProtect",
+            f"--usergroup={usergroup}",
+            "--os=linux-64",
+        ])
+        if username:
+            cmd.append(f"--user={username}")
+        if hip_wrapper:
+            cmd.append(f"--csd-wrapper={hip_wrapper}")
+        cmd.append(gateway)
+        return cmd
+
+    @staticmethod
+    def _classify_openconnect_timeout(output: str) -> str:
+        """Return a fixed, secret-free diagnostic for a stalled OpenConnect handoff."""
+        text = str(output or '').lower()
+        if not text.strip():
+            return "no OpenConnect output"
+        if any(marker in text for marker in (
+            "fgets (stdin)",
+            "please enter",
+            "password:",
+            "passwd:",
+        )):
+            return "waiting for additional credential input"
+        if "hip" in text or "host integrity" in text:
+            return "waiting during HIP negotiation"
+        if "certificate" in text:
+            return "stalled during certificate validation"
+        if "ssl" in text or "https" in text or "connected to" in text:
+            return "TLS connected but no tunnel was created"
+        return "handshake produced output but no tunnel"
+
     def _gp_early_started_enabled(self) -> bool:
         """Whether GP should optimistically report STARTED during auth."""
         value = self._parse_bool(os.environ.get("MS_SSO_NM_GP_EARLY_STARTED"))
         if value is None:
-            # Default on: avoids NM connect-timeout for long GP SAML/MFA flows.
-            return True
+            # GP profiles use a 300-second NetworkManager timeout. Reporting
+            # STARTED before a tunnel exists produces a false "connected" UI.
+            return False
         return value
 
     def _get_tunnel_connect_timeout_seconds(self, protocol: str) -> int:
@@ -1115,6 +1205,17 @@ class VPNPluginService(dbus.service.Object):
             password = secrets['password']
             totp_secret = secrets['totp_secret']
             gp_os_version = (secrets.get('gp_os_version') or '').strip()
+            gp_auth_interface = str(
+                secrets.get('gp_auth_interface')
+                or os.environ.get('MS_SSO_GP_AUTH_INTERFACE')
+                or 'portal'
+            ).strip().lower()
+            if gp_auth_interface not in {'portal', 'gateway'}:
+                log.warning(
+                    "Ignoring invalid GlobalProtect auth interface: "
+                    f"{gp_auth_interface!r}"
+                )
+                gp_auth_interface = 'portal'
             mfa_preference = str(
                 secrets.get('mfa_preference')
                 or os.environ.get("MS_SSO_MFA_PREFERENCE")
@@ -1173,6 +1274,7 @@ class VPNPluginService(dbus.service.Object):
             log.info(f"Username: {username}")
             if protocol == 'gp':
                 log.info(f"GlobalProtect OS version: {gp_os_version or get_gp_os_version()}")
+                log.info(f"GlobalProtect auth interface: {gp_auth_interface}")
             log.debug(f"Password: {'(set)' if password else '(not set)'}")
             log.debug(f"TOTP: {'(set)' if totp_secret else '(not set)'}")
 
@@ -1225,10 +1327,9 @@ class VPNPluginService(dbus.service.Object):
                 self.gp_connect_start_time = time.monotonic()
                 if os.environ.get("MS_SSO_NM_GP_EARLY_CONFIG", "").lower() in {"1", "true", "yes"}:
                     GLib.idle_add(self._emit_initial_config, connect_generation)
-            # NetworkManager expects the plugin to reach STARTED in a timely manner or it
-            # may cancel the connection (observed ~60s). GlobalProtect SAML/MFA flows can
-            # easily exceed that, so GP defaults to optimistic STARTED during auth.
-            # Set MS_SSO_NM_GP_EARLY_STARTED=0 to keep "Connecting" until tunnel up.
+            # GP profiles use a 300-second NetworkManager timeout, so keep the
+            # connection in STARTING until a real tunnel is usable. A legacy
+            # optimistic STARTED state remains available as an explicit opt-in.
             if protocol == 'gp':
                 if self._gp_early_started_enabled():
                     GLib.idle_add(self._emit_started_for_auth, connect_generation)
@@ -1498,6 +1599,7 @@ class VPNPluginService(dbus.service.Object):
                                 protocol=protocol,  # Pass protocol for correct SAML URL
                                 disable_browser_session_cache=disable_browser_session_cache,
                                 gp_os_version=gp_os_version or None,
+                                gp_auth_interface=gp_auth_interface,
                                 cancel_callback=_connect_cancelled,
                                 progress_callback=lambda event: log.info(
                                     f"SAML flow: {event}"
@@ -1545,11 +1647,29 @@ class VPNPluginService(dbus.service.Object):
                             terminal_auth_failure = True
                             break
 
+                        cache_usergroup = 'portal:prelogin-cookie'
+                        if protocol == 'gp':
+                            try:
+                                _cookie_value, cache_usergroup, _cookie_uses_stdin = (
+                                    self._select_gp_cookie(
+                                        cookies,
+                                        auth_interface=gp_auth_interface,
+                                    )
+                                )
+                            except RuntimeError as gp_cookie_error:
+                                final_error = str(gp_cookie_error)
+                                terminal_auth_failure = True
+                                break
+
                         # Store fresh cookies unless cache is explicitly disabled.
                         # Store before cancellation check so NM-triggered reconnects can
                         # reuse fresh auth result and skip duplicate browser auth flows.
                         if not disable_cookie_cache and not skip_gp_cookie_cache and not used_cache:
-                            store_nm_cookies(connection_name, cookies, usergroup='portal:prelogin-cookie')
+                            store_nm_cookies(
+                                connection_name,
+                                cookies,
+                                usergroup=cache_usergroup,
+                            )
 
                         if _connect_cancelled():
                             log.info("Connect cancelled during authentication; fresh cookies preserved for retry")
@@ -1559,6 +1679,12 @@ class VPNPluginService(dbus.service.Object):
                     if _connect_cancelled():
                         log.info("Connect cancelled before starting OpenConnect; aborting")
                         return
+                    if protocol == 'gp' and not self._has_reusable_gp_cookie(cookies):
+                        # A prelogin cookie is endpoint-scoped and commonly
+                        # single-use. It may be cached briefly across an NM
+                        # cancellation before handoff, but never replay it after
+                        # OpenConnect starts consuming it.
+                        clear_nm_cookies(connection_name)
                     success, error_msg, uptime_seconds = self._attempt_vpn_connection(
                         gateway,
                         protocol,
@@ -1566,6 +1692,7 @@ class VPNPluginService(dbus.service.Object):
                         username,
                         used_cache=used_cache,
                         gp_os_version=gp_os_version,
+                        gp_auth_interface=gp_auth_interface,
                         connect_generation=connect_generation,
                         watchdog_interval_seconds=watchdog_interval_seconds,
                         watchdog_missing_tun_limit=watchdog_missing_tun_limit,
@@ -1587,8 +1714,16 @@ class VPNPluginService(dbus.service.Object):
                             log.warning("Cached cookie rejected, clearing cache and re-authenticating...")
                             clear_nm_cookies(connection_name)
                             continue
+                        if protocol == 'gp' and not self._has_reusable_gp_cookie(cookies):
+                            log.warning(
+                                "Cached one-time GlobalProtect prelogin cookie did not "
+                                "establish a tunnel; clearing it before one fresh SAML attempt"
+                            )
+                            clear_nm_cookies(connection_name)
+                            continue
+                        protocol_label = "GlobalProtect" if protocol == 'gp' else "AnyConnect"
                         log.warning(
-                            "Cached AnyConnect cookie did not establish a usable tunnel; "
+                            f"Cached {protocol_label} cookie did not establish a usable tunnel; "
                             "preserving cache and letting reconnect retry it"
                         )
                         final_error = error_msg or "VPN connection failed"
@@ -1613,16 +1748,30 @@ class VPNPluginService(dbus.service.Object):
                     else:
                         if not used_cache and cookie_rejected:
                             terminal_auth_failure = True
-                        if (
-                            not used_cache
-                            and not (
+                        if not used_cache:
+                            if protocol == 'gp':
+                                if self._has_reusable_gp_cookie(cookies) and not cookie_rejected:
+                                    log.info(
+                                        "Preserving reusable GlobalProtect portal cookie after "
+                                        "transport failure"
+                                    )
+                                else:
+                                    clear_nm_cookies(connection_name)
+                                    terminal_auth_failure = True
+                                    if not cookie_rejected:
+                                        final_error = (
+                                            (error_msg or "GlobalProtect tunnel handoff failed")
+                                            + "; not repeating SAML/TOTP after a one-time "
+                                            "prelogin cookie was consumed"
+                                        )
+                            elif not (
                                 protocol == 'anyconnect'
                                 and error_msg
-                                and 'dns' in error_msg.lower()
-                            )
-                        ):
-                            clear_nm_cookies(connection_name)
-                        final_error = error_msg or "VPN connection failed"
+                                and 'dns' in str(error_msg).lower()
+                            ):
+                                clear_nm_cookies(connection_name)
+                        if not final_error:
+                            final_error = error_msg or "VPN connection failed"
                         break
 
                 if _connect_cancelled():
@@ -1744,6 +1893,7 @@ class VPNPluginService(dbus.service.Object):
             username=None,
             used_cache=False,
             gp_os_version=None,
+            gp_auth_interface='portal',
             connect_generation: Optional[int] = None,
             watchdog_interval_seconds=5,
             watchdog_missing_tun_limit=3,
@@ -1778,49 +1928,50 @@ class VPNPluginService(dbus.service.Object):
                     0,
                 )
 
-            if protocol == 'gp' and 'prelogin-cookie' in cookies:
-                cookie_str = cookies.get('prelogin-cookie', '')
+            if protocol == 'gp':
+                cookie_str, gp_usergroup, gp_cookie_uses_stdin = (
+                    self._select_gp_cookie(
+                        cookies,
+                        auth_interface=gp_auth_interface,
+                    )
+                )
                 gp_env = os.environ.copy()
                 if gp_os_version:
                     gp_env["MS_SSO_GP_OS_VERSION"] = gp_os_version
                 else:
                     gp_env.setdefault("MS_SSO_GP_OS_VERSION", get_gp_os_version())
                 gp_hip_wrapper = get_gp_hip_report_wrapper()
-                log.debug(f"Using GlobalProtect prelogin-cookie (len={len(cookie_str)})")
-                cmd = [
-                    openconnect_bin,
-                    "--verbose",
-                    f"--protocol={proto_flag}",
-                    reconnect_arg,
-                    dpd_arg,
-                    "--passwd-on-stdin",
-                    "--useragent=PAN GlobalProtect",
-                    "--usergroup=portal:prelogin-cookie",
-                    "--os=linux-64",
-                    gateway,
-                ]
+                gp_username = cookies.get('saml-username') or username
+                log.debug(
+                    "Using GlobalProtect authentication artifact "
+                    f"(group={gp_usergroup}, len={len(cookie_str)})"
+                )
+                cmd = self._build_gp_openconnect_command(
+                    openconnect_bin=openconnect_bin,
+                    proto_flag=proto_flag,
+                    gateway=gateway,
+                    usergroup=gp_usergroup,
+                    username=gp_username,
+                    resolve_arg=resolve_arg,
+                    hip_wrapper=gp_hip_wrapper,
+                )
                 if gp_hip_wrapper:
-                    cmd.insert(-1, f"--csd-wrapper={gp_hip_wrapper}")
                     log.info(
                         "Using GlobalProtect HIP wrapper: "
                         f"{gp_hip_wrapper} (OS={gp_env.get('MS_SSO_GP_OS_VERSION')})"
                     )
-                if resolve_arg:
-                    cmd.insert(3, resolve_arg)
-                # Add username if available (required for GlobalProtect)
-                if username:
-                    cmd.insert(7 if resolve_arg else 6, f"--user={username}")
-                self.vpn_process = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    env=gp_env,
-                )
+                popen_kwargs = {
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "env": gp_env,
+                }
+                if gp_cookie_uses_stdin:
+                    popen_kwargs["stdin"] = subprocess.PIPE
+                self.vpn_process = subprocess.Popen(cmd, **popen_kwargs)
                 vpn_process = self.vpn_process
                 self.vpn_process_generation = connect_generation
-                vpn_process.stdin.write(f"{cookie_str}\n".encode())
-                vpn_process.stdin.flush()
+                if gp_cookie_uses_stdin:
+                    self._write_gp_cookie_and_close(vpn_process, cookie_str)
             else:
                 cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
                 log.debug(f"Using AnyConnect cookie (len={len(cookie_str)})")
@@ -1939,6 +2090,11 @@ class VPNPluginService(dbus.service.Object):
                 time.sleep(0.5)
 
             if not connected:
+                log.warning(
+                    "OpenConnect tunnel timeout diagnostic: "
+                    f"{self._classify_openconnect_timeout(output_buffer)} "
+                    f"(captured-bytes={len(output_buffer)})"
+                )
                 # Ensure failed/timeout attempts do not leave a stray OpenConnect
                 # process or DNS state behind.
                 try:
@@ -2272,7 +2428,11 @@ class VPNPluginService(dbus.service.Object):
         allow_early = os.environ.get("MS_SSO_NM_GP_EARLY_CONFIG", "").lower() in {"1", "true", "yes"}
         if allow_early:
             return True
-        # Default below NetworkManager's observed connect timeout window.
+        # Default off: a gateway-only Config makes NetworkManager advertise an
+        # active VPN even though OpenConnect has not created a tunnel. Profiles
+        # saved by the editor already have a 300-second activation timeout.
+        if not os.environ.get("MS_SSO_NM_GP_CONFIG_DELAY", "").strip():
+            return False
         return self._initial_config_delay_elapsed("GP", "MS_SSO_NM_GP_CONFIG_DELAY", 20)
 
     def _anyconnect_initial_config_allowed(self) -> bool:
