@@ -123,6 +123,22 @@ MICROSOFT_SKIP_OPTIONAL_LABELS = (
     "Später",
 )
 
+MICROSOFT_KMSI_MARKERS = (
+    "Stay signed in",
+    "Angemeldet bleiben",
+    "Rester connecté",
+    "Rimanere connesso",
+    "Mantener la sesión iniciada",
+)
+
+MICROSOFT_KMSI_ACCEPT_LABELS = (
+    "Yes",
+    "Ja",
+    "Oui",
+    "Sì",
+    "Sí",
+)
+
 
 def _remaining_timeout_ms(deadline: float, now: Optional[float] = None) -> int:
     """Return the non-negative milliseconds remaining before a monotonic deadline."""
@@ -1944,15 +1960,37 @@ def do_saml_auth(
                     _wait_until_ready(0.1)
                     continue
 
+                # Microsoft can present a localized "Stay signed in?" page
+                # after TOTP succeeds. Accepting it is appropriate for the
+                # plugin's dedicated persistent browser profile and avoids a
+                # full login on the next connection.
+                if _page_has_text(list(MICROSOFT_KMSI_MARKERS)):
+                    kmsi_submitted = _click_action(
+                        list(MICROSOFT_KMSI_ACCEPT_LABELS)
+                    )
+                    if not kmsi_submitted:
+                        kmsi_submitted = _click_known_ids([
+                            "idSIButton9",
+                            "acceptButton",
+                            "primaryButton",
+                        ])
+                    if not kmsi_submitted:
+                        kmsi_submitted = _click_first_selector([
+                            "button[type='submit']",
+                            "input[type='submit']",
+                        ])
+                    if kmsi_submitted:
+                        _report_progress("microsoft-kmsi-accepted")
+                        last_progress_time = time.monotonic()
+                        _interruptible_pause(0.25)
+                        continue
+
                 # Fallback clicks for common prompts
                 if _click_action(["Use your password instead", "Use password instead"]):
                     last_progress_time = time.monotonic()
                     _interruptible_pause(0.25)
                     continue
                 fallback_submitted = _click_action([
-                    "Stay signed in",
-                    "Yes",
-                    "No",
                     "OK",
                     "Continue",
                     "Next",

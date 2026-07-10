@@ -12,6 +12,8 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
 
 from core.auth import (  # noqa: E402
     MICROSOFT_ALTERNATE_MFA_LABELS,
+    MICROSOFT_KMSI_ACCEPT_LABELS,
+    MICROSOFT_KMSI_MARKERS,
     MICROSOFT_NUMBER_MATCH_MARKERS,
     MICROSOFT_PASSKEY_MARKERS,
     MICROSOFT_PUSH_DIRECT_SELECTORS,
@@ -49,6 +51,10 @@ class MicrosoftMfaTests(unittest.TestCase):
 
     def test_microsoft_totp_method_has_stable_selector(self):
         self.assertIn("[data-value='PhoneAppOTP']", MICROSOFT_TOTP_DIRECT_SELECTORS)
+
+    def test_german_stay_signed_in_prompt_is_supported(self):
+        self.assertIn("Angemeldet bleiben", MICROSOFT_KMSI_MARKERS)
+        self.assertIn("Ja", MICROSOFT_KMSI_ACCEPT_LABELS)
 
     def test_push_passkey_and_number_match_states_are_supported(self):
         self.assertIn("[data-value='PhoneAppNotification']", MICROSOFT_PUSH_DIRECT_SELECTORS)
