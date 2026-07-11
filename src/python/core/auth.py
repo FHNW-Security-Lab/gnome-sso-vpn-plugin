@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import unicodedata
 import xml.etree.ElementTree as ET
 from typing import Callable, Optional
 
@@ -31,8 +33,16 @@ MICROSOFT_TOTP_DIRECT_SELECTORS = (
     "[data-value='SoftwareOath']",
 )
 
-MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS = 20.0
+MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS = 25.0
+MICROSOFT_METHOD_PICKER_SETTLE_SECONDS = 1.5
+MICROSOFT_PASSWORD_STABILITY_SECONDS = 0.5
 MICROSOFT_TOTP_MAX_SUBMISSIONS = 2
+SAML_UI_STALL_WINDOW_SECONDS = 8.0
+SAML_UI_POST_SUBMIT_GRACE_SECONDS = 20.0
+SAML_UI_PROCESSING_EXTENSION_SECONDS = 10.0
+SAML_UI_MAX_PROCESSING_EXTENSIONS = 6
+SAML_UI_MAX_SUBMIT_WAIT_SECONDS = 180.0
+SAML_UI_MAX_RECOVERIES = 1
 
 MICROSOFT_TOTP_METHOD_LABELS = (
     "Use a verification code",
@@ -85,6 +95,7 @@ MICROSOFT_PUSH_METHOD_LABELS = (
     "Anforderung in meiner Microsoft Authenticator-App genehmigen",
     "Benachrichtigung an meine Microsoft Authenticator-App senden",
     "Microsoft Authenticator-Benachrichtigung",
+    "Eine Anforderung in meiner Microsoft Authenticator-App bestätigen",
 )
 
 MICROSOFT_PASSWORD_METHOD_LABELS = (
@@ -113,6 +124,19 @@ MICROSOFT_PASSKEY_MARKERS = (
     "Mit Ihrem Passkey anmelden",
     "Mit einem Hauptschlüssel anmelden",
     "Anmeldung mit einem Hauptschlüssel",
+    "Gesicht, Fingerabdruck, PIN oder Sicherheitsschlüssel",
+)
+
+MICROSOFT_CREDENTIAL_ERROR_MARKERS = (
+    "Your account or password is incorrect",
+    "Your password is incorrect",
+    "The user name or password is incorrect",
+    "Enter a valid password",
+    "Incorrect user ID or password",
+    "Ihr Konto oder Kennwort ist falsch",
+    "Das Kennwort ist falsch",
+    "Benutzername oder Kennwort ist falsch",
+    "Geben Sie ein gültiges Kennwort ein",
 )
 
 MICROSOFT_NUMBER_MATCH_MARKERS = (
@@ -166,6 +190,155 @@ MICROSOFT_KMSI_ACCEPT_LABELS = (
     "Sì",
     "Sí",
 )
+
+
+class SamlUiStalledError(RuntimeError):
+    """Raised when the browser login UI remains unchanged after recovery."""
+
+
+def _normalize_session_identity(value: Optional[str]) -> str:
+    """Normalize a cache identity component without exposing it in a path."""
+    return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+
+
+def _normalize_gateway_identity(gateway: Optional[str]) -> str:
+    """Return a stable host/port identity for a VPN gateway."""
+    text = unicodedata.normalize("NFKC", str(gateway or "")).strip()
+    try:
+        parsed = urllib.parse.urlsplit(text if "://" in text else f"//{text}")
+        host = (parsed.hostname or text).strip().rstrip(".").casefold()
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            pass
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port and port != 443:
+            return f"{host}:{port}"
+        return host
+    except Exception:
+        return text.rstrip(".").casefold()
+
+
+def _browser_session_cache_key(
+    protocol: Optional[str],
+    gateway: Optional[str],
+    username: Optional[str],
+) -> str:
+    """Return an opaque deterministic key for one VPN/account browser profile."""
+    identity = json.dumps(
+        [
+            _normalize_session_identity(protocol),
+            _normalize_gateway_identity(gateway),
+            _normalize_session_identity(username),
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    # Bump the opaque namespace when browser-profile semantics change so an
+    # upgrade cannot inherit a pre-fix Microsoft page that was mid-transition.
+    return f"v2-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+def _is_actionable_control(
+    tag_name: Optional[str],
+    role: Optional[str] = None,
+    input_type: Optional[str] = None,
+    disabled: bool = False,
+    has_href: bool = False,
+    has_click_handler: bool = False,
+    has_data_value: bool = False,
+    tab_index: Optional[int] = None,
+    pointer_cursor: bool = False,
+) -> bool:
+    """Classify semantic and non-semantic controls that are genuinely interactive."""
+    if disabled:
+        return False
+    tag = str(tag_name or "").strip().casefold()
+    normalized_role = str(role or "").strip().casefold()
+    normalized_type = str(input_type or "").strip().casefold()
+    return (
+        normalized_role in {"button", "link"}
+        or tag == "button"
+        or (tag == "a" and has_href)
+        or (tag == "input" and normalized_type in {"button", "submit"})
+        or has_click_handler
+        or has_data_value
+        or (tab_index is not None and tab_index >= 0)
+        or pointer_cursor
+    )
+
+
+def _exact_action_pattern(label: str) -> re.Pattern:
+    """Match one complete control label, ignoring case and edge whitespace."""
+    return re.compile(rf"^\s*{re.escape(str(label or '').strip())}\s*$", re.IGNORECASE)
+
+
+def _allows_partial_action_label(label: str) -> bool:
+    """Allow partial matching only for long labels specific enough to be safe."""
+    return len(str(label or "").strip()) >= 12
+
+
+def _action_patterns(labels) -> list[re.Pattern]:
+    """Prefer exact labels, then permit specific long-label variants."""
+    patterns = [_exact_action_pattern(label) for label in labels]
+    patterns.extend(
+        re.compile(re.escape(str(label).strip()), re.IGNORECASE)
+        for label in labels
+        if _allows_partial_action_label(label)
+    )
+    return patterns
+
+
+def _stale_ui_recovery_action(
+    last_substantive_progress: float,
+    now: float,
+    recovery_attempts: int,
+    grace_until: float = 0.0,
+    stall_window: float = SAML_UI_STALL_WINDOW_SECONDS,
+    max_recoveries: int = SAML_UI_MAX_RECOVERIES,
+) -> str:
+    """Choose a bounded recovery action based only on substantive UI progress."""
+    if now < grace_until or now - last_substantive_progress < max(0.0, stall_window):
+        return "wait"
+    return "recover" if recovery_attempts < max(0, max_recoveries) else "fail"
+
+
+def _extend_processing_grace(
+    now: float,
+    grace_until: float,
+    processing_visible: bool,
+    extensions_used: int,
+    extension_seconds: float = SAML_UI_PROCESSING_EXTENSION_SECONDS,
+    max_extensions: int = SAML_UI_MAX_PROCESSING_EXTENSIONS,
+    hard_deadline: Optional[float] = None,
+) -> tuple[float, int]:
+    """Progressively extend an expired grace while submitted UI is unresolved."""
+    if (
+        not processing_visible
+        or now < grace_until
+        or (hard_deadline is not None and now >= hard_deadline)
+        or extensions_used >= max(0, max_extensions)
+    ):
+        return grace_until, extensions_used
+    # Back off from the fast initial check without imposing the longest wait on
+    # ordinary logins: 10s, 20s, 30s, 40s, 50s, then 60s as needed.
+    next_extension = max(0.0, extension_seconds) * (extensions_used + 1)
+    next_deadline = now + next_extension
+    if hard_deadline is not None:
+        next_deadline = min(next_deadline, hard_deadline)
+    return next_deadline, extensions_used + 1
+
+
+def _submission_hard_deadline(
+    submitted_at: float,
+    auth_deadline: float,
+    max_wait_seconds: float = SAML_UI_MAX_SUBMIT_WAIT_SECONDS,
+) -> float:
+    """Clamp one submitted form to both its own cap and the auth deadline."""
+    return min(auth_deadline, submitted_at + max(0.0, max_wait_seconds))
 
 
 def _remaining_timeout_ms(deadline: float, now: Optional[float] = None) -> int:
@@ -518,7 +691,7 @@ def do_saml_auth(
             gp_auth_interface=gp_auth_interface,
         )
         if debug:
-            print(f"    [DEBUG] prelogin-cookie: {gp_prelogin_cookie[:20] if gp_prelogin_cookie else None}...")
+            print(f"    [DEBUG] prelogin-cookie present: {bool(gp_prelogin_cookie)}")
             print(f"    [DEBUG] gateway_ip: {gp_gateway_ip}")
     else:
         print("  [1/6] Using AnyConnect SAML URL...")
@@ -731,17 +904,23 @@ def do_saml_auth(
                 print(f"    [DEBUG] Using ephemeral browser session dir: {cache_dir}")
         else:
             cache_dir = None
-            cache_candidates = []
+            cache_roots = []
             if real_user != "root":
-                cache_candidates.append(
+                cache_roots.append(
                     os.path.join(home, ".cache", "ms-sso-openconnect", "browser-session")
                 )
-            cache_candidates.extend([
+            cache_roots.extend([
                 "/var/cache/ms-sso-openconnect/browser-session",
                 "/tmp/ms-sso-openconnect/browser-session",
             ])
+            cache_key = _browser_session_cache_key(
+                protocol,
+                vpn_server_netloc,
+                username,
+            )
 
-            for candidate in cache_candidates:
+            for root in cache_roots:
+                candidate = os.path.join(root, cache_key)
                 if _ensure_writable_dir(candidate):
                     cache_dir = candidate
                     if debug:
@@ -817,6 +996,7 @@ def do_saml_auth(
         def _secure_screenshot(path: str) -> None:
             page.screenshot(path=path)
             os.chmod(path, 0o600)
+            os.chmod(path, 0o600)
 
         def _close_context() -> None:
             try:
@@ -891,6 +1071,9 @@ def do_saml_auth(
 
         vpn_request_event = threading.Event()
         ui_change_event = threading.Event()
+        microsoft_credential_lookup_pending = 0
+        microsoft_credential_lookup_settle_until = 0.0
+        microsoft_credential_lookup_generation = 0
 
         def _wait_for_vpn_callback(timeout_ms: int = 60000) -> None:
             _raise_if_cancelled()
@@ -911,11 +1094,35 @@ def do_saml_auth(
                     vpn_request_event.clear()
 
         def handle_request(request):
+            nonlocal microsoft_credential_lookup_pending
+            nonlocal microsoft_credential_lookup_generation
+            if debug:
+                parsed_request = urllib.parse.urlsplit(request.url)
+                if (
+                    parsed_request.hostname == "login.microsoftonline.com"
+                    and request.method.upper() != "GET"
+                ):
+                    print(
+                        "    [DEBUG] Microsoft request: "
+                        f"path={parsed_request.path or '/'} method={request.method}"
+                    )
+            parsed_request = urllib.parse.urlsplit(request.url)
+            if (
+                parsed_request.hostname == "login.microsoftonline.com"
+                and parsed_request.path.casefold().endswith("/getcredentialtype")
+            ):
+                microsoft_credential_lookup_pending += 1
+                microsoft_credential_lookup_generation += 1
             if _is_vpn_url(request.url):
                 vpn_request_event.set()
                 ui_change_event.set()
                 if debug:
-                    print(f"    [DEBUG] Request to VPN: {request.url[:80]}...")
+                    parsed_request = urllib.parse.urlsplit(request.url)
+                    print(
+                        "    [DEBUG] Request to VPN: "
+                        f"host={parsed_request.hostname or 'unknown'} "
+                        f"path={parsed_request.path or '/'}"
+                    )
                     print(f"    [DEBUG] Request method: {request.method}")
                 if request.post_data:
                     try:
@@ -935,17 +1142,58 @@ def do_saml_auth(
                             print(f"    [DEBUG] Error parsing POST: {e}")
 
         def handle_response(response):
+            nonlocal microsoft_credential_lookup_pending
+            nonlocal microsoft_credential_lookup_settle_until
+            parsed_response = urllib.parse.urlsplit(response.url)
+            if (
+                parsed_response.hostname == "login.microsoftonline.com"
+                and parsed_response.path.casefold().endswith("/getcredentialtype")
+            ):
+                microsoft_credential_lookup_pending = max(
+                    0,
+                    microsoft_credential_lookup_pending - 1,
+                )
+                microsoft_credential_lookup_settle_until = (
+                    time.monotonic() + 0.5
+                )
+                ui_change_event.set()
             if not _is_vpn_url(response.url):
+                if debug:
+                    if (
+                        parsed_response.hostname == "login.microsoftonline.com"
+                        and response.request.method.upper() != "GET"
+                    ):
+                        print(
+                            "    [DEBUG] Microsoft response: "
+                            f"path={parsed_response.path or '/'} "
+                            f"status={response.status}"
+                        )
                 return
             ui_change_event.set()
             try:
                 headers = response.headers
                 if debug:
-                    print(f"    [DEBUG] Response from VPN: {response.url[:80]}... status={response.status}")
-                    for h in ["prelogin-cookie", "saml-username", "portal-userauthcookie", "set-cookie", "location"]:
-                        if h in headers:
-                            val = headers[h][:80] if len(headers[h]) > 80 else headers[h]
-                            print(f"    [DEBUG] Header {h}: {val}...")
+                    parsed_response = urllib.parse.urlsplit(response.url)
+                    print(
+                        "    [DEBUG] Response from VPN: "
+                        f"host={parsed_response.hostname or 'unknown'} "
+                        f"path={parsed_response.path or '/'} status={response.status}"
+                    )
+                    auth_header_names = [
+                        h for h in [
+                            "prelogin-cookie",
+                            "saml-username",
+                            "portal-userauthcookie",
+                            "set-cookie",
+                            "location",
+                        ]
+                        if h in headers
+                    ]
+                    if auth_header_names:
+                        print(
+                            "    [DEBUG] Auth response headers present: "
+                            f"{auth_header_names}"
+                        )
                 if "prelogin-cookie" in headers:
                     saml_result["prelogin_cookie"] = headers["prelogin-cookie"]
                 if "saml-username" in headers:
@@ -955,8 +1203,26 @@ def do_saml_auth(
             except Exception:
                 pass
 
+        def handle_request_failed(request):
+            nonlocal microsoft_credential_lookup_pending
+            nonlocal microsoft_credential_lookup_settle_until
+            parsed_request = urllib.parse.urlsplit(request.url)
+            if (
+                parsed_request.hostname == "login.microsoftonline.com"
+                and parsed_request.path.casefold().endswith("/getcredentialtype")
+            ):
+                microsoft_credential_lookup_pending = max(
+                    0,
+                    microsoft_credential_lookup_pending - 1,
+                )
+                microsoft_credential_lookup_settle_until = (
+                    time.monotonic() + 0.5
+                )
+                ui_change_event.set()
+
         page.on("request", handle_request)
         page.on("response", handle_response)
+        page.on("requestfailed", handle_request_failed)
         page.on("load", lambda *_: ui_change_event.set())
         page.on("domcontentloaded", lambda *_: ui_change_event.set())
         page.on("framenavigated", lambda *_: ui_change_event.set())
@@ -965,7 +1231,18 @@ def do_saml_auth(
             try:
                 count = min(locator.count(), limit)
             except Exception:
-                return None
+                try:
+                    fallback = [
+                        password_loc.get_attribute("id") or "",
+                        password_loc.get_attribute("name") or "",
+                        password_loc.get_attribute("type") or "",
+                        password_loc.get_attribute("autocomplete") or "",
+                    ]
+                    return "fallback:" + hashlib.sha256(
+                        json.dumps(fallback, separators=(",", ":")).encode("utf-8")
+                    ).hexdigest()
+                except Exception:
+                    return None
             for index in range(count):
                 candidate = locator.nth(index)
                 try:
@@ -1258,8 +1535,70 @@ def do_saml_auth(
             except Exception:
                 return False
 
+        def _locator_is_actionable(loc) -> bool:
+            try:
+                if not loc.is_visible() or not loc.is_enabled():
+                    return False
+                traits = loc.evaluate(
+                    """element => ({
+                        tagName: element.tagName.toLowerCase(),
+                        role: element.getAttribute('role') || '',
+                        inputType: element.getAttribute('type') || '',
+                        disabled: !!element.disabled ||
+                            element.getAttribute('aria-disabled') === 'true',
+                        hasHref: element.tagName.toLowerCase() === 'a' &&
+                            !!element.getAttribute('href'),
+                        hasClickHandler: typeof element.onclick === 'function' ||
+                            element.hasAttribute('onclick'),
+                        hasDataValue: element.hasAttribute('data-value'),
+                        tabIndex: Number.isInteger(element.tabIndex) ?
+                            element.tabIndex : null,
+                        pointerCursor: window.getComputedStyle(element).cursor === 'pointer',
+                    })"""
+                )
+                return _is_actionable_control(
+                    traits.get("tagName"),
+                    role=traits.get("role"),
+                    input_type=traits.get("inputType"),
+                    disabled=bool(traits.get("disabled")),
+                    has_href=bool(traits.get("hasHref")),
+                    has_click_handler=bool(traits.get("hasClickHandler")),
+                    has_data_value=bool(traits.get("hasDataValue")),
+                    tab_index=traits.get("tabIndex"),
+                    pointer_cursor=bool(traits.get("pointerCursor")),
+                )
+            except Exception:
+                return False
+
+        def _find_actionable_text_control(frame, pattern):
+            """Return a matching text node's nearest genuinely interactive control."""
+            try:
+                matches = frame.get_by_text(pattern, exact=False)
+                match_count = min(matches.count(), 20)
+            except Exception:
+                return None
+            for match_index in range(match_count):
+                text_match = matches.nth(match_index)
+                try:
+                    if not text_match.is_visible():
+                        continue
+                    controls = text_match.locator(
+                        "xpath=ancestor-or-self::*["
+                        "self::button or self::a[@href] or "
+                        "@role='button' or @role='link' or "
+                        "(self::input and (@type='submit' or @type='button')) or "
+                        "@onclick or @data-value or @tabindex]"
+                    )
+                    for control_index in range(min(controls.count(), 10)):
+                        control = controls.nth(control_index)
+                        if _locator_is_actionable(control):
+                            return control
+                except Exception:
+                    continue
+            return None
+
         def _click_action(labels: list[str]) -> bool:
-            patterns = [re.compile(re.escape(label), re.IGNORECASE) for label in labels]
+            patterns = _action_patterns(labels)
             for frame in page.frames:
                 for pattern in patterns:
                     for role in ["button", "link"]:
@@ -1284,39 +1623,62 @@ def do_saml_auth(
                                     continue
                     except Exception:
                         continue
-                    try:
-                        candidate = _first_visible(frame.get_by_text(pattern, exact=False))
-                        if candidate is not None:
+                    candidate = _find_actionable_text_control(frame, pattern)
+                    if candidate is not None:
+                        try:
                             candidate.click(timeout=1500)
                             return True
-                    except Exception:
-                        continue
+                        except Exception:
+                            continue
             return False
 
         def _action_available(labels: list[str]) -> bool:
-            patterns = [re.compile(re.escape(label), re.IGNORECASE) for label in labels]
+            """Find only visible, enabled controls; explanatory text is not an action."""
+            patterns = _action_patterns(labels)
             for frame in page.frames:
                 for pattern in patterns:
                     for role in ("button", "link"):
                         try:
-                            if _first_visible(frame.get_by_role(role, name=pattern)) is not None:
+                            candidate = _first_visible(
+                                frame.get_by_role(role, name=pattern)
+                            )
+                            if (
+                                candidate is not None
+                                and candidate.is_enabled()
+                                and _is_actionable_control("", role=role)
+                            ):
                                 return True
                         except Exception:
                             continue
                     try:
-                        submits = frame.locator("input[type='submit']")
+                        submits = frame.locator(
+                            "input[type='submit'], input[type='button'], button[type='submit']"
+                        )
                         for index in range(min(submits.count(), 10)):
                             candidate = submits.nth(index)
-                            value = _normalize_text(candidate.get_attribute("value"))
-                            if value and pattern.search(value) and candidate.is_visible():
+                            tag_name = candidate.evaluate(
+                                "element => element.tagName.toLowerCase()"
+                            )
+                            input_type = candidate.get_attribute("type")
+                            label = _normalize_text(
+                                candidate.get_attribute("value")
+                                or candidate.text_content(timeout=500)
+                            )
+                            if (
+                                label
+                                and pattern.search(label)
+                                and candidate.is_visible()
+                                and candidate.is_enabled()
+                                and _is_actionable_control(
+                                    tag_name,
+                                    input_type=input_type,
+                                )
+                            ):
                                 return True
                     except Exception:
                         continue
-                    try:
-                        if _first_visible(frame.get_by_text(pattern, exact=False)) is not None:
-                            return True
-                    except Exception:
-                        continue
+                    if _find_actionable_text_control(frame, pattern) is not None:
+                        return True
             return False
 
         def _click_known_ids(ids: list[str]) -> bool:
@@ -1341,49 +1703,113 @@ def do_saml_auth(
             except Exception:
                 return False
 
-        def _submit_otp(otp_loc) -> bool:
-            """Submit only the form that owns the OTP input."""
-            labels = [
-                "Verify",
-                "Überprüfen",
-                "Bestätigen",
-                "Continue",
-                "Weiter",
-                "Next",
-                "Submit",
-            ]
+        def _submit_owned_form(
+            input_loc,
+            labels: list[str],
+            ids: list[str],
+            *,
+            allow_unlabelled_submit: bool = True,
+            allow_known_ids: bool = True,
+            allow_enter: bool = True,
+        ) -> bool:
+            """Submit the form owning an input before trying page-level fallbacks."""
             try:
-                form = _first_visible(otp_loc.locator("xpath=ancestor::form[1]"), limit=1)
+                form = _first_visible(
+                    input_loc.locator("xpath=ancestor::form[1]"),
+                    limit=1,
+                )
             except Exception:
                 form = None
             if form is not None:
                 for label in labels:
-                    pattern = re.compile(re.escape(label), re.IGNORECASE)
+                    pattern = _exact_action_pattern(label)
                     try:
                         button = _first_visible(form.get_by_role("button", name=pattern))
                         if button is not None:
                             button.click()
+                            if debug:
+                                print("    [DEBUG] Submitted owning form via exact button")
                             return True
                     except Exception:
                         continue
-                try:
-                    submit = _first_visible(form.locator("input[type='submit'], button[type='submit']"))
-                    if submit is not None:
-                        submit.click()
-                        return True
-                except Exception:
-                    pass
-            if _click_known_ids([
-                "idSubmit_SAOTCC_Continue",
-                "idSIButton9",
-                "submitButton",
-            ]):
+                if allow_unlabelled_submit:
+                    try:
+                        submit = _first_visible(form.locator(
+                            "input[type='submit'], button[type='submit']"
+                        ))
+                        if submit is not None:
+                            submit.click()
+                            if debug:
+                                print(
+                                    "    [DEBUG] Submitted owning form via submit control"
+                                )
+                            return True
+                    except Exception:
+                        pass
+            if allow_known_ids and _click_known_ids(ids):
+                if debug:
+                    print("    [DEBUG] Submitted form via known control id")
                 return True
+            if not allow_enter:
+                return False
             try:
-                otp_loc.press("Enter")
+                input_loc.press("Enter")
+                if debug:
+                    print("    [DEBUG] Submitted form via Enter")
                 return True
             except Exception:
                 return False
+
+        def _submit_otp(otp_loc) -> bool:
+            """Submit only the form that owns the OTP input."""
+            return _submit_owned_form(
+                otp_loc,
+                [
+                    "Verify",
+                    "Überprüfen",
+                    "Bestätigen",
+                    "Continue",
+                    "Weiter",
+                    "Next",
+                    "Submit",
+                ],
+                [
+                "idSubmit_SAOTCC_Continue",
+                "idSIButton9",
+                "submitButton",
+                ],
+            )
+
+        def _submit_password(password_loc) -> bool:
+            """Submit the password form without matching alternate-login links."""
+            labels = [
+                "Anmelden",
+                "Sign in",
+                "Connexion",
+                "Accedi",
+                "Continue",
+                "Next",
+            ]
+            if _submit_owned_form(
+                password_loc,
+                labels,
+                [],
+                allow_unlabelled_submit=False,
+                allow_known_ids=False,
+                allow_enter=False,
+            ):
+                if debug:
+                    print("    [DEBUG] Submitted password via exact owning-form control")
+                return True
+            if _click_action(labels):
+                if debug:
+                    print("    [DEBUG] Submitted password via exact page control")
+                return True
+            return _submit_owned_form(
+                password_loc,
+                labels,
+                ["idSIButton9", "submitButton"],
+            )
 
         def _page_has_text(texts: list[str]) -> bool:
             for frame in page.frames:
@@ -1403,40 +1829,159 @@ def do_saml_auth(
                 pass
             return False
 
+        def _find_password_input():
+            return (
+                _find_input_by_ids([
+                    "passwordInput",
+                    "password",
+                    "i0118",
+                    "passwd",
+                    "Passwd",
+                ])
+                or _find_input_by_labels([
+                    "Kennwort",
+                    "Passwort",
+                    "Password",
+                    "Mot de passe",
+                ])
+                or _find_best_input("password")
+            )
+
+        def _password_control_identity(password_loc) -> Optional[str]:
+            """Return a document-scoped identity that changes with the DOM node."""
+            try:
+                return str(password_loc.evaluate(
+                    """element => {
+                        if (!globalThis.__msSsoDocumentIdentity) {
+                            globalThis.__msSsoDocumentIdentity =
+                                (globalThis.crypto && crypto.randomUUID)
+                                    ? crypto.randomUUID()
+                                    : `${Date.now()}-${Math.random()}`;
+                        }
+                        if (!globalThis.__msSsoElementIdentities) {
+                            globalThis.__msSsoElementIdentities = new WeakMap();
+                            globalThis.__msSsoNextElementIdentity = 1;
+                        }
+                        if (!globalThis.__msSsoElementIdentities.has(element)) {
+                            globalThis.__msSsoElementIdentities.set(
+                                element,
+                                globalThis.__msSsoNextElementIdentity++,
+                            );
+                        }
+                        return `${globalThis.__msSsoDocumentIdentity}:` +
+                            globalThis.__msSsoElementIdentities.get(element);
+                    }"""
+                ))
+            except Exception:
+                return None
+
+        def _credential_error_visible() -> bool:
+            """Recognize explicit credential rejection without logging its text."""
+            return _page_has_text(list(MICROSOFT_CREDENTIAL_ERROR_MARKERS))
+
         def _open_alternate_methods() -> bool:
             if _click_first_selector(MICROSOFT_ALTERNATE_MFA_SELECTORS):
                 return True
             return _click_action(list(MICROSOFT_ALTERNATE_MFA_LABELS))
 
+        def _method_picker_context_visible() -> bool:
+            """Require multiple known choices before trusting non-semantic tile text."""
+            method_groups = (
+                MICROSOFT_PASSKEY_MARKERS,
+                MICROSOFT_TOTP_METHOD_LABELS,
+                MICROSOFT_PUSH_METHOD_LABELS,
+                MICROSOFT_PASSWORD_METHOD_LABELS,
+            )
+            return sum(
+                1 for labels in method_groups if _page_has_text(list(labels))
+            ) >= 2
+
+        def _actionable_method_choice_visible() -> bool:
+            """Recognize one concrete method control without trusting body text."""
+            direct_selectors = (
+                MICROSOFT_TOTP_DIRECT_SELECTORS
+                + MICROSOFT_PUSH_DIRECT_SELECTORS
+                + MICROSOFT_PASSWORD_DIRECT_SELECTORS
+            )
+            return bool(
+                _find_visible_in_frames(list(direct_selectors)) is not None
+                or _action_available(list(MICROSOFT_TOTP_METHOD_LABELS))
+                or _action_available(list(MICROSOFT_PUSH_METHOD_LABELS))
+                or _action_available(list(MICROSOFT_PASSWORD_METHOD_LABELS))
+            )
+
+        def _known_method_label_visible(labels: tuple[str, ...]) -> bool:
+            """Recognize a vetted label only inside a verified method picker."""
+            return (
+                _method_picker_context_visible()
+                and _page_has_text(list(labels))
+            )
+
+        def _click_known_method_label(labels: tuple[str, ...]) -> bool:
+            """Click only vetted credential/MFA labels as a non-semantic tile fallback."""
+            if not _method_picker_context_visible():
+                return False
+            patterns = _action_patterns(labels)
+            for frame in page.frames:
+                for pattern in patterns:
+                    try:
+                        candidate = _first_visible(
+                            frame.get_by_text(pattern, exact=False)
+                        )
+                        if candidate is not None:
+                            candidate.click(timeout=1500)
+                            return True
+                    except Exception:
+                        continue
+            return False
+
         def _totp_method_visible() -> bool:
             if _find_visible_in_frames(list(MICROSOFT_TOTP_DIRECT_SELECTORS)) is not None:
                 return True
-            return _action_available(list(MICROSOFT_TOTP_METHOD_LABELS))
+            return (
+                _action_available(list(MICROSOFT_TOTP_METHOD_LABELS))
+                or _known_method_label_visible(MICROSOFT_TOTP_METHOD_LABELS)
+            )
 
         def _push_method_visible() -> bool:
             if _find_visible_in_frames(list(MICROSOFT_PUSH_DIRECT_SELECTORS)) is not None:
                 return True
-            return _action_available(list(MICROSOFT_PUSH_METHOD_LABELS))
+            return (
+                _action_available(list(MICROSOFT_PUSH_METHOD_LABELS))
+                or _known_method_label_visible(MICROSOFT_PUSH_METHOD_LABELS)
+            )
 
         def _password_method_visible() -> bool:
             if _find_visible_in_frames(list(MICROSOFT_PASSWORD_DIRECT_SELECTORS)) is not None:
                 return True
-            return _action_available(list(MICROSOFT_PASSWORD_METHOD_LABELS))
+            return (
+                _action_available(list(MICROSOFT_PASSWORD_METHOD_LABELS))
+                or _known_method_label_visible(MICROSOFT_PASSWORD_METHOD_LABELS)
+            )
 
         def _select_totp_method() -> bool:
             if _click_first_selector(MICROSOFT_TOTP_DIRECT_SELECTORS):
                 return True
-            return _click_action(list(MICROSOFT_TOTP_METHOD_LABELS))
+            return (
+                _click_action(list(MICROSOFT_TOTP_METHOD_LABELS))
+                or _click_known_method_label(MICROSOFT_TOTP_METHOD_LABELS)
+            )
 
         def _select_push_method() -> bool:
             if _click_first_selector(MICROSOFT_PUSH_DIRECT_SELECTORS):
                 return True
-            return _click_action(list(MICROSOFT_PUSH_METHOD_LABELS))
+            return (
+                _click_action(list(MICROSOFT_PUSH_METHOD_LABELS))
+                or _click_known_method_label(MICROSOFT_PUSH_METHOD_LABELS)
+            )
 
         def _select_password_method() -> bool:
             if _click_first_selector(MICROSOFT_PASSWORD_DIRECT_SELECTORS):
                 return True
-            return _click_action(list(MICROSOFT_PASSWORD_METHOD_LABELS))
+            return (
+                _click_action(list(MICROSOFT_PASSWORD_METHOD_LABELS))
+                or _click_known_method_label(MICROSOFT_PASSWORD_METHOD_LABELS)
+            )
 
         def _number_match_state() -> tuple[bool, Optional[str]]:
             marker_visible = _page_has_text(list(MICROSOFT_NUMBER_MATCH_MARKERS))
@@ -1531,6 +2076,63 @@ def do_saml_auth(
                     except Exception:
                         continue
             return False
+
+        def _auth_ui_fingerprint() -> str:
+            """Hash relevant browser state so credentials never enter logs or paths."""
+            snapshot = []
+            for frame in page.frames:
+                try:
+                    controls = frame.evaluate(
+                        """() => Array.from(document.querySelectorAll(
+                            "input, button, a[href], [role='button'], [role='link']"
+                        )).filter(element => {
+                            const rect = element.getBoundingClientRect();
+                            const style = window.getComputedStyle(element);
+                            return style.visibility !== 'hidden' &&
+                                style.display !== 'none' &&
+                                rect.width > 0 && rect.height > 0;
+                        }).slice(0, 50).map(element => ({
+                            tag: element.tagName.toLowerCase(),
+                            id: element.id || '',
+                            name: element.getAttribute('name') || '',
+                            type: element.getAttribute('type') || '',
+                            role: element.getAttribute('role') || '',
+                            autocomplete: element.getAttribute('autocomplete') || '',
+                            disabled: !!element.disabled ||
+                                element.getAttribute('aria-disabled') === 'true',
+                            hasValue: 'value' in element ? !!element.value : null,
+                            label: (element.getAttribute('aria-label') ||
+                                element.getAttribute('value') ||
+                                element.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 120),
+                        }))"""
+                    )
+                    snapshot.append([frame.url, controls])
+                except Exception:
+                    continue
+            if not snapshot:
+                snapshot.append([page.url, []])
+            encoded = json.dumps(
+                snapshot,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return hashlib.sha256(encoded).hexdigest()
+
+        def _auth_ui_processing() -> bool:
+            """Detect a visible semantic loading state without reading page secrets."""
+            selectors = (
+                "[aria-busy='true']",
+                "[role='progressbar']",
+                "[data-testid*='progress' i]",
+                "[data-testid*='spinner' i]",
+                "[class*='progress' i]",
+                "[class*='spinner' i]",
+                "[class*='loading' i]",
+                "#idDiv_PWD_Progress",
+                "#idDiv_SAOTCS_Progress",
+                "#idDiv_SAOTCC_Progress",
+            )
+            return _find_visible_in_frames(list(selectors)) is not None
 
         def _usable_auth_page() -> bool:
             """Reject Chromium error UI while preserving a partially loaded IdP form."""
@@ -1655,8 +2257,11 @@ def do_saml_auth(
             _report_progress(f"portal-ready host={_page_host()}")
 
             if debug:
-                _secure_screenshot("/tmp/vpn-step1-portal.png")
-                print("    [DEBUG] Screenshot: /tmp/vpn-step1-portal.png")
+                try:
+                    _secure_screenshot("/tmp/vpn-step1-portal.png")
+                    print("    [DEBUG] Screenshot: /tmp/vpn-step1-portal.png")
+                except Exception:
+                    print("    [DEBUG] Portal screenshot unavailable; continuing")
 
             _wait_until_ready(0.5)
             _raise_if_cancelled()
@@ -1698,10 +2303,147 @@ def do_saml_auth(
             otp_alternate_attempts = 0
             method_selection_pending = None
             mfa_picker_pending_until = 0.0
+            mfa_picker_settle_until = 0.0
             mfa_method_pending_until = 0.0
             number_match_switch_deadline = 0.0
             number_match_detected_reported = False
             primary_credential_picker_pending_until = 0.0
+            password_bridge_pending_until = 0.0
+            password_bridge_attempts = 0
+            password_input_ready_since = 0.0
+            password_input_identity = None
+            credential_lookup_submission_attempts = 0
+            password_submission_lookup_generation = 0
+            password_submission_classify_until = 0.0
+            ui_recovery_attempts = 0
+            last_ui_fingerprint = _auth_ui_fingerprint()
+            last_substantive_progress_time = time.monotonic()
+            post_submit_grace_until = 0.0
+            processing_extensions_used = 0
+            form_submission_fingerprint = None
+            form_submission_kind = None
+            form_submission_hard_deadline = 0.0
+            mfa_started = False
+
+            def _recover_stale_browser_ui(now: float) -> bool:
+                """Re-enter the SAML flow once, then surface a bounded stall."""
+                nonlocal filled_username
+                nonlocal filled_password
+                nonlocal adfs_submit_attempts
+                nonlocal last_progress_time
+                nonlocal last_mfa_switch_time
+                nonlocal otp_input_reported
+                nonlocal otp_alternate_attempts
+                nonlocal method_selection_pending
+                nonlocal mfa_picker_pending_until
+                nonlocal mfa_picker_settle_until
+                nonlocal mfa_method_pending_until
+                nonlocal number_match_switch_deadline
+                nonlocal number_match_detected_reported
+                nonlocal primary_credential_picker_pending_until
+                nonlocal password_bridge_pending_until
+                nonlocal password_input_ready_since
+                nonlocal password_input_identity
+                nonlocal credential_lookup_submission_attempts
+                nonlocal password_submission_lookup_generation
+                nonlocal password_submission_classify_until
+                nonlocal last_number_match
+                nonlocal ui_recovery_attempts
+                nonlocal last_ui_fingerprint
+                nonlocal last_substantive_progress_time
+                nonlocal post_submit_grace_until
+                nonlocal processing_extensions_used
+                nonlocal form_submission_fingerprint
+                nonlocal form_submission_kind
+                nonlocal form_submission_hard_deadline
+
+                recovery_action = _stale_ui_recovery_action(
+                    last_substantive_progress_time,
+                    now,
+                    ui_recovery_attempts,
+                    grace_until=post_submit_grace_until,
+                )
+                if recovery_action == "wait":
+                    return False
+                if mfa_started:
+                    raise RuntimeError(
+                        "Microsoft MFA UI did not make substantive progress"
+                    )
+                if recovery_action == "fail":
+                    raise SamlUiStalledError(
+                        "SAML login UI did not make substantive progress after recovery"
+                    )
+
+                ui_recovery_attempts += 1
+                filled_username = False
+                filled_password = False
+                adfs_submit_attempts = 0
+                last_mfa_switch_time = 0.0
+                otp_input_reported = False
+                otp_alternate_attempts = 0
+                method_selection_pending = None
+                mfa_picker_pending_until = 0.0
+                mfa_picker_settle_until = 0.0
+                mfa_method_pending_until = 0.0
+                number_match_switch_deadline = 0.0
+                number_match_detected_reported = False
+                primary_credential_picker_pending_until = 0.0
+                password_bridge_pending_until = 0.0
+                password_input_ready_since = 0.0
+                password_input_identity = None
+                credential_lookup_submission_attempts = 0
+                password_submission_lookup_generation = 0
+                password_submission_classify_until = 0.0
+                post_submit_grace_until = 0.0
+                processing_extensions_used = 0
+                form_submission_fingerprint = None
+                form_submission_kind = None
+                form_submission_hard_deadline = 0.0
+                if last_number_match is not None:
+                    _close_number_match_notification()
+                    last_number_match = None
+
+                _report_progress("saml-ui-recovery")
+                if debug:
+                    print(
+                        "    [DEBUG] SAML login UI stalled; re-entering the start flow"
+                    )
+                try:
+                    _goto_with_retries(start_url, deadline)
+                except Exception as exc:
+                    raise SamlUiStalledError(
+                        "SAML login UI recovery could not re-enter the start flow"
+                    ) from exc
+                last_ui_fingerprint = _auth_ui_fingerprint()
+                last_substantive_progress_time = time.monotonic()
+                last_progress_time = last_substantive_progress_time
+                return True
+
+            def _arm_submission_wait(kind: str, submitted_at: float) -> None:
+                """Latch one form submit so it is polled but never replayed."""
+                nonlocal last_progress_time
+                nonlocal last_substantive_progress_time
+                nonlocal post_submit_grace_until
+                nonlocal processing_extensions_used
+                nonlocal form_submission_fingerprint
+                nonlocal form_submission_kind
+                nonlocal form_submission_hard_deadline
+
+                last_progress_time = submitted_at
+                last_substantive_progress_time = submitted_at
+                form_submission_hard_deadline = _submission_hard_deadline(
+                    submitted_at,
+                    deadline,
+                )
+                post_submit_grace_until = min(
+                    submitted_at + SAML_UI_POST_SUBMIT_GRACE_SECONDS,
+                    form_submission_hard_deadline,
+                )
+                processing_extensions_used = 0
+                form_submission_kind = kind
+                # Preserve the pre-action baseline. Capturing after the click
+                # can miss a transition that renders inside the 250 ms pause.
+                form_submission_fingerprint = last_ui_fingerprint
 
             while time.monotonic() < deadline:
                 _raise_if_cancelled()
@@ -1712,6 +2454,7 @@ def do_saml_auth(
 
                 progressed = False
                 form_submitted = False
+                submitted_form_kind = None
                 adfs_mode = _is_adfs_page()
 
                 totp_available = bool(totp_secret and auto_totp)
@@ -1720,6 +2463,35 @@ def do_saml_auth(
                 # several seconds while the next method loads. Do not click or
                 # reinterpret that stale panel during the transition.
                 now = time.monotonic()
+                current_ui_fingerprint = _auth_ui_fingerprint()
+                fingerprint_changed = current_ui_fingerprint != last_ui_fingerprint
+                if fingerprint_changed:
+                    last_ui_fingerprint = current_ui_fingerprint
+                    last_substantive_progress_time = now
+                    if form_submission_fingerprint is None:
+                        processing_extensions_used = 0
+                processing_visible = _auth_ui_processing()
+                previous_grace_until = post_submit_grace_until
+                post_submit_grace_until, processing_extensions_used = (
+                    _extend_processing_grace(
+                        now,
+                        post_submit_grace_until,
+                        form_submission_fingerprint is not None,
+                        processing_extensions_used,
+                        hard_deadline=(
+                            form_submission_hard_deadline or None
+                        ),
+                    )
+                )
+                if post_submit_grace_until > previous_grace_until:
+                    _report_progress(
+                        "saml-ui-processing-extended"
+                        if processing_visible
+                        else "saml-ui-submit-wait-extended"
+                    )
+                if form_submission_fingerprint is None:
+                    post_submit_grace_until = 0.0
+                    processing_extensions_used = 0
                 can_switch_mfa = (
                     now - last_mfa_switch_time
                     >= MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
@@ -1730,6 +2502,172 @@ def do_saml_auth(
                     or _page_has_text(list(MICROSOFT_AUTHENTICATOR_PUSH_MARKERS))
                 )
                 number_match_detected = authenticator_push_detected
+                mfa_started = mfa_started or bool(otp_loc or number_match_detected)
+
+                if (
+                    form_submission_fingerprint is not None
+                    and form_submission_kind == "password-unknown"
+                ):
+                    if (
+                        microsoft_credential_lookup_generation
+                        > password_submission_lookup_generation
+                        or microsoft_credential_lookup_pending > 0
+                    ):
+                        credential_lookup_submission_attempts += 1
+                        if credential_lookup_submission_attempts > 2:
+                            raise RuntimeError(
+                                "Microsoft repeated credential discovery without "
+                                "accepting the password form"
+                            )
+                        form_submission_kind = "credential-lookup"
+                        filled_password = False
+                        password_input_ready_since = 0.0
+                        password_input_identity = None
+                        password_submission_classify_until = 0.0
+                        _report_progress("credential-lookup-submitted")
+                    elif now >= password_submission_classify_until:
+                        form_submission_kind = "password"
+                        password_submission_classify_until = 0.0
+                        _report_progress("password-submitted")
+
+                credential_error_visible = _credential_error_visible()
+                if (
+                    form_submission_fingerprint is not None
+                    and credential_error_visible
+                ):
+                    raise RuntimeError(
+                        "The identity provider rejected the submitted credentials or code"
+                    )
+
+                password_field_visible = bool(
+                    form_submission_kind in {"username", "credential-lookup"}
+                    and _find_password_input() is not None
+                )
+
+                account_state_visible = _page_has_text([
+                    "Pick an account",
+                    "issue looking up your account",
+                    "Use another account",
+                    "Anderes Konto verwenden",
+                ])
+                password_submission_pending = form_submission_kind in {
+                    "password",
+                    "password-unknown",
+                }
+                if (
+                    password_submission_pending
+                    and fingerprint_changed
+                    and account_state_visible
+                ):
+                    raise RuntimeError(
+                        "Microsoft returned to account selection after password submission"
+                    )
+
+                if password_submission_pending:
+                    recognized_post_submit_state = bool(
+                        otp_loc
+                        or number_match_detected
+                        or (
+                            fingerprint_changed
+                            and (
+                                _page_has_text(list(MICROSOFT_KMSI_MARKERS))
+                                or _page_has_text(
+                                    list(MICROSOFT_PASSKEY_REGISTRATION_MARKERS)
+                                )
+                                or _actionable_method_choice_visible()
+                                or _method_picker_context_visible()
+                            )
+                        )
+                    )
+                else:
+                    recognized_post_submit_state = bool(
+                        otp_loc
+                        or number_match_detected
+                        or password_field_visible
+                        or (
+                            fingerprint_changed
+                            and (
+                                _page_has_text(list(MICROSOFT_PASSKEY_MARKERS))
+                                or _page_has_text(list(MICROSOFT_KMSI_MARKERS))
+                                or account_state_visible
+                                or _actionable_method_choice_visible()
+                                or _method_picker_context_visible()
+                            )
+                        )
+                    )
+                if recognized_post_submit_state:
+                    post_submit_grace_until = 0.0
+                    form_submission_fingerprint = None
+                    form_submission_kind = None
+                    form_submission_hard_deadline = 0.0
+                    password_submission_classify_until = 0.0
+                if otp_loc:
+                    password_bridge_pending_until = 0.0
+
+                if (
+                    form_submission_fingerprint is not None
+                    and form_submission_hard_deadline > 0.0
+                    and now >= form_submission_hard_deadline
+                ):
+                    # A submitted credential or MFA form is not a stale static
+                    # page. Reloading it can duplicate a sign-in or phone prompt,
+                    # so stop only at its immutable, protocol-clamped deadline.
+                    raise RuntimeError(
+                        "Microsoft did not complete the submitted sign-in within "
+                        "the adaptive processing limit"
+                    )
+
+                form_submission_pending = bool(
+                    form_submission_fingerprint is not None
+                    and now < post_submit_grace_until
+                )
+
+                intentional_transition_pending = bool(
+                    otp_loc
+                    or number_match_detected
+                    or form_submission_pending
+                    or (
+                        last_mfa_switch_time > 0.0
+                        and not can_switch_mfa
+                    )
+                    or now < mfa_picker_pending_until
+                    or now < mfa_method_pending_until
+                    or now < number_match_switch_deadline
+                    or now < primary_credential_picker_pending_until
+                    or now < password_bridge_pending_until
+                    or microsoft_credential_lookup_pending > 0
+                    or now < microsoft_credential_lookup_settle_until
+                )
+                if (
+                    not intentional_transition_pending
+                    and _recover_stale_browser_ui(now)
+                ):
+                    continue
+                if form_submission_pending and not (otp_loc or number_match_detected):
+                    _interruptible_pause(0.1)
+                    continue
+                if (
+                    microsoft_credential_lookup_pending > 0
+                    or time.monotonic()
+                    < microsoft_credential_lookup_settle_until
+                ):
+                    _interruptible_pause(0.1)
+                    continue
+                if not otp_loc and password_bridge_pending_until > 0.0:
+                    password_input = _find_password_input()
+                    if password_input is not None:
+                        password_bridge_pending_until = 0.0
+                        filled_password = False
+                        password_input_ready_since = 0.0
+                        password_input_identity = None
+                    elif now < password_bridge_pending_until:
+                        _interruptible_pause(0.2)
+                        continue
+                    else:
+                        raise RuntimeError(
+                            "Microsoft did not render password entry after selecting "
+                            "the password bridge to TOTP"
+                        )
 
                 # The old OTP form can remain visible while Microsoft's method
                 # picker becomes ready. Once the picker is genuinely visible,
@@ -1835,6 +2773,7 @@ def do_saml_auth(
                     number_match_detected = False
                     method_selection_pending = None
                     mfa_picker_pending_until = 0.0
+                    mfa_picker_settle_until = 0.0
                     mfa_method_pending_until = 0.0
                     number_match_switch_deadline = 0.0
                     number_match_detected_reported = False
@@ -1867,6 +2806,7 @@ def do_saml_auth(
                                     now + MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
                                 )
                                 mfa_picker_pending_until = 0.0
+                                mfa_picker_settle_until = 0.0
                                 number_match_switch_deadline = 0.0
                                 _report_progress("mfa-totp-direct-selected")
                                 last_mfa_switch_time = now
@@ -1884,6 +2824,9 @@ def do_saml_auth(
                                 last_mfa_switch_time = now
                                 mfa_picker_pending_until = (
                                     now + MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
+                                )
+                                mfa_picker_settle_until = (
+                                    now + MICROSOFT_METHOD_PICKER_SETTLE_SECONDS
                                 )
                                 _interruptible_pause(0.25)
                                 continue
@@ -1945,10 +2888,33 @@ def do_saml_auth(
                             now + MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
                         )
                         mfa_picker_pending_until = 0.0
+                        mfa_picker_settle_until = 0.0
                         _report_progress("mfa-totp-method-selected")
                         last_mfa_switch_time = now
                         _interruptible_pause(0.25)
                         continue
+                    if _password_method_visible():
+                        if now < mfa_picker_settle_until:
+                            _interruptible_pause(0.2)
+                            continue
+                        if (
+                            password_bridge_attempts < 1
+                            and _select_password_method()
+                        ):
+                            password_bridge_attempts += 1
+                            filled_password = False
+                            password_input_ready_since = 0.0
+                            password_input_identity = None
+                            mfa_picker_pending_until = 0.0
+                            mfa_picker_settle_until = 0.0
+                            number_match_switch_deadline = 0.0
+                            password_bridge_pending_until = (
+                                now + MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS
+                            )
+                            last_mfa_switch_time = now
+                            _report_progress("mfa-password-bridge-selected")
+                            _interruptible_pause(0.25)
+                            continue
                     _interruptible_pause(0.2)
                     continue
                 if (
@@ -2011,6 +2977,7 @@ def do_saml_auth(
                     _totp_method_visible() if prefer_totp else _push_method_visible()
                 )
                 if not otp_loc and requested_method_visible:
+                    mfa_started = True
                     otp_alternate_attempts = 0
                     requested_method = "TOTP" if prefer_totp else "Authenticator push"
                     selected = _select_totp_method() if prefer_totp else _select_push_method()
@@ -2101,51 +3068,84 @@ def do_saml_auth(
                                 if not form_submitted:
                                     form_submitted = _click_known_ids(["idSIButton9"])
                                 if form_submitted:
+                                    submitted_form_kind = "username"
                                     _report_progress("username-submitted")
+                        except RuntimeError:
+                            raise
                         except Exception:
                             pass
                     else:
                         if _click_action(["Use another account", "Sign in with another account"]):
                             progressed = True
 
+                # Microsoft resolves the account with GetCredentialType before
+                # replacing the username panel. Never inspect or submit a
+                # password control in the same loop as that asynchronous click.
+                if form_submitted and submitted_form_kind == "username":
+                    submitted_at = time.monotonic()
+                    _arm_submission_wait("username", submitted_at)
+                    _interruptible_pause(0.25)
+                    continue
+
                 # Step 4: password field
                 if password and (adfs_mode or not filled_password):
-                    pass_loc = (
-                        _find_input_by_ids(["passwordInput", "password", "i0118", "passwd", "Passwd"])
-                        or _find_input_by_labels(["Kennwort", "Passwort", "Password", "Mot de passe"])
-                        or _find_best_input("password")
-                    )
+                    pass_loc = _find_password_input()
                     if pass_loc:
+                        password_now = time.monotonic()
+                        current_password_identity = _password_control_identity(pass_loc)
+                        if (
+                            current_password_identity is None
+                            or current_password_identity != password_input_identity
+                            or password_input_ready_since <= 0.0
+                        ):
+                            password_input_identity = current_password_identity
+                            password_input_ready_since = password_now
+                            _interruptible_pause(0.1)
+                            continue
+                        if (
+                            microsoft_credential_lookup_pending > 0
+                            or password_now
+                            < microsoft_credential_lookup_settle_until
+                            or password_now - password_input_ready_since
+                            < MICROSOFT_PASSWORD_STABILITY_SECONDS
+                        ):
+                            _interruptible_pause(0.1)
+                            continue
                         try:
+                            lookup_generation_before = (
+                                microsoft_credential_lookup_generation
+                            )
                             if adfs_mode or _input_value_empty(pass_loc):
                                 pass_loc.fill(password)
-                            filled_password = True
                             progressed = True
-                            # Include German "Anmelden" label used by Unibas
-                            form_submitted = _click_action([
-                                "Anmelden",
-                                "Sign in",
-                                "Connexion",
-                                "Accedi",
-                                "Continue",
-                                "Next",
-                            ])
-                            if not form_submitted:
-                                form_submitted = _click_known_ids(["idSIButton9", "submitButton"])
-                            if not form_submitted:
-                                try:
-                                    pass_loc.press("Enter")
-                                    form_submitted = True
-                                except Exception:
-                                    pass
+                            form_submitted = _submit_password(pass_loc)
                             if form_submitted:
-                                _report_progress("password-submitted")
+                                password_input_ready_since = 0.0
+                                password_input_identity = None
+                                filled_password = True
+                                password_submission_lookup_generation = (
+                                    lookup_generation_before
+                                )
+                                password_submission_classify_until = (
+                                    time.monotonic() + 1.0
+                                )
+                                submitted_form_kind = "password-unknown"
+                                _report_progress("password-action-submitted")
+                        except RuntimeError:
+                            raise
                         except Exception:
                             pass
+                    else:
+                        password_input_ready_since = 0.0
+                        password_input_identity = None
 
                 if form_submitted:
-                    last_progress_time = time.monotonic()
+                    submitted_at = time.monotonic()
                     _interruptible_pause(0.25)
+                    _arm_submission_wait(
+                        submitted_form_kind or "generic",
+                        submitted_at,
+                    )
                     continue
 
                 # ADFS direct submit fallback (JS-based)
@@ -2166,6 +3166,11 @@ def do_saml_auth(
                         adfs_submit_attempts += 1
                         if result.get("hasUser") or result.get("hasPass") or result.get("hasBtn"):
                             progressed = True
+                            if result.get("hasBtn"):
+                                submitted_at = time.monotonic()
+                                _arm_submission_wait("password", submitted_at)
+                                _interruptible_pause(0.25)
+                                continue
                     except Exception:
                         pass
 
@@ -2230,7 +3235,8 @@ def do_saml_auth(
                         otp_input_reported = False
 
                 if totp_submitted:
-                    last_progress_time = time.monotonic()
+                    submitted_at = time.monotonic()
+                    _arm_submission_wait("totp", submitted_at)
                     _interruptible_pause(0.25)
                     continue
 
@@ -2261,7 +3267,8 @@ def do_saml_auth(
                         ])
                     if kmsi_submitted:
                         _report_progress("microsoft-kmsi-accepted")
-                        last_progress_time = time.monotonic()
+                        submitted_at = time.monotonic()
+                        _arm_submission_wait("kmsi", submitted_at)
                         _interruptible_pause(0.25)
                         continue
 
@@ -2278,6 +3285,11 @@ def do_saml_auth(
                 ])
                 if not fallback_submitted:
                     fallback_submitted = _click_known_ids(["idSIButton9", "submitButton"])
+                if fallback_submitted:
+                    submitted_at = time.monotonic()
+                    _arm_submission_wait("generic", submitted_at)
+                    _interruptible_pause(0.25)
+                    continue
                 progressed = progressed or fallback_submitted
 
                 if progressed:
@@ -2322,11 +3334,28 @@ def do_saml_auth(
                                 print(f"    [DEBUG] Microsoft login reload failed: {reload_error}")
                     _wait_until_ready(0.1)
 
+            if (
+                form_submission_fingerprint is not None
+                and not _auth_capture_complete()
+                and not _is_vpn_url(page.url)
+            ):
+                raise RuntimeError(
+                    "Microsoft did not complete the submitted sign-in within "
+                    "the adaptive processing limit"
+                )
+
             remaining_ms = _remaining_timeout_ms(deadline)
             if remaining_ms > 0:
                 _report_progress(f"waiting-for-vpn-callback host={_page_host()}")
                 _wait_for_vpn_callback(remaining_ms)
             _raise_if_cancelled()
+            if (
+                not _auth_capture_complete()
+                and not _is_vpn_url(page.url)
+            ):
+                raise RuntimeError(
+                    "SAML authentication did not complete before the protocol deadline"
+                )
 
             # Collect cookies
             all_cookies = context.cookies()
@@ -2358,12 +3387,14 @@ def do_saml_auth(
                 vpn_cookies = {}
 
             if debug:
+                final_url_parts = urllib.parse.urlsplit(page.url)
                 debug_out = {
                     "vpn_server": vpn_server,
                     "vpn_server_host": vpn_server_host,
                     "vpn_server_netloc": vpn_server_netloc,
                     "vpn_server_ip": vpn_server_ip,
-                    "final_url": page.url,
+                    "final_host": final_url_parts.hostname or "unknown",
+                    "final_path": final_url_parts.path or "/",
                     "cookies": list(vpn_cookies.keys()),
                     "cookie_domains": sorted({c.get("domain", "") for c in all_cookies}),
                     "saml_response": bool(saml_result["saml_response"]),

@@ -1,6 +1,6 @@
 """MS SSO OpenConnect runtime for the GNOME NetworkManager plugin."""
 
-from .auth import do_saml_auth, _get_gp_prelogin
+from .auth import SamlUiStalledError, do_saml_auth, _get_gp_prelogin
 from .config import (
     get_connections,
     get_all_connections,  # Alias for backwards compatibility
@@ -32,6 +32,7 @@ from .totp import generate_totp, validate_secret
 __all__ = [
     # Auth
     "do_saml_auth",
+    "SamlUiStalledError",
     "_get_gp_prelogin",
     # Config
     "get_connections",

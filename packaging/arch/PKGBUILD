@@ -1,7 +1,7 @@
 pkgname=networkmanager-ms-sso-git
 _upstream_name=networkmanager-ms-sso
 _repo_name=gnome-sso-vpn-plugin
-pkgver=2.0.2.r76.g0ebac92
+pkgver=2.0.3.r77.g9ce4e2b
 pkgrel=1
 pkgdesc='NetworkManager VPN plugin for MS SSO OpenConnect'
 arch=('x86_64')
@@ -19,6 +19,7 @@ depends=(
   'python-keyring'
   'python-platformdirs'
   'python-playwright'
+  'procps-ng'
   'util-linux'
 )
 makedepends=(

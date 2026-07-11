@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_NAME="network-manager-ms-sso"
-VERSION="2.0.2"
+VERSION="2.0.3"
 
 BUILD_DEPENDENCIES=(
     dpkg-dev
@@ -31,6 +31,7 @@ RUNTIME_DEPENDENCIES=(
     python3-dbus
     python3-keyring
     python3-platformdirs
+    procps
     util-linux
     gir1.2-nm-1.0
     gir1.2-gtk-4.0

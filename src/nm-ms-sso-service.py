@@ -110,6 +110,7 @@ _setup_core_module()
 from core import (
     do_saml_auth,
     PROTOCOLS,
+    SamlUiStalledError,
 )
 from core.cookies import (
     store_nm_cookies,
@@ -235,7 +236,7 @@ class VPNPluginService(dbus.service.Object):
         vpn_secrets = vpn_settings.get('secrets', {})
 
         log.info(f"VPN settings keys: {list(vpn_settings.keys())}")
-        log.info(f"VPN data: {vpn_data}")
+        log.info(f"VPN data keys: {list(vpn_data.keys())}")
         log.info(f"VPN secrets keys: {list(vpn_secrets.keys())}")
 
         # Extract data fields
@@ -254,6 +255,7 @@ class VPNPluginService(dbus.service.Object):
         secrets['reconnect_max_attempts'] = vpn_data.get('reconnect-max-attempts', '')
         secrets['dns_server_limit'] = vpn_data.get('dns-server-limit', '')
         secrets['mfa_preference'] = vpn_data.get('mfa-preference', '')
+        secrets['debug_auth'] = vpn_data.get('debug-auth', '')
 
         # Extract secrets
         secrets['password'] = vpn_secrets.get('password', '')
@@ -339,6 +341,28 @@ class VPNPluginService(dbus.service.Object):
             )
         )
 
+    def _do_saml_auth_with_ui_stall_fallback(self, **auth_kwargs):
+        """Retry one cached-browser UI stall with an ephemeral browser session."""
+        try:
+            return do_saml_auth(**auth_kwargs)
+        except SamlUiStalledError:
+            # An already-ephemeral attempt has no safer browser state to fall
+            # back to. Propagate it without starting another MFA flow.
+            if auth_kwargs.get('disable_browser_session_cache'):
+                raise
+
+            cancel_callback = auth_kwargs.get('cancel_callback')
+            if cancel_callback and cancel_callback():
+                raise
+
+            log.warning(
+                "Cached SAML browser session stalled; retrying once with an "
+                "ephemeral browser session"
+            )
+            retry_kwargs = dict(auth_kwargs)
+            retry_kwargs['disable_browser_session_cache'] = True
+            return do_saml_auth(**retry_kwargs)
+
     @staticmethod
     def _is_cookie_rejection(error_msg) -> bool:
         """Return True when OpenConnect explicitly rejected a session cookie."""
@@ -363,23 +387,42 @@ class VPNPluginService(dbus.service.Object):
         auth_interface = str(auth_interface or 'portal').strip().lower()
         if auth_interface not in {'portal', 'gateway'}:
             auth_interface = 'portal'
+        if auth_interface == 'gateway':
+            # A portal-userauthcookie is a portal handoff artifact. Passing it
+            # as gateway:portal-userauthcookie makes OpenConnect submit it to
+            # the wrong GP form. Direct gateway SAML must use the gateway's
+            # prelogin cookie, including when both artifacts were captured.
+            if cookies.get('prelogin-cookie'):
+                return (
+                    cookies['prelogin-cookie'],
+                    'gateway:prelogin-cookie',
+                    True,
+                )
+            raise RuntimeError(
+                "GlobalProtect gateway authentication returned no gateway prelogin cookie"
+            )
         if cookies.get('portal-userauthcookie'):
             return (
                 cookies['portal-userauthcookie'],
-                f'{auth_interface}:portal-userauthcookie',
+                'portal:portal-userauthcookie',
                 True,
             )
         if cookies.get('prelogin-cookie'):
             return (
                 cookies['prelogin-cookie'],
-                f'{auth_interface}:prelogin-cookie',
+                'portal:prelogin-cookie',
                 True,
             )
         raise RuntimeError("GlobalProtect authentication returned no usable cookie")
 
     @staticmethod
-    def _has_reusable_gp_cookie(cookies) -> bool:
-        """Portal user-auth cookies are reusable; prelogin cookies may be single-use."""
+    def _has_reusable_gp_cookie(cookies, auth_interface: str = 'portal') -> bool:
+        """Return whether the artifact selected for this GP interface is reusable."""
+        auth_interface = str(auth_interface or 'portal').strip().lower()
+        if auth_interface == 'gateway':
+            # Direct gateway auth always selects the single-use prelogin cookie,
+            # even if the callback also exposed a reusable portal handoff.
+            return False
         return bool(cookies and cookies.get('portal-userauthcookie'))
 
     @staticmethod
@@ -1258,6 +1301,12 @@ class VPNPluginService(dbus.service.Object):
                 f"{'disabled' if disable_browser_session_cache else 'enabled'}"
             )
             log.info(f"MFA preference: {mfa_preference}")
+            debug_auth = (
+                self._is_truthy(secrets.get('debug_auth'))
+                or self._is_truthy(os.environ.get("MS_SSO_NM_DEBUG_AUTH"))
+            )
+            if debug_auth:
+                log.info("Privacy-safe SAML browser diagnostics enabled")
             if protocol in {'gp', 'anyconnect'} and disable_browser_session_cache and not force_enable_browser_session_cache:
                 log.info(
                     f"{protocol} uses a fresh browser session by configuration; "
@@ -1587,7 +1636,7 @@ class VPNPluginService(dbus.service.Object):
                             log.warning(f"No playwright browser found in any of: {browser_paths}")
 
                         try:
-                            cookies = do_saml_auth(
+                            cookies = self._do_saml_auth_with_ui_stall_fallback(
                                 vpn_server=gateway,
                                 vpn_server_ip=self.current_gateway_ip,
                                 username=username,
@@ -1595,7 +1644,7 @@ class VPNPluginService(dbus.service.Object):
                                 totp_secret=totp_secret,
                                 auto_totp=True,
                                 headless=True,
-                                debug=self._is_truthy(os.environ.get("MS_SSO_NM_DEBUG_AUTH")),
+                                debug=debug_auth,
                                 protocol=protocol,  # Pass protocol for correct SAML URL
                                 disable_browser_session_cache=disable_browser_session_cache,
                                 gp_os_version=gp_os_version or None,
@@ -1679,7 +1728,10 @@ class VPNPluginService(dbus.service.Object):
                     if _connect_cancelled():
                         log.info("Connect cancelled before starting OpenConnect; aborting")
                         return
-                    if protocol == 'gp' and not self._has_reusable_gp_cookie(cookies):
+                    if protocol == 'gp' and not self._has_reusable_gp_cookie(
+                        cookies,
+                        gp_auth_interface,
+                    ):
                         # A prelogin cookie is endpoint-scoped and commonly
                         # single-use. It may be cached briefly across an NM
                         # cancellation before handoff, but never replay it after
@@ -1714,7 +1766,10 @@ class VPNPluginService(dbus.service.Object):
                             log.warning("Cached cookie rejected, clearing cache and re-authenticating...")
                             clear_nm_cookies(connection_name)
                             continue
-                        if protocol == 'gp' and not self._has_reusable_gp_cookie(cookies):
+                        if protocol == 'gp' and not self._has_reusable_gp_cookie(
+                            cookies,
+                            gp_auth_interface,
+                        ):
                             log.warning(
                                 "Cached one-time GlobalProtect prelogin cookie did not "
                                 "establish a tunnel; clearing it before one fresh SAML attempt"
@@ -1750,7 +1805,10 @@ class VPNPluginService(dbus.service.Object):
                             terminal_auth_failure = True
                         if not used_cache:
                             if protocol == 'gp':
-                                if self._has_reusable_gp_cookie(cookies) and not cookie_rejected:
+                                if self._has_reusable_gp_cookie(
+                                    cookies,
+                                    gp_auth_interface,
+                                ) and not cookie_rejected:
                                     log.info(
                                         "Preserving reusable GlobalProtect portal cookie after "
                                         "transport failure"

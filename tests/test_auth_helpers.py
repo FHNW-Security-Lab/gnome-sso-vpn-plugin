@@ -24,16 +24,29 @@ from core.auth import (  # noqa: E402
     MICROSOFT_PASSWORD_METHOD_LABELS,
     MICROSOFT_PUSH_DIRECT_SELECTORS,
     MICROSOFT_TOTP_DIRECT_SELECTORS,
+    SAML_UI_MAX_RECOVERIES,
+    SAML_UI_MAX_PROCESSING_EXTENSIONS,
+    SAML_UI_MAX_SUBMIT_WAIT_SECONDS,
+    SAML_UI_POST_SUBMIT_GRACE_SECONDS,
+    SAML_UI_PROCESSING_EXTENSION_SECONDS,
+    SAML_UI_STALL_WINDOW_SECONDS,
     _detect_desktop_user,
     _adaptive_mfa_action,
+    _allows_partial_action_label,
+    _browser_session_cache_key,
+    _exact_action_pattern,
+    _extend_processing_grace,
     _get_gp_prelogin,
     _has_number_match_evidence,
+    _is_actionable_control,
     _merge_saml_artifacts,
     _parse_saml_timeout,
     _prefer_totp_for_number_match,
     _remaining_timeout_ms,
+    _submission_hard_deadline,
     _should_notify_number_match,
     _should_submit_totp_counter,
+    _stale_ui_recovery_action,
     _standalone_two_digit_numbers,
 )
 from core.totp import generate_totp, seconds_until_totp_rotation  # noqa: E402
@@ -50,6 +63,166 @@ class AuthDeadlineTests(unittest.TestCase):
         self.assertEqual(_parse_saml_timeout("anyconnect", "invalid"), 120)
         self.assertEqual(_parse_saml_timeout("anyconnect", "0"), 120)
         self.assertEqual(_parse_saml_timeout("gp", "30"), 180)
+
+
+class BrowserSessionIsolationTests(unittest.TestCase):
+    def test_cache_key_normalizes_identity_without_exposing_it(self):
+        first = _browser_session_cache_key(
+            " GP ",
+            "https://VPN.Example.EDU.:443/ssl-vpn/login.esp",
+            " Alice@Example.EDU ",
+        )
+        second = _browser_session_cache_key(
+            "gp",
+            "vpn.example.edu",
+            "alice@example.edu",
+        )
+
+        self.assertEqual(first, second)
+        self.assertRegex(first, r"^v2-[0-9a-f]{64}$")
+        self.assertNotIn("vpn", first)
+        self.assertNotIn("alice", first)
+        self.assertNotIn("example", first)
+
+    def test_cache_key_isolates_protocol_gateway_and_username(self):
+        baseline = _browser_session_cache_key(
+            "gp",
+            "vpn.example.edu",
+            "alice@example.edu",
+        )
+        variants = {
+            _browser_session_cache_key(
+                "anyconnect", "vpn.example.edu", "alice@example.edu"
+            ),
+            _browser_session_cache_key(
+                "gp", "other.example.edu", "alice@example.edu"
+            ),
+            _browser_session_cache_key(
+                "gp", "vpn.example.edu", "bob@example.edu"
+            ),
+        }
+
+        self.assertEqual(len(variants), 3)
+        self.assertNotIn(baseline, variants)
+
+
+class BrowserUiRecoveryTests(unittest.TestCase):
+    def test_explanatory_text_is_not_an_actionable_control(self):
+        self.assertFalse(_is_actionable_control("div"))
+        self.assertFalse(_is_actionable_control("p"))
+        self.assertFalse(_is_actionable_control("input", input_type="text"))
+
+    def test_short_submit_label_does_not_match_alternate_method_link(self):
+        pattern = _exact_action_pattern("Anmelden")
+        self.assertIsNotNone(pattern.search("Anmelden"))
+        self.assertIsNotNone(pattern.search("  ANMELDEN  "))
+        self.assertIsNone(pattern.search("Auf andere Weise anmelden"))
+        self.assertFalse(_allows_partial_action_label("Anmelden"))
+        self.assertTrue(_allows_partial_action_label(
+            "Ich kann meine Microsoft Authenticator-App nicht verwenden"
+        ))
+
+    def test_only_enabled_button_link_or_submit_controls_are_actionable(self):
+        self.assertTrue(_is_actionable_control("button"))
+        self.assertTrue(_is_actionable_control("span", role="button"))
+        self.assertTrue(_is_actionable_control("a", role="link"))
+        self.assertTrue(_is_actionable_control("input", input_type="submit"))
+        self.assertTrue(_is_actionable_control("a", has_href=True))
+        self.assertTrue(_is_actionable_control("div", has_click_handler=True))
+        self.assertTrue(_is_actionable_control("div", has_data_value=True))
+        self.assertTrue(_is_actionable_control("div", tab_index=0))
+        self.assertTrue(_is_actionable_control("div", pointer_cursor=True))
+        self.assertFalse(_is_actionable_control("div", tab_index=-1))
+        self.assertFalse(_is_actionable_control("button", disabled=True))
+
+    def test_stale_ui_recovery_is_fast_but_honors_submit_grace(self):
+        self.assertEqual(SAML_UI_MAX_RECOVERIES, 1)
+        self.assertLessEqual(SAML_UI_STALL_WINDOW_SECONDS, 8.0)
+        self.assertGreaterEqual(SAML_UI_POST_SUBMIT_GRACE_SECONDS, 20.0)
+        self.assertEqual(
+            _stale_ui_recovery_action(
+                100.0,
+                100.0 + SAML_UI_STALL_WINDOW_SECONDS - 0.1,
+                0,
+            ),
+            "wait",
+        )
+        self.assertEqual(
+            _stale_ui_recovery_action(
+                100.0,
+                100.0 + SAML_UI_STALL_WINDOW_SECONDS,
+                0,
+            ),
+            "recover",
+        )
+        self.assertEqual(
+            _stale_ui_recovery_action(
+                100.0,
+                100.0 + SAML_UI_STALL_WINDOW_SECONDS,
+                0,
+                grace_until=100.0 + SAML_UI_POST_SUBMIT_GRACE_SECONDS,
+            ),
+            "wait",
+        )
+        self.assertEqual(
+            _stale_ui_recovery_action(
+                100.0,
+                100.0 + SAML_UI_STALL_WINDOW_SECONDS,
+                1,
+            ),
+            "fail",
+        )
+
+    def test_unresolved_submission_gets_progressive_bounded_extensions(self):
+        self.assertEqual(SAML_UI_MAX_PROCESSING_EXTENSIONS, 6)
+        deadline, used = _extend_processing_grace(
+            now=120.0,
+            grace_until=120.0,
+            processing_visible=True,
+            extensions_used=0,
+            hard_deadline=180.0,
+        )
+        self.assertEqual(deadline, 120.0 + SAML_UI_PROCESSING_EXTENSION_SECONDS)
+        self.assertEqual(used, 1)
+        deadline, used = _extend_processing_grace(
+            now=deadline,
+            grace_until=deadline,
+            processing_visible=True,
+            extensions_used=used,
+            hard_deadline=180.0,
+        )
+        self.assertEqual(deadline, 150.0)
+        self.assertEqual(used, 2)
+        deadline, used = _extend_processing_grace(
+            now=deadline,
+            grace_until=deadline,
+            processing_visible=True,
+            extensions_used=used,
+            hard_deadline=180.0,
+        )
+        self.assertEqual(deadline, 180.0)
+        self.assertEqual(used, 3)
+        self.assertEqual(
+            _extend_processing_grace(
+                now=deadline,
+                grace_until=deadline,
+                processing_visible=True,
+                extensions_used=used,
+                hard_deadline=180.0,
+            ),
+            (deadline, used),
+        )
+
+    def test_submission_deadline_is_immutable_and_protocol_clamped(self):
+        self.assertEqual(SAML_UI_MAX_SUBMIT_WAIT_SECONDS, 180.0)
+        self.assertEqual(
+            _submission_hard_deadline(100.0, 400.0),
+            280.0,
+        )
+        self.assertEqual(
+            _submission_hard_deadline(100.0, 200.0),
+            200.0,
+        )
 
 
 class MicrosoftMfaTests(unittest.TestCase):

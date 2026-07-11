@@ -164,6 +164,13 @@ class OpenConnectOutputTests(unittest.TestCase):
         self.assertFalse(self.service._has_reusable_gp_cookie({
             "prelogin-cookie": "one-time",
         }))
+        self.assertFalse(self.service._has_reusable_gp_cookie(
+            {
+                "prelogin-cookie": "gateway-cookie",
+                "portal-userauthcookie": "portal-cookie",
+            },
+            auth_interface="gateway",
+        ))
 
     def test_gp_gateway_cookie_selection_skips_portal_handoff(self):
         selected = self.service._select_gp_cookie(
@@ -175,6 +182,106 @@ class OpenConnectOutputTests(unittest.TestCase):
             selected,
             ("one-time", "gateway:prelogin-cookie", True),
         )
+
+    def test_gp_gateway_cookie_selection_prefers_prelogin_when_both_exist(self):
+        selected = self.service._select_gp_cookie(
+            {
+                "prelogin-cookie": "gateway-cookie",
+                "portal-userauthcookie": "portal-cookie",
+            },
+            auth_interface="gateway",
+        )
+
+        self.assertEqual(
+            selected,
+            ("gateway-cookie", "gateway:prelogin-cookie", True),
+        )
+
+    def test_gp_gateway_cookie_selection_rejects_portal_only_artifact(self):
+        with self.assertRaisesRegex(RuntimeError, "no gateway prelogin cookie"):
+            self.service._select_gp_cookie(
+                {"portal-userauthcookie": "portal-cookie"},
+                auth_interface="gateway",
+            )
+
+    def test_cached_browser_ui_stall_retries_once_with_ephemeral_session(self):
+        cookies = {"prelogin-cookie": "gateway-cookie"}
+        with patch.object(
+            SERVICE_MODULE,
+            "do_saml_auth",
+            side_effect=[SERVICE_MODULE.SamlUiStalledError("stalled"), cookies],
+        ) as auth:
+            result = self.service._do_saml_auth_with_ui_stall_fallback(
+                vpn_server="vpn.example.edu",
+                disable_browser_session_cache=False,
+                cancel_callback=lambda: False,
+            )
+
+        self.assertEqual(result, cookies)
+        self.assertEqual(auth.call_count, 2)
+        self.assertFalse(auth.call_args_list[0].kwargs["disable_browser_session_cache"])
+        self.assertTrue(auth.call_args_list[1].kwargs["disable_browser_session_cache"])
+
+    def test_second_browser_ui_stall_is_propagated_without_third_attempt(self):
+        with patch.object(
+            SERVICE_MODULE,
+            "do_saml_auth",
+            side_effect=SERVICE_MODULE.SamlUiStalledError("stalled"),
+        ) as auth:
+            with self.assertRaises(SERVICE_MODULE.SamlUiStalledError):
+                self.service._do_saml_auth_with_ui_stall_fallback(
+                    vpn_server="vpn.example.edu",
+                    disable_browser_session_cache=False,
+                    cancel_callback=lambda: False,
+                )
+
+        self.assertEqual(auth.call_count, 2)
+        self.assertTrue(auth.call_args_list[1].kwargs["disable_browser_session_cache"])
+
+    def test_ephemeral_browser_ui_stall_is_not_retried(self):
+        with patch.object(
+            SERVICE_MODULE,
+            "do_saml_auth",
+            side_effect=SERVICE_MODULE.SamlUiStalledError("stalled"),
+        ) as auth:
+            with self.assertRaises(SERVICE_MODULE.SamlUiStalledError):
+                self.service._do_saml_auth_with_ui_stall_fallback(
+                    vpn_server="vpn.example.edu",
+                    disable_browser_session_cache=True,
+                    cancel_callback=lambda: False,
+                )
+
+        auth.assert_called_once()
+
+    def test_cancelled_cached_browser_ui_stall_is_not_retried(self):
+        with patch.object(
+            SERVICE_MODULE,
+            "do_saml_auth",
+            side_effect=SERVICE_MODULE.SamlUiStalledError("stalled"),
+        ) as auth:
+            with self.assertRaises(SERVICE_MODULE.SamlUiStalledError):
+                self.service._do_saml_auth_with_ui_stall_fallback(
+                    vpn_server="vpn.example.edu",
+                    disable_browser_session_cache=False,
+                    cancel_callback=lambda: True,
+                )
+
+        auth.assert_called_once()
+
+    def test_non_ui_saml_failure_is_not_retried(self):
+        with patch.object(
+            SERVICE_MODULE,
+            "do_saml_auth",
+            side_effect=RuntimeError("authentication failed"),
+        ) as auth:
+            with self.assertRaisesRegex(RuntimeError, "authentication failed"):
+                self.service._do_saml_auth_with_ui_stall_fallback(
+                    vpn_server="vpn.example.edu",
+                    disable_browser_session_cache=False,
+                    cancel_callback=lambda: False,
+                )
+
+        auth.assert_called_once()
 
     def test_gp_command_uses_returned_identity_and_hip_for_all_cookie_types(self):
         command = self.service._build_gp_openconnect_command(

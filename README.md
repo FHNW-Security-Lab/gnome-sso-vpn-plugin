@@ -24,7 +24,7 @@ Install the exact package path printed by the build with APT so its runtime
 dependencies are resolved automatically. For example:
 
 ```bash
-sudo apt install "$PWD/dist/network-manager-ms-sso_2.0.2-1_amd64.deb"
+sudo apt install "$PWD/dist/network-manager-ms-sso_2.0.3-1_amd64.deb"
 ```
 
 ## Build Or Install On Arch
@@ -101,8 +101,19 @@ affects GlobalProtect; AnyConnect profiles keep their existing connection path.
 
 GlobalProtect and AnyConnect SAML reuse a browser session by default. This keeps
 Microsoft/IdP SSO state across reconnects, avoids repeated TOTP prompts, and
-makes long-running AnyConnect deployments such as FHNW less fragile. If a stale
-IdP session causes problems, force a fresh browser session explicitly:
+makes long-running AnyConnect deployments such as FHNW less fragile. Browser
+state is isolated by VPN protocol, gateway, and account so switching
+between institutions cannot reuse the other connection's tenant or account
+selection. If a cached Microsoft page stops advancing, the plugin re-enters the
+flow once and then falls back to one clean ephemeral session within the same
+NetworkManager activation. UI state is checked continuously: static pages use a
+short recovery threshold, while submitted forms, visible processing, and MFA
+method transitions receive bounded extra time only while they are still active.
+Submitted forms start with a 20-second fast path and progressively extend only
+as needed, up to the protocol deadline; they are never automatically reloaded
+or submitted twice.
+
+If an IdP session still causes problems, force a fresh browser session explicitly:
 
 ```bash
 nmcli connection modify "<connection name>" +vpn.data "disable-browser-session-cache=1"

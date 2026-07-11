@@ -41,6 +41,11 @@ case "$1" in
             echo "Chromium runtime installed successfully."
         fi
 
+        # D-Bus-activated helpers can survive a NetworkManager restart and
+        # continue running the pre-upgrade code. Stop them explicitly so the
+        # next activation always starts the helper installed by this package.
+        pkill -f /usr/libexec/nm-ms-sso-service >/dev/null 2>&1 || true
+
         # Restart NetworkManager to pick up the new plugin
         if systemctl is-active --quiet NetworkManager; then
             echo "Restarting NetworkManager..."

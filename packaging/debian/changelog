@@ -1,3 +1,17 @@
+network-manager-ms-sso (2.0.3-1) unstable; urgency=medium
+
+  * Isolate browser sessions by VPN gateway and account to prevent tenant crossover
+  * Rotate pre-fix browser profiles so upgrades cannot reuse a stalled login page
+  * Recover once from a stalled Microsoft sign-in page using a clean browser session
+  * Restrict adaptive MFA selection to real interactive controls
+  * Extend genuinely pending sign-ins progressively without resubmitting credentials
+  * Serialize Microsoft credential discovery before submitting password forms
+  * Keep direct GlobalProtect gateway authentication on its prelogin artifact
+  * Stop stale D-Bus VPN helpers during package upgrades
+  * Declare the procps runtime used by package upgrade hooks
+
+ -- MS SSO OpenConnect Maintainers <maintainers@example.com>  Sat, 11 Jul 2026 12:55:41 +0200
+
 network-manager-ms-sso (2.0.2-1) unstable; urgency=medium
 
   * Make Microsoft MFA adaptive and prefer automatic TOTP over phone approval
