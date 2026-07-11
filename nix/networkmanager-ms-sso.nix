@@ -40,7 +40,7 @@ let
 in
 python3Packages.buildPythonApplication rec {
   pname = "networkmanager-ms-sso";
-  version = "2.0.1";
+  version = "2.0.2";
   format = "other";
 
   src = lib.cleanSource ../.;

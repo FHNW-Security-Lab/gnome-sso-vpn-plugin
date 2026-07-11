@@ -1,3 +1,14 @@
+network-manager-ms-sso (2.0.2-1) unstable; urgency=medium
+
+  * Make Microsoft MFA adaptive and prefer automatic TOTP over phone approval
+  * Handle direct TOTP, number matching, and passkey fallback flows reliably
+  * Speed up FHNW AnyConnect and UniBas GlobalProtect connection setup
+  * Authenticate UniBas directly through its GlobalProtect gateway
+  * Report the detected Linux distribution consistently in GlobalProtect HIP data
+  * Complete Arch Linux and NixOS runtime packaging support
+
+ -- MS SSO OpenConnect Maintainers <maintainers@example.com>  Sat, 11 Jul 2026 12:25:34 +0200
+
 network-manager-ms-sso (2.0.1-1) unstable; urgency=medium
 
   * Make FHNW AnyConnect first-time authentication choose TOTP reliably
