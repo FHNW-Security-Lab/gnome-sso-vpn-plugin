@@ -44,7 +44,14 @@ case "$1" in
         # D-Bus-activated helpers can survive a NetworkManager restart and
         # continue running the pre-upgrade code. Stop them explicitly so the
         # next activation always starts the helper installed by this package.
-        pkill -f /usr/libexec/nm-ms-sso-service >/dev/null 2>&1 || true
+        pkill -TERM -f /usr/libexec/nm-ms-sso-service >/dev/null 2>&1 || true
+        wait_attempt=0
+        while pgrep -f /usr/libexec/nm-ms-sso-service >/dev/null 2>&1 \
+            && [ "$wait_attempt" -lt 120 ]; do
+            wait_attempt=$((wait_attempt + 1))
+            sleep 0.25
+        done
+        pkill -KILL -f /usr/libexec/nm-ms-sso-service >/dev/null 2>&1 || true
 
         # Restart NetworkManager to pick up the new plugin
         if systemctl is-active --quiet NetworkManager; then

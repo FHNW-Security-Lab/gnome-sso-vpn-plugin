@@ -24,7 +24,7 @@ Install the exact package path printed by the build with APT so its runtime
 dependencies are resolved automatically. For example:
 
 ```bash
-sudo apt install "$PWD/dist/network-manager-ms-sso_2.0.3-1_amd64.deb"
+sudo apt install "$PWD/dist/network-manager-ms-sso_2.0.4-1_amd64.deb"
 ```
 
 ## Build Or Install On Arch

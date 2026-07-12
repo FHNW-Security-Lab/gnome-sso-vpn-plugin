@@ -60,6 +60,7 @@ sudo mkdir -p /usr/lib/NetworkManager/VPN
 sudo mkdir -p /usr/libexec
 sudo mkdir -p /usr/share/dbus-1/system.d
 sudo mkdir -p /usr/share/network-manager-ms-sso/python
+sudo mkdir -p /etc/NetworkManager/dispatcher.d
 
 # Detect library directory
 if [ -d /usr/lib/x86_64-linux-gnu/NetworkManager ]; then
@@ -78,6 +79,12 @@ sudo chmod +x /usr/libexec/nm-ms-sso-service
 sudo cp "$SCRIPT_DIR/src/nm-ms-sso-auth-dialog.py" /usr/libexec/nm-ms-sso-auth-dialog
 sudo chmod +x /usr/libexec/nm-ms-sso-auth-dialog
 
+sudo cp "$SCRIPT_DIR/src/nm-ms-sso-recover-network" /usr/libexec/nm-ms-sso-recover-network
+sudo chmod +x /usr/libexec/nm-ms-sso-recover-network
+sudo cp "$SCRIPT_DIR/src/nm-ms-sso-recover-network" \
+    /etc/NetworkManager/dispatcher.d/90-nm-ms-sso-recover-network
+sudo chmod +x /etc/NetworkManager/dispatcher.d/90-nm-ms-sso-recover-network
+
 # Install configuration files
 sudo cp "$SCRIPT_DIR/data/nm-ms-sso-service.name" /usr/lib/NetworkManager/VPN/
 sudo cp "$SCRIPT_DIR/data/nm-ms-sso-service.conf" /usr/share/dbus-1/system.d/
@@ -93,6 +100,8 @@ echo ""
 echo "Files installed:"
 echo "  /usr/libexec/nm-ms-sso-service"
 echo "  /usr/libexec/nm-ms-sso-auth-dialog"
+echo "  /usr/libexec/nm-ms-sso-recover-network"
+echo "  /etc/NetworkManager/dispatcher.d/90-nm-ms-sso-recover-network"
 echo "  /usr/lib/NetworkManager/VPN/nm-ms-sso-service.name"
 echo "  /usr/share/dbus-1/system.d/nm-ms-sso-service.conf"
 echo "  $LIBDIR/libnm-vpn-plugin-ms-sso-editor.so"

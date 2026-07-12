@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: network-manager-ms-sso
-Source: https://github.com/FHNW-Security-Lab/gnome-ms-sso-plugin
+Source: https://github.com/FHNW-Security-Lab/gnome-sso-vpn-plugin
 
 Files: *
 Copyright: 2024 MS SSO OpenConnect Contributors

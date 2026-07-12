@@ -139,6 +139,32 @@ NM_VPN_PLUGIN_FAILURE_LOGIN_FAILED = 0
 NM_VPN_PLUGIN_FAILURE_CONNECT_FAILED = 1
 NM_VPN_PLUGIN_FAILURE_BAD_IP_CONFIG = 2
 
+# A completed VPN activation must be torn down by NetworkManager before the
+# plugin repairs or validates the base network.  In particular, trying to move
+# an activation from STARTED back to STARTING leaves NetworkManager's DNS state
+# pointing at the old tunnel ifindex after OpenConnect has removed it.
+NETWORK_RECOVERY_INITIAL_DELAY_MS = 750
+NETWORK_RECOVERY_TIMEOUT_SECONDS = 15
+IPV6_LEAK_ROUTE_METRIC = "42760"
+IPV6_LEAK_ROUTE_PROTOCOL = "186"
+IPV6_LEAK_ROUTE_MARKER = Path(
+    "/run/network-manager-ms-sso/ipv6-leak-route"
+)
+OPENCONNECT_STATE_FILE = Path(
+    "/run/network-manager-ms-sso/openconnect.state"
+)
+PHYSICAL_UPLINK_TYPES = {
+    "ethernet",
+    "wifi",
+    "gsm",
+    "cdma",
+    "bridge",
+    "bond",
+    "team",
+    "vlan",
+    "infiniband",
+}
+
 
 class VPNPluginService(dbus.service.Object):
     """NetworkManager VPN Plugin D-Bus Service."""
@@ -153,6 +179,7 @@ class VPNPluginService(dbus.service.Object):
         self.inactivity_timeout = None
         # Store connection info for config emission
         self.current_gateway = None
+        self.current_connection_uuid = None
         self.current_tun_device = None
         self.current_protocol = None
         self.current_gateway_host = None
@@ -164,7 +191,21 @@ class VPNPluginService(dbus.service.Object):
         self.vpn_split_excludes = []
         self.vpn_split_includes = []
         self.owned_tun_devices = set()
+        self.owned_tun_ifindices = {}
+        self.preexisting_tun_devices = set()
         self.ipv6_leak_protection_enabled = False
+        # NetworkManager-owned uplinks captured before the VPN changes routing
+        # or DNS.  They are reapplied only when post-disconnect health checks
+        # show that the base network did not recover on its own.
+        self.pre_vpn_uplinks = {}
+        self.pre_vpn_dns_default_uplinks = set()
+        self.pre_vpn_dns_state_captured = False
+        self._uplinks_needing_reapply = set()
+        self._network_recovery_token = 0
+        self._network_recovery_deadline = 0.0
+        self._network_recovery_reload_attempted = False
+        self._network_recovery_thread = None
+        self._cleanup_lock = threading.RLock()
         # Track GP connection timing so we can delay initial Config/UI state.
         self.gp_connect_start_time = None
         self.auth_in_progress = False
@@ -182,6 +223,16 @@ class VPNPluginService(dbus.service.Object):
         dbus.service.Object.__init__(self, bus_name, NM_VPN_DBUS_PLUGIN_PATH)
 
         log.info("Core module loaded successfully")
+
+        # If an older service instance was killed, its child can outlive the
+        # D-Bus owner.  Recover the exact persisted PID/start-time ownership
+        # before accepting another VPN activation.
+        self._recover_orphaned_openconnect()
+
+        # A previous service crash must not leave this host-wide route behind.
+        # New activations use a unique metric/protocol plus an ownership marker;
+        # the exact legacy metric-50 route is removed once during upgrade/start.
+        self._remove_stale_ipv6_leak_protection()
 
         # Set initial state
         self._set_state(NM_VPN_SERVICE_STATE_INIT)
@@ -434,11 +485,14 @@ class VPNPluginService(dbus.service.Object):
             username: Optional[str] = None,
             resolve_arg: Optional[str] = None,
             hip_wrapper: Optional[str] = None,
+            interface_name: Optional[str] = None,
     ) -> list[str]:
         """Build a GP command with the same identity flags for every cookie type."""
         cmd = [openconnect_bin, "--verbose", f"--protocol={proto_flag}"]
         if resolve_arg:
             cmd.append(resolve_arg)
+        if interface_name:
+            cmd.append(f"--interface={interface_name}")
         cmd.extend(["--reconnect-timeout=300", "--force-dpd=30"])
         # GP SAML artifacts are authentication-form secrets, not final VPN
         # session cookies. Keep them out of argv and close stdin after one line.
@@ -533,6 +587,437 @@ class VPNPluginService(dbus.service.Object):
         except Exception:
             pass
         return tun_devs
+
+    @staticmethod
+    def _tunnel_name_for_generation(connect_generation: Optional[int]) -> str:
+        """Return a short plugin-specific interface name for one activation."""
+        generation = max(0, int(connect_generation or 0)) % 100
+        return f"tun-ms-sso{generation}"
+
+    @staticmethod
+    def _link_ifindex(device: str) -> Optional[int]:
+        """Return a live link ifindex; names alone are not stable ownership."""
+        try:
+            return socket.if_nametoindex(str(device))
+        except (OSError, ValueError):
+            return None
+
+    def _list_connected_uplinks(self) -> dict[str, str]:
+        """Return connected NetworkManager physical uplinks as device -> UUID."""
+        uplinks = {}
+        if not shutil.which("nmcli"):
+            return uplinks
+        try:
+            result = subprocess.run(
+                [
+                    "nmcli",
+                    "--terse",
+                    "--fields",
+                    "DEVICE,TYPE,STATE,CON-UUID",
+                    "device",
+                    "status",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except Exception as e:
+            log.info(f"Could not enumerate NetworkManager uplinks: {e}")
+            return uplinks
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            log.info(f"Could not enumerate NetworkManager uplinks: {detail}")
+            return uplinks
+
+        for line in result.stdout.splitlines():
+            parts = line.split(":", 3)
+            if len(parts) < 3:
+                continue
+            device, device_type, state = parts[:3]
+            connection_uuid = parts[3] if len(parts) > 3 else ""
+            if (
+                device
+                and device_type in PHYSICAL_UPLINK_TYPES
+                and state.startswith("connected")
+            ):
+                uplinks[device] = connection_uuid
+        return uplinks
+
+    def _capture_base_network_state(self) -> None:
+        """Remember pre-VPN tunnel and uplink ownership for safe teardown."""
+        self.preexisting_tun_devices = self._list_tun_devices()
+        current_uplinks = self._list_connected_uplinks()
+        if current_uplinks:
+            self.pre_vpn_uplinks = current_uplinks
+        if shutil.which("resolvectl"):
+            self.pre_vpn_dns_state_captured = True
+            self.pre_vpn_dns_default_uplinks = (
+                self._dns_default_route_uplinks(set(current_uplinks))
+            )
+        log.info(
+            "Captured base network state: "
+            f"uplinks={sorted(self.pre_vpn_uplinks)}, "
+            f"dns-default-uplinks={sorted(self.pre_vpn_dns_default_uplinks)}, "
+            f"preexisting-tunnels={sorted(self.preexisting_tun_devices)}"
+        )
+
+    def _dns_default_route_uplinks(self, devices: set[str]) -> set[str]:
+        """Return physical links systemd-resolved currently uses by default."""
+        resolvectl = shutil.which("resolvectl")
+        if not resolvectl:
+            return set()
+        default_uplinks = set()
+        for device in sorted(devices):
+            try:
+                result = subprocess.run(
+                    [resolvectl, "status", device],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+            except Exception:
+                continue
+            if result.returncode != 0:
+                continue
+            body = result.stdout.lower()
+            if (
+                re.search(r"current scopes:\s*[^\n]*\bdns\b", body)
+                and re.search(r"default route:\s*yes\b", body)
+            ):
+                default_uplinks.add(device)
+        return default_uplinks
+
+    def _physical_dns_route_restored(self) -> bool:
+        """Compare resolved's post-VPN default DNS links with the baseline."""
+        if not self.pre_vpn_dns_state_captured:
+            return True
+        if not self.pre_vpn_dns_default_uplinks:
+            return True
+        current_uplinks = set(self._list_connected_uplinks())
+        current_defaults = self._dns_default_route_uplinks(current_uplinks)
+        required_defaults = self.pre_vpn_dns_default_uplinks & current_uplinks
+        contaminated = self._uplinks_needing_reapply & current_uplinks
+        return required_defaults.issubset(current_defaults) and not contaminated
+
+    def _route_to_base_network_uses_uplink(self) -> bool:
+        """Return True when public traffic is routed over a physical uplink."""
+        uplinks = set(self.pre_vpn_uplinks)
+        uplinks.update(self._list_connected_uplinks())
+        targets = ["1.1.1.1"]
+        gateway_ip = getattr(self, "current_gateway_ip", None)
+        if gateway_ip and gateway_ip not in targets:
+            targets.append(gateway_ip)
+
+        for target in targets:
+            try:
+                result = subprocess.run(
+                    ["ip", "-4", "route", "get", target],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+            except Exception as e:
+                log.info(f"Base route validation failed: {e}")
+                return False
+            if result.returncode != 0:
+                return False
+
+            route_line = next(
+                (line.strip() for line in result.stdout.splitlines() if line.strip()),
+                "",
+            )
+            match = re.search(r"(?:^|\s)dev\s+(\S+)", route_line)
+            if not match:
+                return False
+            route_device = match.group(1)
+            if uplinks:
+                if route_device not in uplinks:
+                    return False
+            elif route_device.startswith(("tun", "tap", "ppp")):
+                return False
+        return True
+
+    def _base_dns_operational(self) -> bool:
+        """Probe host DNS independently of either institution's VPN record."""
+        host = str(
+            os.environ.get("MS_SSO_NM_NETWORK_DNS_PROBE_HOST")
+            or "example.com"
+        ).strip()
+        if not host:
+            return True
+        try:
+            ipaddress.ip_address(host)
+            return True
+        except ValueError:
+            pass
+
+        getent = shutil.which("getent")
+        if getent:
+            try:
+                result = subprocess.run(
+                    [getent, "ahostsv4", host],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                return result.returncode == 0 and bool(result.stdout.strip())
+            except Exception:
+                return False
+
+        resolvectl = shutil.which("resolvectl")
+        if resolvectl:
+            try:
+                result = subprocess.run(
+                    [resolvectl, "query", "--legend=no", "--type=A", host],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                return result.returncode == 0
+            except Exception:
+                return False
+        return False
+
+    def _base_network_ready(self) -> bool:
+        """Return True only when both physical routing and DNS are usable."""
+        route_ready = self._route_to_base_network_uses_uplink()
+        dns_ready = self._base_dns_operational()
+        dns_route_ready = self._physical_dns_route_restored()
+        log.debug(
+            "Base network health: "
+            f"route={'ready' if route_ready else 'not-ready'}, "
+            f"dns={'ready' if dns_ready else 'not-ready'}, "
+            f"dns-route={'ready' if dns_route_ready else 'not-ready'}"
+        )
+        return route_ready and dns_ready and dns_route_ready
+
+    @staticmethod
+    def _run_recovery_command(command: list[str]) -> bool:
+        """Run one bounded recovery command and report its real exit status."""
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=8,
+            )
+        except Exception as e:
+            log.info(f"Network recovery command failed ({command[0]}): {e}")
+            return False
+        if result.returncode == 0:
+            return True
+        detail = (result.stderr or result.stdout).strip()
+        log.info(
+            "Network recovery command returned "
+            f"{result.returncode} ({command[0]}): {detail}"
+        )
+        return False
+
+    def _reload_networkmanager_dns(self) -> None:
+        """Ask NetworkManager/resolved to discard stale VPN DNS link state."""
+        if shutil.which("nmcli"):
+            if not self._run_recovery_command(
+                ["nmcli", "general", "reload", "dns-full"]
+            ):
+                self._run_recovery_command(["nmcli", "general", "reload"])
+        if shutil.which("resolvectl"):
+            self._run_recovery_command(["resolvectl", "flush-caches"])
+
+    def _primary_uplink_device(self, uplinks: dict[str, str]) -> Optional[str]:
+        """Return the first NM uplink used by the kernel's default routes."""
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "route", "show", "default"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    match = re.search(r"(?:^|\s)dev\s+(\S+)", line)
+                    if match and match.group(1) in uplinks:
+                        return match.group(1)
+        except Exception:
+            pass
+        return sorted(uplinks)[0] if uplinks else None
+
+    def _reapply_connected_uplinks(self, reactivate: bool = False) -> None:
+        """Reapply, and as a last resort reactivate, still-connected uplinks."""
+        current_uplinks = self._list_connected_uplinks()
+        devices = set(current_uplinks)
+        devices.update(
+            device
+            for device in self.pre_vpn_uplinks
+            if device in current_uplinks
+        )
+        devices.update(
+            device
+            for device in self._uplinks_needing_reapply
+            if device in current_uplinks
+        )
+
+        for device in sorted(devices):
+            reapplied = self._run_recovery_command(
+                ["nmcli", "device", "reapply", device]
+            )
+            if reapplied:
+                self._uplinks_needing_reapply.discard(device)
+            if not reapplied:
+                log.info(f"NetworkManager could not reapply uplink {device}")
+
+        if reactivate and not self._base_network_ready():
+            device = self._primary_uplink_device(current_uplinks)
+            connection_uuid = (
+                current_uplinks.get(device or "")
+                or self.pre_vpn_uplinks.get(device or "")
+            )
+            if device and connection_uuid:
+                log.warning(
+                    "Base network is still unavailable; reactivating primary "
+                    f"NetworkManager uplink {device}"
+                )
+                reactivated = self._run_recovery_command([
+                    "nmcli",
+                    "connection",
+                    "up",
+                    "uuid",
+                    connection_uuid,
+                    "ifname",
+                    device,
+                ])
+                if reactivated:
+                    self._uplinks_needing_reapply.discard(device)
+
+    def _recover_base_network_once(self, reactivate: bool = False) -> bool:
+        """Perform one health-driven base-network recovery pass."""
+        if self._base_network_ready():
+            return True
+        if not self._network_recovery_reload_attempted:
+            log.warning(
+                "Base route or DNS did not recover after VPN teardown; "
+                "reloading NetworkManager DNS state"
+            )
+            self._reload_networkmanager_dns()
+            self._network_recovery_reload_attempted = True
+        self._reapply_connected_uplinks(reactivate=reactivate)
+        return self._base_network_ready()
+
+    def _post_disconnect_recovery_worker(self, token: int) -> None:
+        """Run bounded recovery without blocking the GLib/D-Bus main thread."""
+        try:
+            while True:
+                if token != self._network_recovery_token:
+                    return
+                if self.state in (
+                    NM_VPN_SERVICE_STATE_STARTING,
+                    NM_VPN_SERVICE_STATE_STARTED,
+                ):
+                    log.info(
+                        "Skipping stale post-disconnect recovery during a new activation"
+                    )
+                    return
+
+                if not self._cleanup_dns(recovery_token=token):
+                    return
+                if token != self._network_recovery_token:
+                    return
+                remaining = self._network_recovery_deadline - time.monotonic()
+                if self._recover_base_network_once(reactivate=remaining <= 7.0):
+                    log.info(
+                        "Base network route and DNS are operational after VPN teardown"
+                    )
+                    self._uplinks_needing_reapply.clear()
+                    return
+                if remaining <= 0:
+                    log.error(
+                        "Base network did not recover within the bounded post-VPN window"
+                    )
+                    return
+                time.sleep(min(1.0, remaining))
+        finally:
+            if token == self._network_recovery_token:
+                self._network_recovery_thread = None
+
+    def _post_disconnect_recovery_tick(self, token: int) -> bool:
+        """Launch one guarded recovery worker from the GLib main loop."""
+        if token != self._network_recovery_token:
+            return False
+        if self.state in (NM_VPN_SERVICE_STATE_STARTING, NM_VPN_SERVICE_STATE_STARTED):
+            log.info("Skipping stale post-disconnect recovery during a new activation")
+            return False
+        recovery_thread = getattr(self, "_network_recovery_thread", None)
+        if recovery_thread and recovery_thread.is_alive():
+            return False
+        recovery_thread = threading.Thread(
+            target=self._post_disconnect_recovery_worker,
+            args=(token,),
+            name="nm-ms-sso-network-recovery",
+            daemon=True,
+        )
+        self._network_recovery_thread = recovery_thread
+        recovery_thread.start()
+        return False
+
+    def _schedule_post_disconnect_recovery(self) -> None:
+        """Run cleanup after NetworkManager has withdrawn the VPN activation."""
+        self._network_recovery_token += 1
+        token = self._network_recovery_token
+        self._network_recovery_deadline = (
+            time.monotonic() + NETWORK_RECOVERY_TIMEOUT_SECONDS
+        )
+        self._network_recovery_reload_attempted = False
+        GLib.timeout_add(
+            NETWORK_RECOVERY_INITIAL_DELAY_MS,
+            self._post_disconnect_recovery_tick,
+            token,
+        )
+
+    def _wait_for_base_network_before_connect(
+            self,
+            connect_generation: Optional[int],
+            timeout_seconds: int = 12,
+    ) -> bool:
+        """Repair a prior teardown before starting a new browser/auth flow."""
+        if self._base_network_ready():
+            return True
+        log.warning("Waiting for base network recovery before VPN authentication")
+        deadline = time.monotonic() + max(1, timeout_seconds)
+        self._network_recovery_reload_attempted = False
+        while time.monotonic() < deadline:
+            if self._is_connect_cancelled(connect_generation):
+                return False
+            remaining = deadline - time.monotonic()
+            if self._recover_base_network_once(reactivate=remaining <= 5.0):
+                return True
+            time.sleep(min(1.0, max(0.0, remaining)))
+        return self._base_network_ready()
+
+    def _connect_after_recovery(
+            self,
+            recovery_thread,
+            settings,
+            connect_generation: int,
+    ) -> None:
+        """Serialize a fresh connect behind an already-running recovery pass."""
+        recovery_thread.join(timeout=NETWORK_RECOVERY_TIMEOUT_SECONDS + 10)
+        if recovery_thread.is_alive():
+            GLib.idle_add(
+                self._emit_failure,
+                "Prior VPN network recovery did not finish",
+                connect_generation,
+            )
+            return
+        if self._is_connect_cancelled(connect_generation):
+            return
+        self._connect_thread(settings, connect_generation)
 
     def _tun_char_device_ready(self) -> bool:
         """Return True when /dev/net/tun can be opened."""
@@ -776,16 +1261,6 @@ class VPNPluginService(dbus.service.Object):
             raise ValueError(f"invalid IPv4 address: {ip_addr}")
         return parts[0] | (parts[1] << 8) | (parts[2] << 16) | (parts[3] << 24)
 
-    def _reverse_ipv4_octets(self, ip_addr: str) -> Optional[str]:
-        """Return an IPv4 address with reversed octets, or None if invalid."""
-        try:
-            parts = [int(x) for x in ip_addr.split('.')]
-            if len(parts) != 4 or any(part < 0 or part > 255 for part in parts):
-                return None
-            return '.'.join(str(part) for part in reversed(parts))
-        except Exception:
-            return None
-
     def _get_tun_ipv4_config(self, tun_dev: str):
         """Return (ip, prefix) for a tunnel device, or (None, 32)."""
         try:
@@ -918,6 +1393,152 @@ class VPNPluginService(dbus.service.Object):
 
         return False, f"Tunnel {tun_dev} did not become usable with IPv4 config", None, 32
 
+    @staticmethod
+    def _process_start_ticks(pid: int) -> Optional[str]:
+        """Return Linux /proc start ticks so a persisted PID cannot be reused."""
+        try:
+            stat_text = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8")
+            _prefix, separator, suffix = stat_text.rpartition(") ")
+            if not separator:
+                return None
+            fields = suffix.split()
+            # suffix starts at field 3 (state); starttime is field 22.
+            return fields[19] if len(fields) > 19 else None
+        except Exception:
+            return None
+
+    def _write_openconnect_state(
+            self,
+            process,
+            tun_device: str = "",
+            tun_ifindex: Optional[int] = None,
+    ) -> None:
+        """Persist only non-secret child ownership for crash recovery."""
+        if not process or not getattr(process, "pid", None):
+            return
+        start_ticks = self._process_start_ticks(process.pid)
+        if not start_ticks:
+            return
+        try:
+            OPENCONNECT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            temporary = OPENCONNECT_STATE_FILE.with_name(
+                f".{OPENCONNECT_STATE_FILE.name}.{process.pid}.tmp"
+            )
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as state_file:
+                state_file.write(f"pid={int(process.pid)}\n")
+                state_file.write(f"start_ticks={start_ticks}\n")
+                if self.current_connection_uuid:
+                    state_file.write(
+                        f"connection_uuid={self.current_connection_uuid}\n"
+                    )
+                if tun_device:
+                    state_file.write(f"tun={tun_device}\n")
+                if tun_ifindex is not None:
+                    state_file.write(f"tun_ifindex={int(tun_ifindex)}\n")
+            os.replace(temporary, OPENCONNECT_STATE_FILE)
+        except Exception as e:
+            log.info(f"Could not persist OpenConnect recovery state: {e}")
+
+    def _clear_openconnect_state(self, process=None) -> None:
+        """Remove persisted ownership only when it still names this child."""
+        if not OPENCONNECT_STATE_FILE.exists():
+            return
+        if process is not None and getattr(process, "pid", None):
+            try:
+                state = dict(
+                    line.split("=", 1)
+                    for line in OPENCONNECT_STATE_FILE.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    if "=" in line
+                )
+                if state.get("pid") != str(int(process.pid)):
+                    return
+            except Exception:
+                return
+        try:
+            OPENCONNECT_STATE_FILE.unlink(missing_ok=True)
+        except Exception as e:
+            log.info(f"Could not clear OpenConnect recovery state: {e}")
+
+    def _recover_orphaned_openconnect(self) -> None:
+        """Stop an exact persisted orphan and clean its exact tunnel ifindex."""
+        if not OPENCONNECT_STATE_FILE.exists():
+            return
+        try:
+            state = dict(
+                line.split("=", 1)
+                for line in OPENCONNECT_STATE_FILE.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if "=" in line
+            )
+            pid = int(state.get("pid", "0"))
+            expected_start = state.get("start_ticks")
+        except Exception as e:
+            log.info(f"Ignoring invalid OpenConnect recovery state: {e}")
+            self._clear_openconnect_state()
+            return
+
+        def owned_process_alive() -> bool:
+            if pid <= 0 or self._process_start_ticks(pid) != expected_start:
+                return False
+            try:
+                comm = Path(f"/proc/{pid}/comm").read_text(
+                    encoding="utf-8"
+                ).strip().lower()
+            except Exception:
+                return False
+            return "openconnect" in comm
+
+        if owned_process_alive():
+            log.warning(f"Recovering orphaned OpenConnect process {pid}")
+            try:
+                os.kill(pid, signal.SIGHUP)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                log.info(f"Could not signal orphaned OpenConnect process: {e}")
+            deadline = time.monotonic() + 10.0
+            while owned_process_alive() and time.monotonic() < deadline:
+                time.sleep(0.25)
+            if owned_process_alive():
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+            if owned_process_alive():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+
+        tun_device = state.get("tun", "")
+        try:
+            expected_ifindex = int(state.get("tun_ifindex", "0"))
+        except ValueError:
+            expected_ifindex = 0
+        live_ifindex = self._link_ifindex(tun_device) if tun_device else None
+        if (
+            tun_device.startswith("tun")
+            and expected_ifindex > 0
+            and live_ifindex in (None, expected_ifindex)
+        ):
+            self.current_tun_device = tun_device
+            self.owned_tun_devices.add(tun_device)
+            self.owned_tun_ifindices[tun_device] = expected_ifindex
+
+        if self.owned_tun_devices:
+            self._cleanup_dns()
+        else:
+            self._clear_openconnect_state()
+
     def _stop_vpn_process(
             self,
             preserve_session: bool = True,
@@ -927,7 +1548,9 @@ class VPNPluginService(dbus.service.Object):
     ) -> None:
         """Stop OpenConnect while letting vpnc-script clean up when possible."""
         process = process or self.vpn_process
-        if not process or process.poll() is not None:
+        if not process:
+            return
+        if process.poll() is not None:
             return
         if (
             process is self.vpn_process
@@ -943,7 +1566,9 @@ class VPNPluginService(dbus.service.Object):
         sig = signal.SIGHUP if preserve_session else signal.SIGTERM
         try:
             process.send_signal(sig)
-            process.wait(timeout=5)
+            # Give OpenConnect/vpnc-script enough time to restore the saved
+            # default route and resolver state before considering SIGKILL.
+            process.wait(timeout=10)
             return
         except ProcessLookupError:
             return
@@ -1060,81 +1685,6 @@ class VPNPluginService(dbus.service.Object):
         # Full-tunnel DNS normally implies the server expects full-tunnel routing.
         return bool(self.vpn_tunnel_all_dns)
 
-    def _anyconnect_route_spec_to_cidr(self, route_spec: str) -> Optional[str]:
-        """Convert Cisco split route notation to a CIDR route string."""
-        try:
-            if not route_spec:
-                return None
-            text = str(route_spec).strip()
-            if "/" not in text:
-                return str(ipaddress.ip_network(text, strict=False))
-            addr, mask = text.split("/", 1)
-            if "." in mask:
-                return str(ipaddress.ip_network(f"{addr}/{mask}", strict=False))
-            return str(ipaddress.ip_network(text, strict=False))
-        except Exception as e:
-            log.info(f"Could not parse AnyConnect route spec {route_spec!r}: {e}")
-            return None
-
-    def _cleanup_anyconnect_physical_routes(self) -> None:
-        """Remove routes that vpnc-script may leave on the physical uplink."""
-        if self.current_protocol != 'anyconnect':
-            return
-
-        route_cidrs = []
-        for route_spec in getattr(self, "vpn_split_excludes", []):
-            cidr = self._anyconnect_route_spec_to_cidr(route_spec)
-            if cidr and cidr not in route_cidrs:
-                route_cidrs.append(cidr)
-        if getattr(self, "current_gateway_ip", None):
-            route_cidrs.append(f"{self.current_gateway_ip}/32")
-            reversed_gateway_ip = self._reverse_ipv4_octets(self.current_gateway_ip)
-            if reversed_gateway_ip and reversed_gateway_ip != self.current_gateway_ip:
-                route_cidrs.append(f"{reversed_gateway_ip}/32")
-        if not route_cidrs:
-            return
-
-        tun_names = set(self.owned_tun_devices)
-        if self.current_tun_device:
-            tun_names.add(self.current_tun_device)
-        tun_names.update(self._list_tun_devices())
-
-        for cidr in route_cidrs:
-            try:
-                result = subprocess.run(
-                    ["ip", "-4", "route", "show", cidr],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=5,
-                )
-            except Exception as e:
-                log.info(f"Route inspection failed for {cidr}: {e}")
-                continue
-
-            for line in [line.strip() for line in result.stdout.splitlines() if line.strip()]:
-                if not line.startswith(cidr.split("/", 1)[0]) and not line.startswith(cidr):
-                    continue
-                if any(f" dev {tun_dev}" in line for tun_dev in tun_names):
-                    continue
-                try:
-                    delete = subprocess.run(
-                        ["ip", "-4", "route", "del", cidr],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=5,
-                    )
-                    if delete.returncode == 0:
-                        log.info(f"Removed leaked AnyConnect physical route: {line}")
-                    elif delete.stderr.strip():
-                        log.info(
-                            f"Could not remove leaked route {cidr}: "
-                            f"{delete.stderr.strip()}"
-                        )
-                except Exception as e:
-                    log.info(f"Leaked route cleanup failed for {cidr}: {e}")
-
     def _remove_tun_default_routes(self, tun_dev: str):
         """Best-effort cleanup for accidental full-tunnel defaults."""
         if not tun_dev:
@@ -1171,8 +1721,26 @@ class VPNPluginService(dbus.service.Object):
                 log.info(f"Default route cleanup failed for {tun_dev}: {e}")
         return removed
 
-    def _apply_split_dns_resolved(self, tun_dev: str, domains):
+    def _apply_split_dns_resolved(
+            self,
+            tun_dev: str,
+            domains,
+            connect_generation: Optional[int] = None,
+    ):
         """Force route-only DNS after NetworkManager has processed Ip4Config."""
+        expected_ifindex = getattr(self, "owned_tun_ifindices", {}).get(tun_dev)
+        if (
+            (connect_generation is not None and self._is_connect_cancelled(connect_generation))
+            or tun_dev != self.current_tun_device
+            or tun_dev not in self.owned_tun_devices
+            or expected_ifindex is None
+            or self._link_ifindex(tun_dev) != expected_ifindex
+        ):
+            log.info(
+                f"Skipping stale split-DNS callback for {tun_dev} "
+                f"(generation {connect_generation})"
+            )
+            return False
         if not tun_dev or self.current_protocol != 'anyconnect' or self.vpn_tunnel_all_dns:
             return False
         if self._anyconnect_preserve_default_route():
@@ -1242,6 +1810,10 @@ class VPNPluginService(dbus.service.Object):
 
             # Extract connection parameters
             secrets = self._get_connection_secrets(settings)
+            connection_settings = settings.get('connection', {})
+            self.current_connection_uuid = str(
+                connection_settings.get('uuid') or ''
+            ).strip() or None
             gateway = secrets['gateway']
             protocol = secrets['protocol']
             username = secrets['username']
@@ -1341,6 +1913,11 @@ class VPNPluginService(dbus.service.Object):
             # IMPORTANT: Resolve gateway IP NOW, before VPN connects
             # After VPN connects, DNS switches to VPN DNS servers which can't resolve external hostnames
             self.current_gateway_ip = None
+            self._capture_base_network_state()
+            if not self._wait_for_base_network_before_connect(connect_generation):
+                raise Exception(
+                    "Base network route or DNS is not operational after the previous VPN teardown"
+                )
             gateway_lookup = gateway
             try:
                 from urllib.parse import urlparse
@@ -1363,7 +1940,6 @@ class VPNPluginService(dbus.service.Object):
             # Some networks inject a host route that forces ARP on LAN and breaks reachability.
             if self.current_gateway_ip:
                 self._clear_onlink_host_route(self.current_gateway_ip)
-                self._cleanup_anyconnect_physical_routes()
 
             if protocol in {'anyconnect', 'gp'} and not self._ensure_tun_available():
                 raise Exception(self._tun_unavailable_message())
@@ -1386,7 +1962,8 @@ class VPNPluginService(dbus.service.Object):
             # Connection name for cookie cache
             connection_name = f"nm-{gateway}"
             log.debug(f"Cookie cache connection name: {connection_name}")
-            # Auto-reconnect watchdog configuration
+            # Pre-tunnel transport retry configuration.  A tunnel that was
+            # already STARTED always ends this NM activation instead.
             conn_auto_reconnect = self._parse_bool(secrets.get('auto_reconnect'))
             env_auto_reconnect = self._parse_bool(os.environ.get("MS_SSO_NM_AUTO_RECONNECT"))
             gp_env_auto_reconnect = self._parse_bool(os.environ.get("MS_SSO_NM_GP_AUTO_RECONNECT")) if protocol == 'gp' else None
@@ -1413,7 +1990,7 @@ class VPNPluginService(dbus.service.Object):
                     self._parse_positive_int(os.environ.get("MS_SSO_NM_RECONNECT_MAX_DELAY_SECONDS"), 60),
                 ),
             )
-            reconnect_default_max_attempts = 0 if protocol == 'anyconnect' else 5
+            reconnect_default_max_attempts = 5
             reconnect_max_attempts = self._parse_positive_int(
                 secrets.get('reconnect_max_attempts'),
                 self._parse_positive_int(
@@ -1425,14 +2002,12 @@ class VPNPluginService(dbus.service.Object):
                 ),
             )
             reconnect_limit_label = "inf" if reconnect_max_attempts == 0 else str(reconnect_max_attempts)
-            reconnect_reset_seconds = self._parse_positive_int(os.environ.get("MS_SSO_NM_RECONNECT_RESET_SECONDS"), 120)
             watchdog_interval_seconds = self._parse_positive_int(os.environ.get("MS_SSO_NM_WATCHDOG_INTERVAL_SECONDS"), 5)
             watchdog_missing_tun_limit = self._parse_positive_int(os.environ.get("MS_SSO_NM_WATCHDOG_TUN_MISS_LIMIT"), 3)
             anyconnect_wait_existing_auth_seconds = 0
             anyconnect_fresh_retries = 0
             anyconnect_retry_delay_seconds = 0
             anyconnect_unstable_session_seconds = 0
-            anyconnect_fast_reconnect_retries = 0
             if protocol == 'anyconnect':
                 anyconnect_wait_existing_auth_seconds = self._parse_positive_int(
                     os.environ.get("MS_SSO_NM_ANYCONNECT_WAIT_AUTH_SECONDS"),
@@ -1450,12 +2025,8 @@ class VPNPluginService(dbus.service.Object):
                     os.environ.get("MS_SSO_NM_ANYCONNECT_UNSTABLE_SESSION_SECONDS"),
                     20,
                 )
-                anyconnect_fast_reconnect_retries = self._parse_positive_int(
-                    os.environ.get("MS_SSO_NM_ANYCONNECT_FAST_RECONNECT_RETRIES"),
-                    2,
-                )
             log.info(
-                "Auto-reconnect: "
+                "Pre-tunnel transport retry: "
                 f"{'enabled' if auto_reconnect else 'disabled'}, "
                 f"delay={reconnect_delay_seconds}s, max-delay={reconnect_max_delay_seconds}s, "
                 f"max-attempts={reconnect_limit_label}"
@@ -1471,13 +2042,11 @@ class VPNPluginService(dbus.service.Object):
                 )
                 log.info(
                     "AnyConnect unstable-session handling: "
-                    f"threshold={anyconnect_unstable_session_seconds}s, "
-                    f"fast-retries={anyconnect_fast_reconnect_retries}"
+                    f"threshold={anyconnect_unstable_session_seconds}s; "
+                    "post-tunnel retries use a fresh NetworkManager activation"
                 )
 
             reconnect_attempt = 0
-            anyconnect_fast_reconnect_attempt = 0
-            force_fresh_auth = False
             saml_keepalive_seconds = self._parse_positive_int(
                 os.environ.get("MS_SSO_NM_AUTH_KEEPALIVE_SECONDS"),
                 self._parse_positive_int(
@@ -1487,6 +2056,12 @@ class VPNPluginService(dbus.service.Object):
             )
 
             while not _connect_cancelled():
+                if not self._wait_for_base_network_before_connect(
+                    connect_generation
+                ):
+                    raise Exception(
+                        "Base network route or DNS did not recover before VPN retry"
+                    )
                 # Try connection with retry on cookie rejection.
                 max_attempts = 2 + anyconnect_fresh_retries
                 connection_ended = False
@@ -1506,9 +2081,7 @@ class VPNPluginService(dbus.service.Object):
                     cookies = None
                     used_cache = False
 
-                    if attempt == 0 and force_fresh_auth:
-                        log.info("Skipping cached cookies for this cycle; forcing fresh authentication")
-                    elif attempt == 0 and skip_gp_cookie_cache:
+                    if attempt == 0 and skip_gp_cookie_cache:
                         log.info("GlobalProtect cookie cache disabled by configuration; forcing fresh authentication")
                     elif attempt == 0 and disable_cookie_cache:
                         log.info("Cookie cache disabled; forcing fresh authentication")
@@ -1870,71 +2443,25 @@ class VPNPluginService(dbus.service.Object):
                         return
                     continue
 
-                # Connection was up and then ended (e.g., network loss/session timeout).
+                # Once Config/Ip4Config has been emitted, NetworkManager owns an
+                # activation that references this exact tunnel ifindex.  Reusing
+                # that activation after OpenConnect removed the device leaves NM
+                # and systemd-resolved pointing at a dead link.  OpenConnect has
+                # already exhausted its own bounded reconnect window, so finish
+                # this activation and let a later NM request start from a healthy
+                # physical network.
                 if (
                     protocol == 'anyconnect'
+                    and session_used_cache
                     and anyconnect_unstable_session_seconds > 0
                     and 0 < connection_uptime_seconds < anyconnect_unstable_session_seconds
                 ):
-                    if session_used_cache:
-                        clear_nm_cookies(connection_name)
-                        force_fresh_auth = True
-                    else:
-                        force_fresh_auth = False
-
-                    if anyconnect_fast_reconnect_attempt < anyconnect_fast_reconnect_retries:
-                        anyconnect_fast_reconnect_attempt += 1
-                        delay_seconds = max(1, anyconnect_retry_delay_seconds)
-                        log.warning(
-                            "AnyConnect tunnel ended shortly after connect "
-                            f"(uptime={connection_uptime_seconds}s < {anyconnect_unstable_session_seconds}s); "
-                            f"retrying quickly in {delay_seconds}s "
-                            f"(fast attempt {anyconnect_fast_reconnect_attempt}/{anyconnect_fast_reconnect_retries})"
-                        )
-                        self._cleanup_dns()
-                        # Keep NetworkManager in a reconnecting state until a new
-                        # tunnel is actually established. Advertising STARTED
-                        # here leaves stale VPN routing/DNS active.
-                        GLib.idle_add(self._emit_starting_keepalive, connect_generation)
-                        if not self._interruptible_sleep(delay_seconds, connect_generation):
-                            return
-                        continue
-
-                anyconnect_fast_reconnect_attempt = 0
-                force_fresh_auth = False
-                if connection_uptime_seconds >= reconnect_reset_seconds:
-                    reconnect_attempt = 0
-                else:
-                    reconnect_attempt += 1
-
-                if not auto_reconnect:
-                    GLib.idle_add(self._emit_disconnected, connect_generation)
-                    return
-                if reconnect_max_attempts > 0 and reconnect_attempt > reconnect_max_attempts:
-                    raise Exception(
-                        "VPN tunnel ended unexpectedly and watchdog retry limit was reached "
-                        f"({reconnect_max_attempts})"
-                    )
-
-                self._cleanup_dns()
-                backoff_step = min(max(reconnect_attempt - 1, 0), 6)
-                delay_seconds = min(
-                    reconnect_delay_seconds * (2 ** backoff_step),
-                    reconnect_max_delay_seconds,
-                ) if reconnect_max_delay_seconds > 0 else reconnect_delay_seconds
-                log.warning(
-                    "Watchdog: VPN tunnel ended unexpectedly "
-                    f"(uptime={connection_uptime_seconds}s); reconnecting in {delay_seconds}s "
-                    f"(attempt {reconnect_attempt}/{reconnect_limit_label})"
+                    clear_nm_cookies(connection_name)
+                raise Exception(
+                    "VPN tunnel ended unexpectedly after "
+                    f"{connection_uptime_seconds}s; ending this activation to restore "
+                    "the base network"
                 )
-                if protocol == 'gp' and self._gp_early_started_enabled():
-                    GLib.idle_add(self._emit_started_keepalive, connect_generation)
-                else:
-                    GLib.idle_add(self._emit_starting_keepalive, connect_generation)
-                if protocol == 'gp' and self._gp_initial_config_allowed():
-                    GLib.idle_add(self._emit_initial_config, connect_generation)
-                if not self._interruptible_sleep(delay_seconds, connect_generation):
-                    return
 
         except Exception as e:
             error_msg = str(e)
@@ -1965,6 +2492,7 @@ class VPNPluginService(dbus.service.Object):
                 uptime_seconds: connected runtime before exit (0 on failure)
         """
         try:
+            tunnel_was_established = False
             # Log cookie info for debugging
             log.debug(f"Cookie keys: {list(cookies.keys())}")
 
@@ -1978,6 +2506,15 @@ class VPNPluginService(dbus.service.Object):
             # Capture existing tunnel devices before OpenConnect can create its
             # interface; a fast process must not make the new tun look stale.
             baseline_tun_devs = self._list_tun_devices()
+            requested_tun_device = self._tunnel_name_for_generation(
+                connect_generation
+            )
+            if requested_tun_device in baseline_tun_devs:
+                return (
+                    False,
+                    f"Reserved VPN interface {requested_tun_device} already exists",
+                    0,
+                )
 
             if not self._ensure_tun_available():
                 return (
@@ -2012,6 +2549,7 @@ class VPNPluginService(dbus.service.Object):
                     username=gp_username,
                     resolve_arg=resolve_arg,
                     hip_wrapper=gp_hip_wrapper,
+                    interface_name=requested_tun_device,
                 )
                 if gp_hip_wrapper:
                     log.info(
@@ -2028,6 +2566,10 @@ class VPNPluginService(dbus.service.Object):
                 self.vpn_process = subprocess.Popen(cmd, **popen_kwargs)
                 vpn_process = self.vpn_process
                 self.vpn_process_generation = connect_generation
+                self._write_openconnect_state(
+                    vpn_process,
+                    requested_tun_device,
+                )
                 if gp_cookie_uses_stdin:
                     self._write_gp_cookie_and_close(vpn_process, cookie_str)
             else:
@@ -2037,6 +2579,7 @@ class VPNPluginService(dbus.service.Object):
                     openconnect_bin,
                     "--verbose",
                     f"--protocol={proto_flag}",
+                    f"--interface={requested_tun_device}",
                     reconnect_arg,
                     dpd_arg,
                     f"--cookie={cookie_str}",
@@ -2065,6 +2608,10 @@ class VPNPluginService(dbus.service.Object):
                 )
                 vpn_process = self.vpn_process
                 self.vpn_process_generation = connect_generation
+                self._write_openconnect_state(
+                    vpn_process,
+                    requested_tun_device,
+                )
 
             log.info(f"OpenConnect started (PID {vpn_process.pid})")
             if openconnect_bin != "openconnect":
@@ -2129,17 +2676,23 @@ class VPNPluginService(dbus.service.Object):
                 # "session up" marker so we don't falsely bind to stale tun devices.
                 tun_devs_now = self._list_tun_devices()
                 candidate_tun = None
-                new_tun_devs = sorted(tun_devs_now - baseline_tun_devs)
-                if new_tun_devs:
-                    candidate_tun = new_tun_devs[0]
-                elif self.current_tun_device and self.current_tun_device in tun_devs_now:
-                    candidate_tun = self.current_tun_device
-                elif openconnect_reported_up and tun_devs_now:
-                    candidate_tun = sorted(tun_devs_now)[0]
+                if (
+                    requested_tun_device in tun_devs_now
+                    and requested_tun_device not in baseline_tun_devs
+                ):
+                    candidate_tun = requested_tun_device
 
                 if candidate_tun:
                     self.current_tun_device = candidate_tun
                     self.owned_tun_devices.add(candidate_tun)
+                    candidate_ifindex = self._link_ifindex(candidate_tun)
+                    if candidate_ifindex is not None:
+                        self.owned_tun_ifindices[candidate_tun] = candidate_ifindex
+                    self._write_openconnect_state(
+                        vpn_process,
+                        candidate_tun,
+                        candidate_ifindex,
+                    )
                     if protocol != 'anyconnect' or openconnect_reported_up:
                         log.info(f"Found tun device: {self.current_tun_device}")
                         connected = True
@@ -2205,6 +2758,7 @@ class VPNPluginService(dbus.service.Object):
                 return (False, unusable_reason or "VPN tunnel is not usable", 0)
 
             log.info(f"Validated tunnel {self.current_tun_device}: {ip_addr}/{prefix}")
+            tunnel_was_established = True
 
             log.info(f"VPN DNS servers captured: {self.vpn_dns_servers}")
 
@@ -2320,7 +2874,11 @@ class VPNPluginService(dbus.service.Object):
                             except Exception:
                                 pass
                             break
-                time.sleep(watch_interval)
+                if not self._interruptible_sleep(
+                    watch_interval,
+                    connect_generation,
+                ):
+                    break
 
             # Wait for process to fully exit and report uptime
             try:
@@ -2366,7 +2924,17 @@ class VPNPluginService(dbus.service.Object):
                     )
             except Exception:
                 pass
-            self._cleanup_dns()
+            if locals().get("tunnel_was_established", False):
+                connected_at_value = locals().get("connected_at")
+                uptime_seconds = 0
+                if connected_at_value is not None:
+                    uptime_seconds = int(
+                        max(0, time.monotonic() - connected_at_value)
+                    )
+                # Config may already be queued/emitted.  Route this through the
+                # post-STARTED terminal path so NM withdraws the activation
+                # before any cleanup or retry.
+                return (True, error_msg, uptime_seconds)
             # Check if it's a cookie rejection error
             if 'cookie' in error_msg.lower() and ('reject' in error_msg.lower() or 'invalid' in error_msg.lower()):
                 return (False, "Cookie rejected by server", 0)
@@ -2628,50 +3196,199 @@ class VPNPluginService(dbus.service.Object):
         """Block local IPv6 egress while this IPv4-only VPN is active."""
         if self.ipv6_leak_protection_enabled:
             return
-        if not self._is_truthy(os.environ.get("MS_SSO_NM_BLOCK_IPV6", "1")):
+        # Host-wide unmanaged routes are not crash-safe, so this is now opt-in.
+        if not self._is_truthy(os.environ.get("MS_SSO_NM_BLOCK_IPV6", "0")):
             return
 
         try:
+            # Persist ownership before creating the host-wide route.  If the
+            # service is killed at any later instruction, either the service
+            # startup recovery or the NM dispatcher can safely remove it.
+            IPV6_LEAK_ROUTE_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            temporary = IPV6_LEAK_ROUTE_MARKER.with_name(
+                f".{IPV6_LEAK_ROUTE_MARKER.name}.{os.getpid()}.tmp"
+            )
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as marker_file:
+                marker_file.write(
+                    "connection_uuid="
+                    f"{self.current_connection_uuid or ''}\n"
+                )
+            os.replace(temporary, IPV6_LEAK_ROUTE_MARKER)
+
             result = subprocess.run(
-                ["ip", "-6", "route", "replace", "unreachable", "::/0", "metric", "50"],
+                [
+                    "ip",
+                    "-6",
+                    "route",
+                    "add",
+                    "unreachable",
+                    "::/0",
+                    "metric",
+                    IPV6_LEAK_ROUTE_METRIC,
+                    "proto",
+                    IPV6_LEAK_ROUTE_PROTOCOL,
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=5,
             )
             if result.returncode == 0:
                 self.ipv6_leak_protection_enabled = True
-                log.info("Enabled IPv6 leak protection with unreachable default route")
+                log.info(
+                    "Enabled opt-in IPv6 leak protection with an owned route"
+                )
             else:
                 log.warning(
                     "Failed to enable IPv6 leak protection: "
                     f"{(result.stderr or result.stdout).strip()}"
                 )
+                # A failed add normally means no route was created.  Keep the
+                # marker if the exact route exists or its absence cannot be
+                # verified; recovery can then retry without losing ownership.
+                if self._ipv6_leak_route_present() is False:
+                    IPV6_LEAK_ROUTE_MARKER.unlink(missing_ok=True)
         except Exception as e:
             log.warning(f"Failed to enable IPv6 leak protection: {e}")
 
-    def _remove_ipv6_leak_protection(self) -> None:
-        """Remove the temporary IPv6 block route added for VPN leak protection."""
-        if not self.ipv6_leak_protection_enabled:
-            return
+    @staticmethod
+    def _ipv6_leak_route_present() -> Optional[bool]:
+        """Return exact owned-route presence, or None when it cannot be read."""
         try:
-            subprocess.run(
-                ["ip", "-6", "route", "del", "unreachable", "::/0", "metric", "50"],
+            result = subprocess.run(
+                [
+                    "ip",
+                    "-6",
+                    "route",
+                    "show",
+                    "table",
+                    "all",
+                    "type",
+                    "unreachable",
+                    "::/0",
+                    "metric",
+                    IPV6_LEAK_ROUTE_METRIC,
+                    "proto",
+                    IPV6_LEAK_ROUTE_PROTOCOL,
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=5,
             )
         except Exception as e:
-            log.warning(f"Failed to remove IPv6 leak protection: {e}")
-        finally:
-            self.ipv6_leak_protection_enabled = False
+            log.info(f"Could not inspect owned IPv6 leak route: {e}")
+            return None
+        if result.returncode != 0:
+            log.info(
+                "Could not inspect owned IPv6 leak route: "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+            return None
+        return bool(result.stdout.strip())
+
+    def _clear_ipv6_leak_marker_if_route_absent(self) -> bool:
+        """Clear ownership only after confirming the owned route is absent."""
+        route_present = self._ipv6_leak_route_present()
+        if route_present is not False:
+            if route_present:
+                log.warning("Owned IPv6 leak route still exists; preserving marker")
+            else:
+                log.warning(
+                    "Could not verify IPv6 leak route removal; preserving marker"
+                )
+            return False
+        self.ipv6_leak_protection_enabled = False
+        try:
+            IPV6_LEAK_ROUTE_MARKER.unlink(missing_ok=True)
+        except Exception as e:
+            log.info(f"Could not remove IPv6 leak-route marker: {e}")
+            return False
+        return True
+
+    def _remove_stale_ipv6_leak_protection(self) -> None:
+        """Remove only routes attributable to this plugin, including v2.0.3."""
+        marker_exists = IPV6_LEAK_ROUTE_MARKER.exists()
+        if marker_exists:
+            self._run_recovery_command([
+                "ip",
+                "-6",
+                "route",
+                "del",
+                "unreachable",
+                "::/0",
+                "metric",
+                IPV6_LEAK_ROUTE_METRIC,
+                "proto",
+                IPV6_LEAK_ROUTE_PROTOCOL,
+            ])
+            self._clear_ipv6_leak_marker_if_route_absent()
+
+        # Versions through 2.0.3 created this exact global route by default but
+        # had no ownership marker.  Removing the exact signature once prevents
+        # an earlier SIGKILL from requiring a reboot.
+        try:
+            result = subprocess.run(
+                [
+                    "ip",
+                    "-6",
+                    "route",
+                    "del",
+                    "unreachable",
+                    "::/0",
+                    "metric",
+                    "50",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                log.info("Removed legacy v2.0.3 IPv6 leak-protection route")
+        except Exception as e:
+            log.info(f"Could not remove legacy IPv6 leak route: {e}")
+
+    def _remove_ipv6_leak_protection(self) -> None:
+        """Remove the temporary IPv6 block route added for VPN leak protection."""
+        if (
+            not self.ipv6_leak_protection_enabled
+            and not IPV6_LEAK_ROUTE_MARKER.exists()
+        ):
+            return
+        self._run_recovery_command([
+            "ip",
+            "-6",
+            "route",
+            "del",
+            "unreachable",
+            "::/0",
+            "metric",
+            IPV6_LEAK_ROUTE_METRIC,
+            "proto",
+            IPV6_LEAK_ROUTE_PROTOCOL,
+        ])
+        self._clear_ipv6_leak_marker_if_route_absent()
 
     def _emit_starting_keepalive(self, connect_generation: Optional[int] = None):
         """Emit a keepalive STARTING state to reduce NM connect timeouts."""
         if connect_generation is not None and self._is_connect_cancelled(connect_generation):
             return False
         try:
-            # Intentionally emit even if our internal state didn't change.
-            self.StateChanged(NM_VPN_SERVICE_STATE_STARTING)
+            if self.state == NM_VPN_SERVICE_STATE_STARTED:
+                log.warning(
+                    "Refusing unsafe STARTED-to-STARTING transition in one activation"
+                )
+                return False
+            if self.state != NM_VPN_SERVICE_STATE_STARTING:
+                self._set_state(NM_VPN_SERVICE_STATE_STARTING)
+            else:
+                self.StateChanged(NM_VPN_SERVICE_STATE_STARTING)
         except Exception:
             pass
         return False
@@ -2744,8 +3461,11 @@ class VPNPluginService(dbus.service.Object):
                         )
                 except Exception:
                     pass
-                self._cleanup_dns()
-                self._set_state(NM_VPN_SERVICE_STATE_STARTING)
+                self._emit_failure(
+                    f"Tunnel {tun_dev} lost IPv4 before NetworkManager config",
+                    connect_generation,
+                )
+                self.cancel_requested = True
                 return False
 
             # Use pre-resolved gateway IP (resolved before VPN connected, when external DNS was available)
@@ -2828,24 +3548,11 @@ class VPNPluginService(dbus.service.Object):
                         except:
                             pass
 
-                # Method 3: Fall back to resolv.conf
-                if not dns_server_ips:
-                    try:
-                        result = subprocess.run(['cat', '/etc/resolv.conf'], capture_output=True, text=True)
-                        for line in result.stdout.split('\n'):
-                            if line.startswith('nameserver '):
-                                ns = line.split()[1]
-                                try:
-                                    ns_parts = [int(x) for x in ns.split('.')]
-                                    if len(ns_parts) == 4:
-                                        # Convert IP to uint32 in host byte order (little-endian on x86)
-                                        ns_uint = ns_parts[0] | (ns_parts[1] << 8) | (ns_parts[2] << 16) | (ns_parts[3] << 24)
-                                        dns_server_ips.append(ns)
-                                        log.info(f"Found DNS from resolv.conf: {ns} -> {ns_uint}")
-                                except:
-                                    pass  # Skip non-IPv4 nameservers
-                    except:
-                        pass
+                # Do not copy the host's /etc/resolv.conf into VPN Ip4Config.
+                # On systemd-resolved systems that is usually 127.0.0.53 and
+                # feeding the local stub back as link DNS creates a resolver
+                # loop.  If the VPN pushed no DNS, emit no VPN DNS and retain
+                # NetworkManager's physical-link resolvers.
 
                 dns_server_ips = self._normalize_dns_servers(dns_server_ips)
                 dns_domains = self._normalize_vpn_domains()
@@ -2889,8 +3596,20 @@ class VPNPluginService(dbus.service.Object):
                     f"dns={len(dns_servers)} servers, domains={dns_domains}"
                 )
                 if self.current_protocol == 'anyconnect' and not self.vpn_tunnel_all_dns:
-                    GLib.timeout_add_seconds(1, self._apply_split_dns_resolved, tun_dev, dns_domains)
-                    GLib.timeout_add_seconds(3, self._apply_split_dns_resolved, tun_dev, dns_domains)
+                    GLib.timeout_add_seconds(
+                        1,
+                        self._apply_split_dns_resolved,
+                        tun_dev,
+                        dns_domains,
+                        connect_generation,
+                    )
+                    GLib.timeout_add_seconds(
+                        3,
+                        self._apply_split_dns_resolved,
+                        tun_dev,
+                        dns_domains,
+                        connect_generation,
+                    )
 
             self._apply_ipv6_leak_protection()
 
@@ -2920,8 +3639,8 @@ class VPNPluginService(dbus.service.Object):
         """Emit disconnected state (called from main thread)."""
         if connect_generation is not None and self._is_connect_cancelled(connect_generation):
             return False
-        self._cleanup_dns()
         self._set_state(NM_VPN_SERVICE_STATE_STOPPED)
+        self._schedule_post_disconnect_recovery()
         return False
 
     def _emit_failure(self, message, connect_generation: Optional[int] = None):
@@ -2929,13 +3648,13 @@ class VPNPluginService(dbus.service.Object):
         if connect_generation is not None and self._is_connect_cancelled(connect_generation):
             log.info(f"Skipping stale failure callback for generation {connect_generation}")
             return False
-        self._cleanup_dns()
         self.Failure(NM_VPN_PLUGIN_FAILURE_CONNECT_FAILED)
         self._set_state(NM_VPN_SERVICE_STATE_STOPPED)
+        self._schedule_post_disconnect_recovery()
         return False
 
     def _cleanup_leaked_vpn_dns_links(self):
-        """Remove VPN DNS accidentally attached to non-tunnel links."""
+        """Detect physical links that NetworkManager must reapply after teardown."""
         if not shutil.which("resolvectl"):
             return
 
@@ -2955,29 +3674,32 @@ class VPNPluginService(dbus.service.Object):
         except Exception as e:
             log.info(f"Could not inspect resolved links for DNS cleanup: {e}")
             return
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            log.info(f"Could not inspect resolved links for DNS cleanup: {detail}")
+            return
+
+        physical_uplinks = set(self.pre_vpn_uplinks)
+        physical_uplinks.update(self._list_connected_uplinks())
 
         current_name = None
         current_lines = []
 
         def flush_current():
-            if not current_name or current_name.startswith(("tun", "tap")):
+            if not current_name or current_name not in physical_uplinks:
                 return
             body = "\n".join(current_lines)
             has_vpn_dns = any(server in body for server in vpn_dns)
             has_vpn_domain = any(domain in body for domain in vpn_domains)
             if not has_vpn_dns and not has_vpn_domain:
                 return
-            try:
-                subprocess.run(
-                    ["resolvectl", "revert", current_name],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=5,
-                )
-                log.info(f"Reverted leaked VPN DNS settings from {current_name}")
-            except Exception as e:
-                log.info(f"Leaked DNS cleanup failed for {current_name}: {e}")
+            # `resolvectl revert` would also erase the DHCP-provided DNS for a
+            # physical link.  Let NetworkManager reapply the connection instead.
+            self._uplinks_needing_reapply.add(current_name)
+            log.warning(
+                "Detected VPN DNS state on physical uplink "
+                f"{current_name}; scheduling NetworkManager reapply"
+            )
 
         for line in result.stdout.splitlines():
             match = re.match(r"\s*Link\s+\d+\s+\(([^)]+)\)", line)
@@ -2989,89 +3711,114 @@ class VPNPluginService(dbus.service.Object):
                 current_lines.append(line)
         flush_current()
 
-    def _cleanup_dns(self):
-        """Attempt to clear DNS settings left behind on disconnect/failure."""
+    def _cleanup_dns(self, recovery_token: Optional[int] = None) -> bool:
+        """Serialize idempotent cleanup across D-Bus and worker callbacks."""
+        cleanup_lock = getattr(self, "_cleanup_lock", None)
+        if cleanup_lock is None:
+            cleanup_lock = threading.RLock()
+            self._cleanup_lock = cleanup_lock
+        with cleanup_lock:
+            if recovery_token is not None and (
+                recovery_token != self._network_recovery_token
+                or self.state in (
+                    NM_VPN_SERVICE_STATE_STARTING,
+                    NM_VPN_SERVICE_STATE_STARTED,
+                )
+            ):
+                return False
+            self._cleanup_owned_network_state()
+            return True
+
+    def _cleanup_owned_network_state(self):
+        """Clear only DNS/routes/interfaces owned by this VPN activation."""
         self._remove_ipv6_leak_protection()
         self._cleanup_leaked_vpn_dns_links()
-        self._cleanup_anyconnect_physical_routes()
 
-        tun_devs = set()
-        if self.current_tun_device:
-            tun_devs.add(self.current_tun_device)
-        tun_devs.update(self.owned_tun_devices)
+        owned_cleanup_devs = set(self.owned_tun_devices)
+        had_owned_state = bool(owned_cleanup_devs)
+        owned_ifindices = getattr(self, "owned_tun_ifindices", {})
+        remaining_owned_ifindices = {}
 
-        # Best effort: add currently present tunnel interfaces so DNS gets
-        # reverted even when we missed current_tun_device tracking.
-        if not tun_devs:
-            tun_devs.update(self._list_tun_devices())
-
-        # Fallback when we can't enumerate: try tun0 at minimum.
-        if not tun_devs:
-            tun_devs.add("tun0")
-
-        owned_cleanup_devs = set()
-        if self.current_tun_device:
-            owned_cleanup_devs.add(self.current_tun_device)
-        owned_cleanup_devs.update(self.owned_tun_devices)
-
-        for tun_dev in sorted(tun_devs):
-            cleaned = False
+        for tun_dev in sorted(owned_cleanup_devs):
+            expected_ifindex = owned_ifindices.get(tun_dev)
+            live_ifindex = self._link_ifindex(tun_dev)
+            if (
+                expected_ifindex is None
+                or (
+                    live_ifindex is not None
+                    and live_ifindex != expected_ifindex
+                )
+            ):
+                log.info(
+                    "Skipping cleanup for tunnel name without matching ownership: "
+                    f"{tun_dev} expected-ifindex={expected_ifindex} "
+                    f"live-ifindex={live_ifindex}"
+                )
+                continue
             if shutil.which("resolvectl"):
-                try:
-                    subprocess.run(
-                        ["resolvectl", "revert", tun_dev],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
+                resolved_cleaned = self._run_recovery_command(
+                    ["resolvectl", "revert", tun_dev]
+                )
+                if resolved_cleaned:
                     log.info(f"Reverted DNS settings for {tun_dev}")
-                    cleaned = True
-                except Exception as e:
-                    log.info(f"resolvectl revert failed for {tun_dev}: {e}")
-            # Fallback: try resolvconf if present
-            if not cleaned and shutil.which("resolvconf"):
-                try:
-                    subprocess.run(
-                        ["resolvconf", "-d", tun_dev],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
+            # Try openresolv independently.  NixOS can expose both commands,
+            # and a successful resolvectl call does not remove resolvconf data.
+            if shutil.which("resolvconf"):
+                resolvconf_cleaned = self._run_recovery_command(
+                    ["resolvconf", "-d", tun_dev]
+                )
+                if resolvconf_cleaned:
                     log.info(f"Removed resolvconf entry for {tun_dev}")
-                except Exception as e:
-                    log.info(f"resolvconf cleanup failed for {tun_dev}: {e}")
 
-            if tun_dev not in owned_cleanup_devs:
+            # A vanished owned link still needs its name-keyed resolver entry
+            # removed, but has no live routes/link to mutate.
+            if live_ifindex is None:
                 continue
 
-            try:
-                subprocess.run(
-                    ["ip", "route", "flush", "dev", tun_dev],
-                    capture_output=True,
-                    text=True,
-                    check=False,
+            self._run_recovery_command(
+                ["ip", "-4", "route", "flush", "dev", tun_dev]
+            )
+            self._run_recovery_command(
+                ["ip", "-6", "route", "flush", "dev", tun_dev]
+            )
+            self._run_recovery_command(
+                ["ip", "link", "delete", "dev", tun_dev]
+            )
+            remaining_ifindex = self._link_ifindex(tun_dev)
+            if remaining_ifindex == expected_ifindex:
+                remaining_owned_ifindices[tun_dev] = expected_ifindex
+                log.warning(
+                    "Owned tunnel still exists after cleanup; preserving "
+                    f"recovery ownership for {tun_dev} ifindex={expected_ifindex}"
                 )
-            except Exception as e:
-                log.info(f"Route cleanup failed for {tun_dev}: {e}")
 
-            try:
-                subprocess.run(
-                    ["ip", "link", "delete", "dev", tun_dev],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-            except Exception as e:
-                log.info(f"Link cleanup failed for {tun_dev}: {e}")
-
-        # Always clear in-memory DNS/tunnel state, even when no tun device was found.
+        # Clear captured VPN metadata, but retain exact ownership when deletion
+        # failed so a later recovery pass/dispatcher can retry safely.
         self.vpn_dns_servers = []
         self.vpn_domains = []
         self.vpn_tunnel_all_dns = None
         self.vpn_split_excludes = []
         self.vpn_split_includes = []
-        self.current_tun_device = None
-        self.owned_tun_devices.clear()
+        self.owned_tun_ifindices = remaining_owned_ifindices
+        self.owned_tun_devices = set(remaining_owned_ifindices)
+        self.current_tun_device = next(
+            iter(sorted(self.owned_tun_devices)),
+            None,
+        )
+        try:
+            if self.vpn_process and self.vpn_process.poll() is not None:
+                if not self.owned_tun_devices:
+                    self._clear_openconnect_state(self.vpn_process)
+                self.vpn_process = None
+                self.vpn_process_generation = None
+            elif (
+                not self.vpn_process
+                and had_owned_state
+                and not self.owned_tun_devices
+            ):
+                self._clear_openconnect_state()
+        except Exception:
+            pass
 
     # D-Bus methods
     @dbus.service.method(NM_VPN_DBUS_PLUGIN_INTERFACE,
@@ -3081,22 +3828,52 @@ class VPNPluginService(dbus.service.Object):
         log.info("Connect called")
         self._reset_inactivity_timeout()
 
-        # Supersede any previous in-flight connect worker.
-        self.cancel_requested = True
-        self._connect_generation += 1
-        connect_generation = self._connect_generation
-        if self.connection_thread and self.connection_thread.is_alive():
-            log.warning("Connect called while previous connect thread is still running; superseding old request")
+        recovery_thread = self._network_recovery_thread
+
+        # Never overlap two activations that share process/tunnel/DNS state.
+        # Failing the second request cleanly is safer than letting an old worker
+        # delete or reapply resources under a new tunnel.
+        cleanup_lock = getattr(self, "_cleanup_lock", None) or threading.RLock()
+        self._cleanup_lock = cleanup_lock
+        with cleanup_lock:
+            previous_thread_alive = bool(
+                self.connection_thread and self.connection_thread.is_alive()
+            )
+            previous_process_alive = bool(
+                self.vpn_process and self.vpn_process.poll() is None
+            )
+            self.cancel_requested = True
+            self._connect_generation += 1
+            self._network_recovery_token += 1
+            connect_generation = self._connect_generation
+
+        if previous_thread_alive or previous_process_alive:
+            log.error(
+                "Rejecting overlapping Connect request; ending the existing "
+                "activation before NetworkManager retries"
+            )
+            if previous_process_alive:
+                self._stop_vpn_process(preserve_session=True, force=True)
+            self._emit_failure("Overlapping VPN activation rejected")
+            return
 
         self._set_state(NM_VPN_SERVICE_STATE_STARTING)
 
         # Convert D-Bus types to Python
         settings = {str(k): {str(k2): v2 for k2, v2 in v.items()} for k, v in connection.items()}
 
-        # Start connection in background thread
+        # Start connection in the background.  If a prior recovery command is
+        # already in flight, the coordinator waits for it off the D-Bus thread
+        # before starting browser authentication or OpenConnect.
+        if recovery_thread and recovery_thread.is_alive():
+            thread_target = self._connect_after_recovery
+            thread_args = (recovery_thread, settings, connect_generation)
+        else:
+            thread_target = self._connect_thread
+            thread_args = (settings, connect_generation)
         self.connection_thread = threading.Thread(
-            target=self._connect_thread,
-            args=(settings, connect_generation),
+            target=thread_target,
+            args=thread_args,
         )
         self.connection_thread.daemon = True
         self.connection_thread.start()
@@ -3117,6 +3894,15 @@ class VPNPluginService(dbus.service.Object):
         self.cancel_requested = True
         self._connect_generation += 1
 
+        if self.state in (
+            NM_VPN_SERVICE_STATE_STOPPED,
+            NM_VPN_SERVICE_STATE_SHUTDOWN,
+        ):
+            log.info("Disconnect is already complete")
+            if self.state == NM_VPN_SERVICE_STATE_STOPPED:
+                self._schedule_post_disconnect_recovery()
+            return
+
         self._set_state(NM_VPN_SERVICE_STATE_STOPPING)
 
         # Use SIGHUP so openconnect preserves the session cookie but still runs
@@ -3125,10 +3911,20 @@ class VPNPluginService(dbus.service.Object):
             log.info("Stopping openconnect with SIGHUP to preserve session cookie")
             self._stop_vpn_process(preserve_session=True, force=True)
 
-        # Ensure DNS cleanup even if openconnect/vpnc-script left residue behind.
-        self._cleanup_dns()
+        worker = self.connection_thread
+        if worker and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=3)
+            if worker.is_alive():
+                log.warning(
+                    "Connection worker is still unwinding after cancellation; "
+                    "its generation is invalidated"
+                )
 
         self._set_state(NM_VPN_SERVICE_STATE_STOPPED)
+        # NetworkManager must first withdraw Config/Ip4Config for the old
+        # tunnel.  The delayed pass then removes only generation-owned residue,
+        # verifies physical routing/DNS, and repairs NM state if necessary.
+        self._schedule_post_disconnect_recovery()
 
     @dbus.service.method(NM_VPN_DBUS_PLUGIN_INTERFACE,
                          in_signature='a{sa{sv}}', out_signature='s')
@@ -3237,7 +4033,27 @@ class VPNPluginService(dbus.service.Object):
         self.mainloop = mainloop
         # Plugin starts in INIT state (already set in __init__)
         # NetworkManager will call Connect() or NeedSecrets() when ready
-        mainloop.run()
+        try:
+            mainloop.run()
+        finally:
+            # GLib timers do not run after quit.  Keep process-exit cleanup
+            # synchronous so SIGTERM/service replacement cannot strand an
+            # owned tunnel, DNS link, or opt-in IPv6 block route.
+            self.cancel_requested = True
+            self._connect_generation += 1
+            try:
+                if self.vpn_process and self.vpn_process.poll() is None:
+                    self._stop_vpn_process(
+                        preserve_session=True,
+                        force=True,
+                        process=self.vpn_process,
+                    )
+            except Exception:
+                pass
+            self._cleanup_dns()
+            self._network_recovery_reload_attempted = False
+            if not self._recover_base_network_once(reactivate=True):
+                log.error("Base network was not yet healthy when the service exited")
 
 
 def main():

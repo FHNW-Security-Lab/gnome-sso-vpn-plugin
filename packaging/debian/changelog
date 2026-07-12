@@ -1,3 +1,15 @@
+network-manager-ms-sso (2.0.4-1) unstable; urgency=medium
+
+  * End a completed VPN activation cleanly instead of reconnecting against stale DNS
+  * Restore and verify physical routing and DNS after failure, timeout, or disconnect
+  * Track exact OpenConnect processes and tunnel ifindices for crash-safe cleanup
+  * Install a service-filtered NetworkManager recovery dispatcher
+  * Preserve unrelated tunnels, uplink routes, and resolver configuration
+  * Make IPv6 leak blocking opt-in and crash-recoverable
+  * Keep Debian, Arch Linux, and NixOS teardown behavior aligned
+
+ -- MS SSO OpenConnect Maintainers <maintainers@example.com>  Sun, 12 Jul 2026 11:25:03 +0200
+
 network-manager-ms-sso (2.0.3-1) unstable; urgency=medium
 
   * Isolate browser sessions by VPN gateway and account to prevent tenant crossover

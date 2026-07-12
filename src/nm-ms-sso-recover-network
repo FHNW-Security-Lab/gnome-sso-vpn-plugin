@@ -1,0 +1,322 @@
+#!/bin/sh
+# NetworkManager dispatcher recovery for this VPN plugin only.
+
+set -u
+
+action="${2:-${NM_DISPATCHER_ACTION:-}}"
+[ "$action" = "vpn-down" ] || exit 0
+
+connection_uuid="${CONNECTION_UUID:-}"
+[ -n "$connection_uuid" ] || exit 0
+
+run_bounded() {
+    limit="$1"
+    shift
+    timeout "$limit" "$@"
+}
+
+service_type="$(
+    run_bounded 5 nmcli --get-values vpn.service-type \
+        connection show uuid "$connection_uuid" \
+        2>/dev/null | head -n 1
+)"
+[ "$service_type" = "org.freedesktop.NetworkManager.ms-sso" ] || exit 0
+
+log_message() {
+    logger -t nm-ms-sso-recovery -- "$1" 2>/dev/null || true
+}
+
+ms_sso_vpn_active() {
+    active_connections="$(
+        run_bounded 5 nmcli --terse --fields UUID,TYPE \
+            connection show --active 2>/dev/null
+    )"
+    [ -n "$active_connections" ] || return 1
+    printf '%s\n' "$active_connections" | (
+        while IFS=: read -r active_uuid active_type; do
+            [ "$active_type" = "vpn" ] || continue
+            active_service="$(
+                run_bounded 5 nmcli --get-values vpn.service-type \
+                    connection show uuid "$active_uuid" 2>/dev/null | head -n 1
+            )"
+            if [ "$active_service" = "org.freedesktop.NetworkManager.ms-sso" ]; then
+                exit 0
+            fi
+        done
+        exit 1
+    )
+}
+
+abort_if_new_ms_sso_active() {
+    if ms_sso_vpn_active; then
+        log_message "new MS SSO VPN activation is active; skipping stale vpn-down recovery"
+        exit 0
+    fi
+}
+
+# Dispatcher actions are queued and may arrive after a newer activation.  This
+# guard must run before reading or mutating any global ownership state.
+abort_if_new_ms_sso_active
+
+state_file="/run/network-manager-ms-sso/openconnect.state"
+state_pid=""
+state_start_ticks=""
+state_tun=""
+state_tun_ifindex=""
+state_connection_uuid=""
+if [ -r "$state_file" ]; then
+    state_pid="$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' "$state_file" | head -n 1)"
+    state_start_ticks="$(
+        sed -n 's/^start_ticks=\([0-9][0-9]*\)$/\1/p' "$state_file" | head -n 1
+    )"
+    state_tun="$(
+        sed -n 's/^tun=\(tun[0-9A-Za-z_.-]*\)$/\1/p' "$state_file" | head -n 1
+    )"
+    state_tun_ifindex="$(
+        sed -n 's/^tun_ifindex=\([0-9][0-9]*\)$/\1/p' "$state_file" | head -n 1
+    )"
+    state_connection_uuid="$(
+        sed -n 's/^connection_uuid=\([0-9A-Fa-f-][0-9A-Fa-f-]*\)$/\1/p' \
+            "$state_file" | head -n 1
+    )"
+fi
+
+# Never consume ownership written by a newer/different activation.
+if [ -n "$state_connection_uuid" ] \
+    && [ "$state_connection_uuid" != "$connection_uuid" ]; then
+    log_message "OpenConnect ownership belongs to a newer VPN activation; skipping"
+    exit 0
+fi
+
+# If the Python service was killed, stop only the exact child recorded by it.
+# Linux start ticks prevent a recycled PID from targeting an unrelated process.
+if [ -n "$state_pid" ] && [ -n "$state_start_ticks" ] \
+    && [ -r "/proc/$state_pid/stat" ] && [ -r "/proc/$state_pid/comm" ]; then
+    current_start_ticks="$(awk '{print $22}' "/proc/$state_pid/stat" 2>/dev/null)"
+    current_comm="$(sed -n '1p' "/proc/$state_pid/comm" 2>/dev/null)"
+    case "$current_comm" in
+        *openconnect*) is_openconnect=1 ;;
+        *) is_openconnect=0 ;;
+    esac
+    if [ "$current_start_ticks" = "$state_start_ticks" ] \
+        && [ "$is_openconnect" -ne 1 ]; then
+        log_message "persisted PID is not OpenConnect; preserving live process and state"
+        exit 0
+    fi
+    if [ "$is_openconnect" -eq 1 ] \
+        && [ "$current_start_ticks" = "$state_start_ticks" ]; then
+        parent_pid="$(
+            sed -n 's/^PPid:[[:space:]]*\([0-9][0-9]*\)$/\1/p' \
+                "/proc/$state_pid/status" 2>/dev/null | head -n 1
+        )"
+        parent_cmdline=""
+        if [ -n "$parent_pid" ] && [ -r "/proc/$parent_pid/cmdline" ]; then
+            parent_cmdline="$(
+                tr '\000' ' ' < "/proc/$parent_pid/cmdline" 2>/dev/null
+            )"
+        fi
+        case "$parent_cmdline" in
+            *nm-ms-sso-service*)
+                log_message "OpenConnect still belongs to a live service; skipping stale recovery"
+                exit 0
+                ;;
+        esac
+        log_message "stopping orphaned OpenConnect process $state_pid"
+        kill -HUP "$state_pid" 2>/dev/null || true
+        wait_attempt=0
+        while kill -0 "$state_pid" 2>/dev/null && [ "$wait_attempt" -lt 5 ]; do
+            wait_attempt=$((wait_attempt + 1))
+            sleep 1
+        done
+        if kill -0 "$state_pid" 2>/dev/null; then
+            kill -TERM "$state_pid" 2>/dev/null || true
+            sleep 1
+        fi
+        if kill -0 "$state_pid" 2>/dev/null; then
+            kill -KILL "$state_pid" 2>/dev/null || true
+        fi
+    fi
+fi
+abort_if_new_ms_sso_active
+
+vpn_iface="${VPN_IP_IFACE:-${state_tun:-${1:-}}}"
+preserve_state=0
+case "$vpn_iface" in
+    tun*|tap*|ppp*)
+        live_ifindex="$(cat "/sys/class/net/$vpn_iface/ifindex" 2>/dev/null || true)"
+        if [ -n "$state_tun_ifindex" ] \
+            && { [ -z "$live_ifindex" ] \
+                || [ "$live_ifindex" = "$state_tun_ifindex" ]; }; then
+            if command -v resolvectl >/dev/null 2>&1; then
+                run_bounded 5 resolvectl revert "$vpn_iface" \
+                    >/dev/null 2>&1 || true
+            fi
+            if command -v resolvconf >/dev/null 2>&1; then
+                run_bounded 5 resolvconf -d "$vpn_iface" \
+                    >/dev/null 2>&1 || true
+            fi
+        fi
+        if [ -n "$state_tun_ifindex" ] \
+            && [ "$live_ifindex" = "$state_tun_ifindex" ]; then
+            abort_if_new_ms_sso_active
+            run_bounded 5 ip -4 route flush dev "$vpn_iface" \
+                >/dev/null 2>&1 || true
+            run_bounded 5 ip -6 route flush dev "$vpn_iface" \
+                >/dev/null 2>&1 || true
+            run_bounded 5 ip link delete dev "$vpn_iface" \
+                >/dev/null 2>&1 || true
+            remaining_ifindex="$(
+                cat "/sys/class/net/$vpn_iface/ifindex" 2>/dev/null || true
+            )"
+            if [ "$remaining_ifindex" = "$state_tun_ifindex" ]; then
+                preserve_state=1
+                log_message "owned tunnel still exists; preserving recovery state"
+            fi
+        fi
+        ;;
+esac
+abort_if_new_ms_sso_active
+if [ "$preserve_state" -eq 0 ]; then
+    rm -f -- "$state_file"
+fi
+
+# Remove an opt-in crash-safe IPv6 block only when this plugin's marker exists.
+ipv6_marker="/run/network-manager-ms-sso/ipv6-leak-route"
+if [ -e "$ipv6_marker" ]; then
+    abort_if_new_ms_sso_active
+    marker_uuid="$(
+        sed -n 's/^connection_uuid=\([0-9A-Fa-f-][0-9A-Fa-f-]*\)$/\1/p' \
+            "$ipv6_marker" 2>/dev/null | head -n 1
+    )"
+    if [ -z "$marker_uuid" ] || [ "$marker_uuid" = "$connection_uuid" ]; then
+        run_bounded 5 ip -6 route del unreachable ::/0 metric 42760 proto 186 \
+            >/dev/null 2>&1 || true
+        if owned_ipv6_route="$(
+            run_bounded 5 ip -6 route show table all type unreachable ::/0 \
+                metric 42760 proto 186 2>/dev/null
+        )"; then
+            if [ -z "$owned_ipv6_route" ]; then
+                rm -f -- "$ipv6_marker"
+            else
+                log_message "owned IPv6 leak route still exists; preserving marker"
+            fi
+        else
+            log_message "could not verify IPv6 leak route removal; preserving marker"
+        fi
+    fi
+fi
+
+reload_dns() {
+    abort_if_new_ms_sso_active
+    run_bounded 5 nmcli general reload dns-full >/dev/null 2>&1 \
+        || run_bounded 5 nmcli general reload >/dev/null 2>&1 \
+        || true
+    if command -v resolvectl >/dev/null 2>&1; then
+        run_bounded 5 resolvectl flush-caches >/dev/null 2>&1 || true
+    fi
+}
+
+list_connected_uplinks() {
+    run_bounded 5 nmcli --terse --fields DEVICE,TYPE,STATE,CON-UUID \
+        device status 2>/dev/null \
+        | while IFS=: read -r device device_type state active_uuid; do
+            case "$device_type:$state" in
+                ethernet:connected*|wifi:connected*|gsm:connected*|cdma:connected*|\
+                bridge:connected*|bond:connected*|team:connected*|vlan:connected*|\
+                infiniband:connected*)
+                    printf '%s:%s\n' "$device" "$active_uuid"
+                    ;;
+            esac
+        done
+}
+
+base_route_ready() {
+    route="$(run_bounded 5 ip -4 route get 1.1.1.1 2>/dev/null | head -n 1)"
+    [ -n "$route" ] || return 1
+    route_device="$(
+        printf '%s\n' "$route" \
+            | sed -n 's/.*[[:space:]]dev[[:space:]]\([^[:space:]]*\).*/\1/p'
+    )"
+    [ -n "$route_device" ] || return 1
+    list_connected_uplinks | cut -d: -f1 | grep -Fqx -- "$route_device"
+}
+
+probe_host="${MS_SSO_RECOVERY_DNS_PROBE_HOST:-example.com}"
+
+base_dns_ready() {
+    run_bounded 5 getent ahostsv4 "$probe_host" >/dev/null 2>&1
+}
+
+reapply_uplinks() {
+    abort_if_new_ms_sso_active
+    list_connected_uplinks | while IFS=: read -r device active_uuid; do
+        [ -n "$device" ] || continue
+        run_bounded 5 nmcli device reapply "$device" >/dev/null 2>&1 || true
+    done
+}
+
+reactivate_uplinks() {
+    abort_if_new_ms_sso_active
+    primary_device="$(
+        run_bounded 5 ip -4 route show default 2>/dev/null \
+            | sed -n 's/.*[[:space:]]dev[[:space:]]\([^[:space:]]*\).*/\1/p' \
+            | while read -r route_device; do
+                list_connected_uplinks | cut -d: -f1 \
+                    | grep -Fqx -- "$route_device" && {
+                        printf '%s\n' "$route_device"
+                        break
+                    }
+            done
+    )"
+    [ -n "$primary_device" ] || primary_device="$(
+        list_connected_uplinks | head -n 1 | cut -d: -f1
+    )"
+    [ -n "$primary_device" ] || return 0
+    primary_uuid="$(
+        list_connected_uplinks | while IFS=: read -r device active_uuid; do
+            if [ "$device" = "$primary_device" ]; then
+                printf '%s\n' "$active_uuid"
+                break
+            fi
+        done
+    )"
+    [ -n "$primary_uuid" ] || return 0
+    run_bounded 8 nmcli connection up uuid "$primary_uuid" \
+        ifname "$primary_device" >/dev/null 2>&1 || true
+}
+
+# vpn-down runs after NetworkManager has withdrawn the VPN activation.  Reload
+# its DNS plugin first, then dynamically stop as soon as route and DNS recover.
+reload_dns
+attempt=0
+while [ "$attempt" -lt 3 ]; do
+    abort_if_new_ms_sso_active
+    if base_route_ready && base_dns_ready; then
+        log_message "base route and DNS recovered after VPN teardown"
+        exit 0
+    fi
+    reapply_uplinks
+    reload_dns
+    attempt=$((attempt + 1))
+    sleep 1
+done
+
+# Reapplying is normally enough.  Reactivate only links that NetworkManager
+# still reports connected, and only after the base network remained broken.
+log_message "base network still unhealthy; reactivating connected physical uplinks"
+reactivate_uplinks
+reload_dns
+
+attempt=0
+while [ "$attempt" -lt 3 ]; do
+    abort_if_new_ms_sso_active
+    if base_route_ready && base_dns_ready; then
+        log_message "base route and DNS recovered after uplink reactivation"
+        exit 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+
+log_message "base route or DNS did not recover within the bounded dispatcher window"
+exit 0

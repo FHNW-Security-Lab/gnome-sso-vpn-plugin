@@ -1,4 +1,4 @@
-VERSION ?= 2.0.3
+VERSION ?= 2.0.4
 
 .PHONY: arch deb nix test
 

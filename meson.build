@@ -1,5 +1,5 @@
 project('network-manager-ms-sso', 'c',
-  version: '2.0.3',
+  version: '2.0.4',
   meson_version: '>= 0.56.0',
   license: 'GPL-2.0-or-later',
   default_options: [
@@ -70,6 +70,20 @@ install_data('src/nm-ms-sso-notify.py',
 install_data('src/nm-ms-sso-gp-hipreport.py',
   rename: 'nm-ms-sso-gp-hipreport',
   install_dir: libexecdir,
+  install_mode: 'rwxr-xr-x',
+)
+
+# Recovery runs outside the Python service, so a service crash or SIGKILL still
+# repairs NetworkManager DNS/uplink state after this plugin's vpn-down event.
+install_data('src/nm-ms-sso-recover-network',
+  rename: 'nm-ms-sso-recover-network',
+  install_dir: libexecdir,
+  install_mode: 'rwxr-xr-x',
+)
+
+install_data('src/nm-ms-sso-recover-network',
+  rename: '90-nm-ms-sso-recover-network',
+  install_dir: join_paths(sysconfdir, 'NetworkManager', 'dispatcher.d'),
   install_mode: 'rwxr-xr-x',
 )
 

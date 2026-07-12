@@ -17,6 +17,7 @@
 , systemd
 , openresolv
 , coreutils
+, glibc
 , kmod
 , util-linux
 , playwright-driver
@@ -40,7 +41,7 @@ let
 in
 python3Packages.buildPythonApplication rec {
   pname = "networkmanager-ms-sso";
-  version = "2.0.3";
+  version = "2.0.4";
   format = "other";
 
   src = lib.cleanSource ../.;
@@ -74,11 +75,13 @@ python3Packages.buildPythonApplication rec {
     "--prefix" "PATH" ":" (lib.makeBinPath [
       openconnectWrapped
       openconnect
+      networkmanager
       iproute2
       procps
       systemd
       openresolv
       coreutils
+      glibc.bin
       kmod
       util-linux
     ])
@@ -128,7 +131,7 @@ python3Packages.buildPythonApplication rec {
 
   meta = with lib; {
     description = "NetworkManager VPN plugin for MS SSO OpenConnect";
-    homepage = "https://github.com/FHNW-Security-Lab/gnome-ms-sso-plugin";
+    homepage = "https://github.com/FHNW-Security-Lab/gnome-sso-vpn-plugin";
     license = licenses.gpl2Plus;
     platforms = platforms.linux;
   };

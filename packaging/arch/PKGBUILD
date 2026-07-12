@@ -1,7 +1,7 @@
 pkgname=networkmanager-ms-sso-git
 _upstream_name=networkmanager-ms-sso
 _repo_name=gnome-sso-vpn-plugin
-pkgver=2.0.3.r77.g9ce4e2b
+pkgver=2.0.4.r78.g6e760a5
 pkgrel=1
 pkgdesc='NetworkManager VPN plugin for MS SSO OpenConnect'
 arch=('x86_64')

@@ -2,7 +2,7 @@
 
 python3Packages.buildPythonPackage rec {
   pname = "ms-sso-openconnect-core";
-  version = "2.0.3";
+  version = "2.0.4";
   format = "other";
 
   src = lib.cleanSource ../src/python/core;
@@ -28,7 +28,7 @@ python3Packages.buildPythonPackage rec {
 
   meta = with lib; {
     description = "Core library for MS SSO OpenConnect";
-    homepage = "https://github.com/FHNW-Security-Lab/gnome-ms-sso-plugin";
+    homepage = "https://github.com/FHNW-Security-Lab/gnome-sso-vpn-plugin";
     license = licenses.mit;
     platforms = platforms.linux;
   };

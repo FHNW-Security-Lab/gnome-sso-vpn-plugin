@@ -10,7 +10,7 @@ Build-Depends: debhelper-compat (= 13),
                libglib2.0-dev (>= 2.50),
                libsecret-1-dev (>= 0.18)
 Standards-Version: 4.6.0
-Homepage: https://github.com/FHNW-Security-Lab/gnome-ms-sso-plugin
+Homepage: https://github.com/FHNW-Security-Lab/gnome-sso-vpn-plugin
 
 Package: network-manager-ms-sso
 Architecture: any
