@@ -12,7 +12,7 @@ It uses the unified core module for:
 - TOTP generation
 """
 
-import json
+import fcntl
 import os
 import re
 import sys
@@ -145,6 +145,8 @@ NM_VPN_PLUGIN_FAILURE_BAD_IP_CONFIG = 2
 # pointing at the old tunnel ifindex after OpenConnect has removed it.
 NETWORK_RECOVERY_INITIAL_DELAY_MS = 750
 NETWORK_RECOVERY_TIMEOUT_SECONDS = 15
+GP_GATEWAY_ROUTE_STABILIZATION_DELAYS = (0.0, 0.2, 0.5, 1.0, 1.5)
+ANYCONNECT_STRUCTURAL_READY_GRACE_SECONDS = 1.0
 IPV6_LEAK_ROUTE_METRIC = "42760"
 IPV6_LEAK_ROUTE_PROTOCOL = "186"
 IPV6_LEAK_ROUTE_MARKER = Path(
@@ -393,10 +395,16 @@ class VPNPluginService(dbus.service.Object):
         )
 
     def _do_saml_auth_with_ui_stall_fallback(self, **auth_kwargs):
-        """Retry one cached-browser UI stall with an ephemeral browser session."""
+        """Retry one AnyConnect cached-browser stall in an ephemeral session."""
         try:
             return do_saml_auth(**auth_kwargs)
         except SamlUiStalledError:
+            # The fast profile-repair policy is specific to AnyConnect/FHNW.
+            # GlobalProtect has its own prelogin/callback flow and must not be
+            # restarted under a clean browser profile by this wrapper.
+            if auth_kwargs.get('protocol', 'anyconnect') != 'anyconnect':
+                raise
+
             # An already-ephemeral attempt has no safer browser state to fall
             # back to. Propagate it without starting another MFA flow.
             if auth_kwargs.get('disable_browser_session_cache'):
@@ -493,7 +501,11 @@ class VPNPluginService(dbus.service.Object):
             cmd.append(resolve_arg)
         if interface_name:
             cmd.append(f"--interface={interface_name}")
-        cmd.extend(["--reconnect-timeout=300", "--force-dpd=30"])
+        # GlobalProtect's native dead-peer cadence is ten seconds. Keep it so
+        # an interrupted ESP/HTTPS path is detected promptly instead of
+        # extending a blackholed session to the AnyConnect interval.
+        cmd.extend(["--reconnect-timeout=300", "--force-dpd=10"])
+        cmd.append("--non-inter")
         # GP SAML artifacts are authentication-form secrets, not final VPN
         # session cookies. Keep them out of argv and close stdin after one line.
         cmd.append("--passwd-on-stdin")
@@ -508,6 +520,141 @@ class VPNPluginService(dbus.service.Object):
             cmd.append(f"--csd-wrapper={hip_wrapper}")
         cmd.append(gateway)
         return cmd
+
+    @staticmethod
+    def _build_anyconnect_cookie_header(cookies) -> str:
+        """Return only browser cookies that OpenConnect can consume.
+
+        The named entries below are capture metadata, not HTTP cookies.  In
+        particular, a SAML assertion must not be sent back as a Cisco cookie.
+        Preserve all unknown cookie names for gateway compatibility.
+        """
+        metadata_keys = {
+            "samlresponse",
+            "saml-username",
+            "_gateway_ip",
+        }
+        cookie_parts = []
+        for raw_name, raw_value in (cookies or {}).items():
+            name = str(raw_name).strip()
+            value = str(raw_value)
+            if (
+                not name
+                or name.casefold() in metadata_keys
+                or any(character in name or character in value for character in "\r\n")
+            ):
+                continue
+            cookie_parts.append(f"{name}={value}")
+        return "; ".join(cookie_parts)
+
+    @staticmethod
+    def _build_anyconnect_cookie_config(cookie_header: str) -> bytes:
+        """Encode one OpenConnect config containing the complete Cisco cookie."""
+        cookie_header = str(cookie_header or "")
+        if not cookie_header:
+            raise ValueError("AnyConnect cookie header is empty")
+        if "\r" in cookie_header or "\n" in cookie_header:
+            raise ValueError("AnyConnect cookie header contains a line break")
+        return f"cookie={cookie_header}\n".encode("utf-8")
+
+    @staticmethod
+    def _create_anyconnect_cookie_config_fd(cookie_header: str) -> int:
+        """Store an unlimited cookie config in an anonymous, inherited memfd."""
+        memfd_create = getattr(os, "memfd_create", None)
+        if memfd_create is None:
+            raise RuntimeError(
+                "Anonymous in-memory files are unavailable on this Linux runtime"
+            )
+
+        payload = VPNPluginService._build_anyconnect_cookie_config(cookie_header)
+        raw_config_fd = memfd_create(
+            "nm-ms-sso-anyconnect-cookie",
+            getattr(os, "MFD_CLOEXEC", 0),
+        )
+        try:
+            # stdin may be closed when NetworkManager launches the service, in
+            # which case memfd_create() can return fd 0.  Popen's DEVNULL stdin
+            # setup would replace that descriptor before OpenConnect reads it.
+            config_fd = fcntl.fcntl(
+                raw_config_fd,
+                fcntl.F_DUPFD_CLOEXEC,
+                3,
+            )
+        finally:
+            os.close(raw_config_fd)
+        try:
+            os.fchmod(config_fd, stat.S_IRUSR | stat.S_IWUSR)
+            remaining = memoryview(payload)
+            while remaining:
+                try:
+                    written = os.write(config_fd, remaining)
+                except InterruptedError:
+                    continue
+                if written <= 0:
+                    raise OSError("Could not write AnyConnect cookie config")
+                remaining = remaining[written:]
+            os.lseek(config_fd, 0, os.SEEK_SET)
+            return config_fd
+        except Exception:
+            os.close(config_fd)
+            raise
+
+    @staticmethod
+    def _build_anyconnect_openconnect_command(
+            openconnect_bin: str,
+            proto_flag: str,
+            gateway: str,
+            cookie_config_fd: int,
+            resolve_arg: Optional[str] = None,
+            interface_name: Optional[str] = None,
+    ) -> list[str]:
+        """Build a non-interactive command referencing an inherited secret fd."""
+        cookie_config_fd = int(cookie_config_fd)
+        if cookie_config_fd < 0:
+            raise ValueError("AnyConnect cookie config fd must be non-negative")
+        cmd = [openconnect_bin, "--verbose", f"--protocol={proto_flag}"]
+        if resolve_arg:
+            cmd.append(resolve_arg)
+        if interface_name:
+            cmd.append(f"--interface={interface_name}")
+        cmd.extend([
+            "--reconnect-timeout=300",
+            "--force-dpd=30",
+            "--non-inter",
+            f"--config=/proc/self/fd/{cookie_config_fd}",
+            gateway,
+        ])
+        return cmd
+
+    @staticmethod
+    def _build_anyconnect_popen_kwargs(cookie_config_fd: int) -> dict:
+        """Keep only the anonymous config fd open in the OpenConnect child."""
+        cookie_config_fd = int(cookie_config_fd)
+        if cookie_config_fd < 0:
+            raise ValueError("AnyConnect cookie config fd must be non-negative")
+        return {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "pass_fds": (cookie_config_fd,),
+        }
+
+    @staticmethod
+    def _advance_anyconnect_structural_readiness(
+            candidate_ifindex: Optional[int],
+            ip_addr: Optional[str],
+            stable_ifindex: Optional[int],
+            stable_since: Optional[float],
+            now: float,
+            grace_seconds: float = ANYCONNECT_STRUCTURAL_READY_GRACE_SECONDS,
+    ) -> tuple[bool, Optional[int], Optional[float]]:
+        """Track a stable, exact AnyConnect link independently of log wording."""
+        if candidate_ifindex is None or not ip_addr:
+            return False, None, None
+        if stable_ifindex != candidate_ifindex or stable_since is None:
+            return False, candidate_ifindex, now
+        ready = now - stable_since >= max(0.0, grace_seconds)
+        return ready, stable_ifindex, stable_since
 
     @staticmethod
     def _classify_openconnect_timeout(output: str) -> str:
@@ -789,13 +936,26 @@ class VPNPluginService(dbus.service.Object):
         route_ready = self._route_to_base_network_uses_uplink()
         dns_ready = self._base_dns_operational()
         dns_route_ready = self._physical_dns_route_restored()
+        gateway_route_ready = not (
+            getattr(self, "current_protocol", None) == "gp"
+            and self._gp_gateway_route_mismatch(
+                getattr(self, "current_gateway_ip", None)
+            )
+        )
         log.debug(
             "Base network health: "
             f"route={'ready' if route_ready else 'not-ready'}, "
             f"dns={'ready' if dns_ready else 'not-ready'}, "
-            f"dns-route={'ready' if dns_route_ready else 'not-ready'}"
+            f"dns-route={'ready' if dns_route_ready else 'not-ready'}, "
+            "gp-gateway-route="
+            f"{'ready' if gateway_route_ready else 'not-ready'}"
         )
-        return route_ready and dns_ready and dns_route_ready
+        return (
+            route_ready
+            and dns_ready
+            and dns_route_ready
+            and gateway_route_ready
+        )
 
     @staticmethod
     def _run_recovery_command(command: list[str]) -> bool:
@@ -849,6 +1009,101 @@ class VPNPluginService(dbus.service.Object):
             pass
         return sorted(uplinks)[0] if uplinks else None
 
+    def _gp_gateway_route_mismatch(self, gateway_ip: Optional[str]) -> bool:
+        """Detect a GP gateway uplink that NetworkManager would later replace."""
+        if not gateway_ip:
+            return False
+        current_uplinks = self._list_connected_uplinks()
+        uplinks = dict(
+            current_uplinks
+            or getattr(self, "pre_vpn_uplinks", {})
+            or {}
+        )
+        if not uplinks:
+            return False
+        try:
+            defaults_result = subprocess.run(
+                ["ip", "-4", "route", "show", "default"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+        except Exception as e:
+            log.info(f"Could not inspect physical default routes: {e}")
+            return False
+        if defaults_result.returncode != 0:
+            return False
+        try:
+            gateway_result = subprocess.run(
+                ["ip", "-4", "route", "get", gateway_ip],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+        except Exception as e:
+            log.info(f"Could not inspect GlobalProtect gateway route: {e}")
+            return False
+        if gateway_result.returncode != 0:
+            return False
+        default_candidates = []
+        for line in defaults_result.stdout.splitlines():
+            device_match = re.search(r"(?:^|\s)dev\s+(\S+)", line)
+            if not device_match or device_match.group(1) not in uplinks:
+                continue
+            metric_match = re.search(r"(?:^|\s)metric\s+(\d+)", line)
+            metric = int(metric_match.group(1)) if metric_match else 0
+            default_candidates.append((metric, device_match.group(1)))
+        if not default_candidates:
+            return False
+        best_metric = min(metric for metric, _device in default_candidates)
+        primary_devices = {
+            device
+            for metric, device in default_candidates
+            if metric == best_metric
+        }
+        match = re.search(
+            r"(?:^|\s)dev\s+(\S+)",
+            gateway_result.stdout,
+        )
+        gateway_device = match.group(1) if match else None
+        mismatch = bool(
+            gateway_device
+            and gateway_device not in primary_devices
+        )
+        if mismatch:
+            log.warning(
+                "GlobalProtect gateway route uses "
+                f"{gateway_device} while the lowest-metric physical default "
+                f"uses {','.join(sorted(primary_devices))}; "
+                "NetworkManager reapply is required"
+            )
+        return mismatch
+
+    def _stabilize_gp_gateway_route(self, gateway_ip: Optional[str]) -> bool:
+        """Withdraw leaked VPN uplink routes before consuming GP credentials."""
+        if not self._gp_gateway_route_mismatch(gateway_ip):
+            return True
+        self._uplinks_needing_reapply.update(
+            self._list_connected_uplinks()
+        )
+        self._reapply_connected_uplinks()
+        stable_samples = 0
+        for delay in GP_GATEWAY_ROUTE_STABILIZATION_DELAYS:
+            if delay:
+                time.sleep(delay)
+            if self._gp_gateway_route_mismatch(gateway_ip):
+                stable_samples = 0
+                continue
+            stable_samples += 1
+            if stable_samples >= 2:
+                log.info(
+                    "GlobalProtect gateway route stabilized before authentication"
+                )
+                return True
+        return False
+
     def _reapply_connected_uplinks(self, reactivate: bool = False) -> None:
         """Reapply, and as a last resort reactivate, still-connected uplinks."""
         current_uplinks = self._list_connected_uplinks()
@@ -898,6 +1153,11 @@ class VPNPluginService(dbus.service.Object):
 
     def _recover_base_network_once(self, reactivate: bool = False) -> bool:
         """Perform one health-driven base-network recovery pass."""
+        if self._uplinks_needing_reapply:
+            log.info(
+                "Reapplying physical uplinks to withdraw transient VPN routes and DNS"
+            )
+            self._reapply_connected_uplinks()
         if self._base_network_ready():
             return True
         if not self._network_recovery_reload_attempted:
@@ -955,7 +1215,10 @@ class VPNPluginService(dbus.service.Object):
             return False
         recovery_thread = getattr(self, "_network_recovery_thread", None)
         if recovery_thread and recovery_thread.is_alive():
-            return False
+            # A prior token's worker may still be unwinding a bounded command.
+            # Keep this GLib timeout alive so the newest recovery token gets a
+            # worker as soon as that stale thread exits.
+            return True
         recovery_thread = threading.Thread(
             target=self._post_disconnect_recovery_worker,
             args=(token,),
@@ -970,6 +1233,11 @@ class VPNPluginService(dbus.service.Object):
         """Run cleanup after NetworkManager has withdrawn the VPN activation."""
         self._network_recovery_token += 1
         token = self._network_recovery_token
+        current_uplinks = self._list_connected_uplinks()
+        self._uplinks_needing_reapply.update(
+            set(current_uplinks)
+            or set(getattr(self, "pre_vpn_uplinks", {}))
+        )
         self._network_recovery_deadline = (
             time.monotonic() + NETWORK_RECOVERY_TIMEOUT_SECONDS
         )
@@ -1940,6 +2208,16 @@ class VPNPluginService(dbus.service.Object):
             # Some networks inject a host route that forces ARP on LAN and breaks reachability.
             if self.current_gateway_ip:
                 self._clear_onlink_host_route(self.current_gateway_ip)
+            if (
+                protocol == 'gp'
+                and not self._stabilize_gp_gateway_route(
+                    self.current_gateway_ip
+                )
+            ):
+                raise Exception(
+                    "GlobalProtect gateway route remained inconsistent after "
+                    "NetworkManager reapply"
+                )
 
             if protocol in {'anyconnect', 'gp'} and not self._ensure_tun_available():
                 raise Exception(self._tun_unavailable_message())
@@ -2102,14 +2380,6 @@ class VPNPluginService(dbus.service.Object):
                                 used_cache = False
                             else:
                                 log.info(f"Using cached cookies (keys: {list(cookies.keys()) if cookies else 'none'})")
-                            # Optional sensitive debug dump; disabled by default.
-                            if cookies and self._is_truthy(os.environ.get("MS_SSO_NM_DEBUG_DUMP_COOKIES")):
-                                try:
-                                    with open('/tmp/nm-vpn-cached-cookies.json', 'w') as f:
-                                        json.dump({"source": "cache", "cookies": cookies, "usergroup": usergroup}, f, indent=2)
-                                    log.debug("Cached cookies written to /tmp/nm-vpn-cached-cookies.json")
-                                except Exception as e:
-                                    log.debug(f"Could not write cached cookies debug file: {e}")
                         else:
                             log.info("No valid cached cookies found")
 
@@ -2239,14 +2509,6 @@ class VPNPluginService(dbus.service.Object):
                                     f"(keys: {list(cookies.keys())})"
                                 )
                                 cookies = None
-                            # Optional sensitive debug dump; disabled by default.
-                            if self._is_truthy(os.environ.get("MS_SSO_NM_DEBUG_DUMP_COOKIES")):
-                                try:
-                                    with open('/tmp/nm-vpn-fresh-cookies.json', 'w') as f:
-                                        json.dump({"source": "fresh_saml", "cookies": cookies}, f, indent=2)
-                                    log.debug("Fresh cookies written to /tmp/nm-vpn-fresh-cookies.json")
-                                except Exception as e:
-                                    log.debug(f"Could not write fresh cookies debug file: {e}")
                         except Exception as auth_err:
                             log.error(f"SAML auth error: {auth_err}")
                             import traceback
@@ -2501,8 +2763,6 @@ class VPNPluginService(dbus.service.Object):
             proto_flag = PROTOCOLS.get(protocol, {}).get('flag', 'anyconnect')
             openconnect_bin = get_openconnect_binary(protocol)
             resolve_arg = self._get_openconnect_resolve_arg()
-            reconnect_arg = "--reconnect-timeout=300"
-            dpd_arg = "--force-dpd=30"
             # Capture existing tunnel devices before OpenConnect can create its
             # interface; a fast process must not make the new tun look stale.
             baseline_tun_devs = self._list_tun_devices()
@@ -2573,39 +2833,37 @@ class VPNPluginService(dbus.service.Object):
                 if gp_cookie_uses_stdin:
                     self._write_gp_cookie_and_close(vpn_process, cookie_str)
             else:
-                cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+                cookie_str = self._build_anyconnect_cookie_header(cookies)
+                if not cookie_str:
+                    return (
+                        False,
+                        "AnyConnect authentication returned no usable HTTP cookies",
+                        0,
+                    )
                 log.debug(f"Using AnyConnect cookie (len={len(cookie_str)})")
-                cmd = [
-                    openconnect_bin,
-                    "--verbose",
-                    f"--protocol={proto_flag}",
-                    f"--interface={requested_tun_device}",
-                    reconnect_arg,
-                    dpd_arg,
-                    f"--cookie={cookie_str}",
-                    gateway,
-                ]
-                if resolve_arg:
-                    cmd.insert(3, resolve_arg)
-                log.debug(
-                    f"OpenConnect command: {openconnect_bin} --verbose "
-                    f"--protocol={proto_flag} --cookie=[redacted] {gateway}"
+                cookie_config_fd = self._create_anyconnect_cookie_config_fd(
+                    cookie_str
                 )
-                # Optional sensitive debug dump; disabled by default.
-                if self._is_truthy(os.environ.get("MS_SSO_NM_DEBUG_DUMP_COOKIES")):
-                    try:
-                        with open('/tmp/nm-vpn-debug-cmd.txt', 'w') as f:
-                            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                            f.write(f"Cookie string length: {len(cookie_str)}\n")
-                            f.write(f"Cookie keys: {list(cookies.keys())}\n")
-                            f.write(f"Cookie string: {cookie_str}\n")
-                    except Exception:
-                        pass
-                self.vpn_process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT
-                )
+                try:
+                    cmd = self._build_anyconnect_openconnect_command(
+                        openconnect_bin=openconnect_bin,
+                        proto_flag=proto_flag,
+                        gateway=gateway,
+                        cookie_config_fd=cookie_config_fd,
+                        resolve_arg=resolve_arg,
+                        interface_name=requested_tun_device,
+                    )
+                    log.debug(
+                        f"OpenConnect command: {openconnect_bin} --verbose "
+                        f"--protocol={proto_flag} --config=/proc/self/fd/[redacted] "
+                        f"{gateway}"
+                    )
+                    self.vpn_process = subprocess.Popen(
+                        cmd,
+                        **self._build_anyconnect_popen_kwargs(cookie_config_fd),
+                    )
+                finally:
+                    os.close(cookie_config_fd)
                 vpn_process = self.vpn_process
                 self.vpn_process_generation = connect_generation
                 self._write_openconnect_state(
@@ -2631,19 +2889,20 @@ class VPNPluginService(dbus.service.Object):
             # Wait for tun interface to come up
             timeout = self._get_tunnel_connect_timeout_seconds(protocol)
             log.info(f"Waiting up to {timeout}s for tunnel interface")
-            start_time = time.time()
+            start_time = time.monotonic()
             connected = False
             output_buffer = ""
             openconnect_reported_up = False
+            structural_ready_ifindex = None
+            structural_ready_since = None
 
             # Set stdout to non-blocking so we can read while checking interface
-            import fcntl
             import os as os_module
             fd = vpn_process.stdout.fileno()
             fl = fcntl.fcntl(fd, fcntl.F_GETFL)
             fcntl.fcntl(fd, fcntl.F_SETFL, fl | os_module.O_NONBLOCK)
 
-            while time.time() - start_time < timeout:
+            while time.monotonic() - start_time < timeout:
                 if self._is_connect_cancelled(connect_generation):
                     self._stop_vpn_process(
                         preserve_session=True,
@@ -2693,10 +2952,52 @@ class VPNPluginService(dbus.service.Object):
                         candidate_tun,
                         candidate_ifindex,
                     )
-                    if protocol != 'anyconnect' or openconnect_reported_up:
+                    if protocol != 'anyconnect':
                         log.info(f"Found tun device: {self.current_tun_device}")
                         connected = True
                         break
+                    if openconnect_reported_up and candidate_ifindex is not None:
+                        log.info(f"Found tun device: {self.current_tun_device}")
+                        connected = True
+                        break
+
+                    # The requested name did not exist before this child was
+                    # launched, and its exact ifindex is persisted as owned
+                    # state.  Some OpenConnect versions change their English
+                    # success wording, so a live link with stable IPv4 is a
+                    # stronger readiness signal than stdout text.  The short
+                    # grace also drains the remaining pushed DNS/route lines.
+                    candidate_ip, _candidate_prefix = (
+                        self._get_tun_ipv4_config(candidate_tun)
+                    )
+                    (
+                        structurally_ready,
+                        structural_ready_ifindex,
+                        structural_ready_since,
+                    ) = self._advance_anyconnect_structural_readiness(
+                        candidate_ifindex,
+                        candidate_ip,
+                        structural_ready_ifindex,
+                        structural_ready_since,
+                        time.monotonic(),
+                    )
+                    if structurally_ready and vpn_process.poll() is None:
+                        output_buffer, openconnect_reported_up = (
+                            self._consume_vpn_stdout(
+                                output_buffer,
+                                openconnect_reported_up,
+                                process=vpn_process,
+                            )
+                        )
+                        log.info(
+                            "Found structurally ready AnyConnect tunnel: "
+                            f"{self.current_tun_device} ifindex={candidate_ifindex}"
+                        )
+                        connected = True
+                        break
+                else:
+                    structural_ready_ifindex = None
+                    structural_ready_since = None
 
                 time.sleep(0.5)
 
@@ -3429,8 +3730,6 @@ class VPNPluginService(dbus.service.Object):
             tun_device: Optional[str] = None,
     ):
         """Emit IP config after interface is up (called from main thread)."""
-        import struct
-
         if (
             (connect_generation is not None and self._is_connect_cancelled(connect_generation))
             or (vpn_process is not None and vpn_process is not self.vpn_process)
@@ -3498,12 +3797,11 @@ class VPNPluginService(dbus.service.Object):
             self.Config(config)
             log.info(f"Emitted Config signal")
 
-            # Emit Ip4Config signal with proper format
-            # NetworkManager expects 'addresses' as array of arrays: [[addr, prefix, gateway], ...]
+            # Emit Ip4Config using NetworkManager's singular IPv4 keys.
             if ip_addr:
-                # Convert IP to uint32 (network byte order)
-                ip_parts = [int(x) for x in ip_addr.split('.')]
-                ip_uint = struct.unpack('!I', bytes(ip_parts))[0]
+                # NetworkManager represents IPv4 values as a uint32 containing
+                # the address in network byte order.
+                ip_uint = self._ipv4_to_nm_uint32(ip_addr)
 
                 # Get DNS servers - try multiple methods
                 dns_server_ips = []
@@ -3573,23 +3871,18 @@ class VPNPluginService(dbus.service.Object):
                     dns_servers.append(dbus.UInt32(ns_uint))
                 log.info(f"Total DNS servers found: {len(dns_servers)}")
 
-                # Build addresses array: each address is [addr, prefix, gateway]
-                # For point-to-point VPN, gateway in address is typically 0
-                addr_array = dbus.Array([
-                    dbus.Array([dbus.UInt32(ip_uint), dbus.UInt32(prefix), dbus.UInt32(0)], signature='u')
-                ], signature='au')
-
-                # Build routes array: empty since OpenConnect handles routes via vpnc-script
-                routes_array = dbus.Array([], signature='au')
-
                 ip4_config = dbus.Dictionary({
-                    'addresses': addr_array,
-                    'routes': routes_array,
+                    'address': dbus.UInt32(ip_uint),
+                    'prefix': dbus.UInt32(prefix),
+                    # OpenConnect's vpnc-script already owns the live kernel
+                    # address and routes. Retain NetworkManager's prior route
+                    # metadata and suppress its otherwise automatic second
+                    # default route for the same tunnel.
+                    'preserve-routes': dbus.Boolean(True),
+                    'never-default': dbus.Boolean(True),
                     'dns': dbus.Array(dns_servers, signature='u') if dns_servers else dbus.Array([], signature='u'),
                     'domains': dbus.Array(dns_domains, signature='s'),
                 }, signature='sv')
-                if self.current_protocol == 'anyconnect' and not self._anyconnect_preserve_default_route():
-                    ip4_config['never-default'] = dbus.Boolean(True)
                 self.Ip4Config(ip4_config)
                 log.info(
                     f"Emitted Ip4Config signal: addr={ip_addr}/{prefix}, "

@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "nm-ms-sso-editor.h"
+#include "nm-ms-sso-timeout-policy.h"
 
 /* Keyring schema for MS SSO VPN secrets */
 static const SecretSchema ms_sso_schema = {
@@ -38,8 +39,6 @@ static const SecretSchema ms_sso_schema = {
 /* Protocol values */
 #define PROTO_ANYCONNECT   "anyconnect"
 #define PROTO_GP           "gp"
-#define DEFAULT_ANYCONNECT_TIMEOUT 180U
-#define DEFAULT_GP_TIMEOUT         300U
 
 /*
  * Editor Private Data
@@ -268,14 +267,18 @@ update_connection(NMVpnEditor *editor, NMConnection *connection, GError **error)
     protocol = (protocol_idx == 0) ? PROTO_ANYCONNECT : PROTO_GP;
     nm_setting_vpn_add_data_item(s_vpn, KEY_PROTOCOL, protocol);
 
-    /* SAML/MFA can legitimately exceed NetworkManager's 60-second default.
-     * Preserve explicit user values, but give new and legacy default profiles
-     * enough time to authenticate and bring up a real tunnel. */
-    if (nm_setting_vpn_get_timeout(s_vpn) == 0) {
-        guint timeout = (protocol_idx == 0)
-            ? DEFAULT_ANYCONNECT_TIMEOUT
-            : DEFAULT_GP_TIMEOUT;
-        g_object_set(s_vpn, NM_SETTING_VPN_TIMEOUT, timeout, NULL);
+    /* NetworkManager's activation timer does not restart as SAML advances.
+     * Raise undersized AnyConnect profiles whenever they are saved, while
+     * retaining the existing GlobalProtect default and explicit values. */
+    {
+        guint current_timeout = nm_setting_vpn_get_timeout(s_vpn);
+        guint timeout = ms_sso_vpn_activation_timeout(
+            g_strcmp0(protocol, PROTO_ANYCONNECT) == 0,
+            current_timeout
+        );
+
+        if (timeout != current_timeout)
+            g_object_set(s_vpn, NM_SETTING_VPN_TIMEOUT, timeout, NULL);
     }
 
     /* Set secrets in NM connection (for NM's internal handling) */

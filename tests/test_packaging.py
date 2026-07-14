@@ -194,6 +194,19 @@ exit 0
         self.assertNotIn("resolvectl revert tun42", self._calls())
         self.assertIn("resolvectl flush-caches", self._calls())
 
+    def test_dispatcher_reapplies_uplinks_before_accepting_base_route(self):
+        result = self._run_dispatcher()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._calls()
+        reapply_index = calls.index("nmcli device reapply eth0")
+        first_route_check = next(
+            index
+            for index, command in enumerate(calls)
+            if command.startswith("ip -4 route get 1.1.1.1")
+        )
+        self.assertLess(reapply_index, first_route_check)
+
     def test_queued_old_event_cannot_mutate_a_new_ms_sso_activation(self):
         result = self._run_dispatcher(active_ms_sso=True)
 

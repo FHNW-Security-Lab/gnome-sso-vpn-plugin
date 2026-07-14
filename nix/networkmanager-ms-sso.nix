@@ -24,6 +24,9 @@
 , ms-sso-openconnect-core
 }:
 
+assert lib.assertMsg (lib.versionAtLeast openconnect.version "9.12")
+  "networkmanager-ms-sso requires OpenConnect 9.12 or newer";
+
 let
   openconnectWrapped = writeShellScriptBin "openconnect" ''
     exec ${lib.getExe openconnect} --script ${lib.getExe' vpnc-scripts "vpnc-script"} "$@"
@@ -41,7 +44,7 @@ let
 in
 python3Packages.buildPythonApplication rec {
   pname = "networkmanager-ms-sso";
-  version = "2.0.4";
+  version = "2.0.5";
   format = "other";
 
   src = lib.cleanSource ../.;

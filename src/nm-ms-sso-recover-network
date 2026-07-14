@@ -285,8 +285,12 @@ reactivate_uplinks() {
         ifname "$primary_device" >/dev/null 2>&1 || true
 }
 
-# vpn-down runs after NetworkManager has withdrawn the VPN activation.  Reload
-# its DNS plugin first, then dynamically stop as soon as route and DNS recover.
+# vpn-down runs after NetworkManager has withdrawn the VPN activation. Reapply
+# every connected physical uplink once before accepting a healthy public route:
+# vpnc-script can leave a gateway /32 on a secondary link while ordinary
+# Internet and DNS still work. Then dynamically stop as soon as recovery is
+# complete.
+reapply_uplinks
 reload_dns
 attempt=0
 while [ "$attempt" -lt 3 ]; do

@@ -3,8 +3,10 @@
 import importlib.util
 import logging.handlers
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -128,6 +130,63 @@ class OpenConnectOutputTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertIs(self.service.vpn_process, current_process)
 
+    def test_connected_emits_nm_owned_metadata_without_owning_vpnc_routes(self):
+        process = SimpleNamespace(poll=lambda: None)
+        self.service.vpn_process = process
+        self.service.current_tun_device = "tun-ms-sso7"
+        self.service.current_gateway = "vpn.example.edu"
+        self.service.current_gateway_ip = "192.0.2.10"
+        self.service.current_dns_server_limit = 1
+        self.service._get_tun_ipv4_config = lambda _device: ("10.3.0.38", 32)
+        self.service._apply_ipv6_leak_protection = lambda: None
+        no_resolved_dns = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="not configured",
+        )
+
+        for protocol in ("gp", "anyconnect"):
+            with self.subTest(protocol=protocol):
+                configs = []
+                ip4_configs = []
+                states = []
+                self.service.current_protocol = protocol
+                # Exercise the full-tunnel AnyConnect case too: NetworkManager
+                # must never add a competing default even when the server does.
+                self.service.vpn_tunnel_all_dns = True
+                self.service.Config = configs.append
+                self.service.Ip4Config = ip4_configs.append
+                self.service._set_state = states.append
+
+                with patch.object(
+                    SERVICE_MODULE.subprocess,
+                    "run",
+                    return_value=no_resolved_dns,
+                ):
+                    result = self.service._emit_connected(
+                        connect_generation=2,
+                        vpn_process=process,
+                        tun_device="tun-ms-sso7",
+                    )
+
+                self.assertFalse(result)
+                self.assertEqual(len(configs), 1)
+                self.assertEqual(len(ip4_configs), 1)
+                ip4_config = ip4_configs[0]
+                self.assertEqual(
+                    int(ip4_config["address"]),
+                    self.service._ipv4_to_nm_uint32("10.3.0.38"),
+                )
+                self.assertEqual(int(ip4_config["prefix"]), 32)
+                self.assertTrue(bool(ip4_config["preserve-routes"]))
+                self.assertTrue(bool(ip4_config["never-default"]))
+                self.assertNotIn("addresses", ip4_config)
+                self.assertNotIn("routes", ip4_config)
+                self.assertEqual(
+                    states,
+                    [SERVICE_MODULE.NM_VPN_SERVICE_STATE_STARTED],
+                )
+
     def test_stale_failure_callback_is_ignored(self):
         calls = []
         self.service._cleanup_dns = lambda: calls.append("cleanup")
@@ -148,6 +207,219 @@ class OpenConnectOutputTests(unittest.TestCase):
         self.assertEqual(stream.data, b"secret-cookie\n")
         self.assertTrue(stream.flushed)
         self.assertTrue(stream.closed)
+
+    def test_anyconnect_cookie_header_excludes_capture_metadata(self):
+        header = self.service._build_anyconnect_cookie_header({
+            "webvpn": "session",
+            "webvpnc": "configuration",
+            "vendor-cookie": "preserved",
+            "_vendor-cookie": "also-preserved",
+            "SAMLResponse": "large-assertion",
+            "saml-username": "captured-user",
+            "_gateway_ip": "192.0.2.10",
+        })
+
+        self.assertEqual(
+            header,
+            "webvpn=session; webvpnc=configuration; vendor-cookie=preserved; "
+            "_vendor-cookie=also-preserved",
+        )
+        self.assertNotIn("large-assertion", header)
+        self.assertNotIn("captured-user", header)
+
+    def test_anyconnect_memfd_config_preserves_cookie_larger_than_7_kib(self):
+        cookie_header = (
+            "webvpn=session; webvpnc="
+            + ("configuration-fragment-" * 340)
+            + "; vendor-cookie=preserved"
+        )
+        expected = f"cookie={cookie_header}\n".encode("utf-8")
+        self.assertGreater(len(expected), 7 * 1024)
+
+        config_fd = self.service._create_anyconnect_cookie_config_fd(
+            cookie_header
+        )
+        try:
+            actual = b""
+            while True:
+                chunk = os.read(config_fd, 8192)
+                if not chunk:
+                    break
+                actual += chunk
+        finally:
+            os.close(config_fd)
+
+        self.assertEqual(actual, expected)
+
+    def test_anyconnect_memfd_survives_popen_when_stdin_was_closed(self):
+        regression_script = textwrap.dedent(
+            r"""
+            import importlib.util
+            import os
+            import subprocess
+            import sys
+
+            service_path = sys.argv[1]
+            spec = importlib.util.spec_from_file_location(
+                "nm_ms_sso_closed_stdin_regression",
+                service_path,
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            service = object.__new__(module.VPNPluginService)
+
+            os.close(0)
+            real_memfd_create = module.os.memfd_create
+            raw_fds = []
+
+            def recording_memfd_create(*args, **kwargs):
+                raw_fd = real_memfd_create(*args, **kwargs)
+                raw_fds.append(raw_fd)
+                return raw_fd
+
+            module.os.memfd_create = recording_memfd_create
+            cookie_header = "webvpn=session; webvpnc=configuration"
+            expected = service._build_anyconnect_cookie_config(cookie_header)
+            config_fd = service._create_anyconnect_cookie_config_fd(cookie_header)
+            if raw_fds != [0]:
+                raise RuntimeError(f"closed stdin did not yield raw fd 0: {raw_fds}")
+            if config_fd < 3:
+                raise RuntimeError(f"unsafe duplicated config fd: {config_fd}")
+
+            reader_code = (
+                "import pathlib, sys; "
+                "sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())"
+            )
+            try:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        reader_code,
+                        f"/proc/self/fd/{config_fd}",
+                    ],
+                    **service._build_anyconnect_popen_kwargs(config_fd),
+                )
+            finally:
+                os.close(config_fd)
+
+            output = process.communicate(timeout=10)[0]
+            if process.returncode != 0 or output != expected:
+                raise RuntimeError(
+                    f"inherited config read failed: rc={process.returncode}, "
+                    f"bytes={len(output)}"
+                )
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", regression_script, str(SERVICE_PATH)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    def test_anyconnect_command_reads_cookie_from_inherited_memfd_config(self):
+        command = self.service._build_anyconnect_openconnect_command(
+            openconnect_bin="openconnect",
+            proto_flag="anyconnect",
+            gateway="vpn.example.edu",
+            cookie_config_fd=73,
+            resolve_arg="--resolve=vpn.example.edu:192.0.2.10",
+            interface_name="tun-ms-sso7",
+        )
+
+        self.assertIn("--config=/proc/self/fd/73", command)
+        self.assertIn("--non-inter", command)
+        self.assertIn("--interface=tun-ms-sso7", command)
+        self.assertIn("--resolve=vpn.example.edu:192.0.2.10", command)
+        self.assertIn("--force-dpd=30", command)
+        self.assertNotIn("--force-dpd=10", command)
+        self.assertNotIn("--cookie-on-stdin", command)
+        self.assertFalse(any(argument.startswith("--cookie=") for argument in command))
+
+    def test_anyconnect_popen_inherits_only_config_fd_and_disables_stdin(self):
+        kwargs = self.service._build_anyconnect_popen_kwargs(73)
+
+        self.assertEqual(kwargs["pass_fds"], (73,))
+        self.assertEqual(kwargs["stdin"], SERVICE_MODULE.subprocess.DEVNULL)
+        self.assertEqual(kwargs["stdout"], SERVICE_MODULE.subprocess.PIPE)
+        self.assertEqual(kwargs["stderr"], SERVICE_MODULE.subprocess.STDOUT)
+
+    def test_service_has_no_live_cookie_debug_dump_escape_hatch(self):
+        service_source = SERVICE_PATH.read_text(encoding="utf-8")
+
+        for forbidden in (
+            "MS_SSO_NM_DEBUG_DUMP_COOKIES",
+            "/tmp/nm-vpn-cached-cookies.json",
+            "/tmp/nm-vpn-fresh-cookies.json",
+            "/tmp/nm-vpn-debug-cmd.txt",
+        ):
+            self.assertNotIn(forbidden, service_source)
+
+    def test_anyconnect_structural_readiness_requires_stable_ifindex_and_ip(self):
+        ready, stable_ifindex, stable_since = (
+            self.service._advance_anyconnect_structural_readiness(
+                candidate_ifindex=42,
+                ip_addr="10.0.0.10",
+                stable_ifindex=None,
+                stable_since=None,
+                now=10.0,
+                grace_seconds=1.0,
+            )
+        )
+        self.assertFalse(ready)
+        self.assertEqual(stable_ifindex, 42)
+        self.assertEqual(stable_since, 10.0)
+
+        ready, stable_ifindex, stable_since = (
+            self.service._advance_anyconnect_structural_readiness(
+                candidate_ifindex=42,
+                ip_addr="10.0.0.10",
+                stable_ifindex=stable_ifindex,
+                stable_since=stable_since,
+                now=11.0,
+                grace_seconds=1.0,
+            )
+        )
+        self.assertTrue(ready)
+        self.assertEqual(stable_ifindex, 42)
+        self.assertEqual(stable_since, 10.0)
+
+        ready, stable_ifindex, stable_since = (
+            self.service._advance_anyconnect_structural_readiness(
+                candidate_ifindex=43,
+                ip_addr="10.0.0.10",
+                stable_ifindex=stable_ifindex,
+                stable_since=stable_since,
+                now=12.0,
+                grace_seconds=1.0,
+            )
+        )
+        self.assertFalse(ready)
+        self.assertEqual(stable_ifindex, 43)
+        self.assertEqual(stable_since, 12.0)
+
+        ready, stable_ifindex, stable_since = (
+            self.service._advance_anyconnect_structural_readiness(
+                candidate_ifindex=43,
+                ip_addr=None,
+                stable_ifindex=stable_ifindex,
+                stable_since=stable_since,
+                now=13.0,
+                grace_seconds=1.0,
+            )
+        )
+        self.assertFalse(ready)
+        self.assertIsNone(stable_ifindex)
+        self.assertIsNone(stable_since)
 
     def test_gp_cookie_selection_prefers_reusable_portal_cookie(self):
         selected = self.service._select_gp_cookie({
@@ -214,6 +486,7 @@ class OpenConnectOutputTests(unittest.TestCase):
         ) as auth:
             result = self.service._do_saml_auth_with_ui_stall_fallback(
                 vpn_server="vpn.example.edu",
+                protocol="anyconnect",
                 disable_browser_session_cache=False,
                 cancel_callback=lambda: False,
             )
@@ -222,6 +495,22 @@ class OpenConnectOutputTests(unittest.TestCase):
         self.assertEqual(auth.call_count, 2)
         self.assertFalse(auth.call_args_list[0].kwargs["disable_browser_session_cache"])
         self.assertTrue(auth.call_args_list[1].kwargs["disable_browser_session_cache"])
+
+    def test_gp_browser_ui_stall_is_not_retried_in_clean_session(self):
+        with patch.object(
+            SERVICE_MODULE,
+            "do_saml_auth",
+            side_effect=SERVICE_MODULE.SamlUiStalledError("stalled"),
+        ) as auth:
+            with self.assertRaises(SERVICE_MODULE.SamlUiStalledError):
+                self.service._do_saml_auth_with_ui_stall_fallback(
+                    vpn_server="vpn.example.edu",
+                    protocol="gp",
+                    disable_browser_session_cache=False,
+                    cancel_callback=lambda: False,
+                )
+
+        auth.assert_called_once()
 
     def test_second_browser_ui_stall_is_propagated_without_third_attempt(self):
         with patch.object(
@@ -297,6 +586,7 @@ class OpenConnectOutputTests(unittest.TestCase):
         )
 
         self.assertIn("--passwd-on-stdin", command)
+        self.assertIn("--non-inter", command)
         self.assertFalse(any("portal-cookie" in arg for arg in command))
         self.assertIn("--user=saml-returned-user", command)
         self.assertIn("--usergroup=portal:portal-userauthcookie", command)
@@ -304,6 +594,171 @@ class OpenConnectOutputTests(unittest.TestCase):
         self.assertIn("--os=linux-64", command)
         self.assertIn("--csd-wrapper=/usr/libexec/nm-ms-sso-gp-hipreport", command)
         self.assertIn("--interface=tun-ms-sso7", command)
+        self.assertIn("--force-dpd=10", command)
+        self.assertNotIn("--force-dpd=30", command)
+        self.assertNotIn("--no-dtls", command)
+
+    def test_gp_gateway_route_mismatch_detects_stale_nonprimary_uplink(self):
+        self.service.pre_vpn_uplinks = {
+            "eth0": "wired-uuid",
+            "wlan0": "wifi-uuid",
+        }
+        self.service._list_connected_uplinks = lambda: dict(
+            self.service.pre_vpn_uplinks
+        )
+        for defaults, gateway_device, expected in (
+            (
+                "default via 192.0.2.1 dev eth0 metric 100\n"
+                "default via 192.0.2.1 dev wlan0 metric 600\n",
+                "eth0",
+                False,
+            ),
+            (
+                "default via 192.0.2.1 dev wlan0 metric 600\n"
+                "default via 192.0.2.1 dev eth0 metric 100\n",
+                "wlan0",
+                True,
+            ),
+            (
+                "default via 192.0.2.1 dev eth0 metric 100\n"
+                "default via 192.0.2.1 dev wlan0 metric 100\n",
+                "wlan0",
+                False,
+            ),
+            (
+                "default dev wg0 metric 5\n"
+                "default via 192.0.2.1 dev eth0 metric 100\n"
+                "default via 192.0.2.1 dev wlan0 metric 600\n",
+                "eth0",
+                False,
+            ),
+        ):
+            with self.subTest(gateway_device=gateway_device):
+                default_routes = subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=defaults,
+                    stderr="",
+                )
+                gateway_route = subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=(
+                        "192.0.2.10 via 192.0.2.1 "
+                        f"dev {gateway_device} src 192.0.2.20\n"
+                    ),
+                    stderr="",
+                )
+                with patch.object(
+                    SERVICE_MODULE.subprocess,
+                    "run",
+                    side_effect=(default_routes, gateway_route),
+                ):
+                    self.assertEqual(
+                        self.service._gp_gateway_route_mismatch("192.0.2.10"),
+                        expected,
+                    )
+
+        failed_defaults = subprocess.CompletedProcess(
+            args=[],
+            returncode=2,
+            stdout="",
+            stderr="failed",
+        )
+        with patch.object(
+            SERVICE_MODULE.subprocess,
+            "run",
+            return_value=failed_defaults,
+        ) as run:
+            self.assertFalse(
+                self.service._gp_gateway_route_mismatch("192.0.2.10")
+            )
+        run.assert_called_once()
+
+    def test_gp_gateway_route_stabilization_requires_two_stable_samples(self):
+        self.service._uplinks_needing_reapply = set()
+        current_uplinks = {
+            "eth0": "wired-uuid",
+            "wlan0": "wifi-uuid",
+        }
+        with patch.object(
+            self.service,
+            "_gp_gateway_route_mismatch",
+            side_effect=[True, False, False],
+        ) as mismatch, patch.object(
+            self.service,
+            "_list_connected_uplinks",
+            return_value=current_uplinks,
+        ), patch.object(
+            self.service,
+            "_reapply_connected_uplinks",
+        ) as reapply, patch.object(
+            SERVICE_MODULE.time,
+            "sleep",
+        ) as sleep:
+            stable = self.service._stabilize_gp_gateway_route("192.0.2.10")
+
+        self.assertTrue(stable)
+        self.assertEqual(
+            self.service._uplinks_needing_reapply,
+            {"eth0", "wlan0"},
+        )
+        self.assertEqual(mismatch.call_count, 3)
+        reapply.assert_called_once_with()
+        sleep.assert_called_once_with(0.2)
+
+    def test_gp_gateway_route_stabilization_is_bounded_when_still_stale(self):
+        self.service._uplinks_needing_reapply = set()
+        with patch.object(
+            self.service,
+            "_gp_gateway_route_mismatch",
+            return_value=True,
+        ) as mismatch, patch.object(
+            self.service,
+            "_list_connected_uplinks",
+            return_value={"eth0": "wired-uuid"},
+        ), patch.object(
+            self.service,
+            "_reapply_connected_uplinks",
+        ) as reapply, patch.object(
+            SERVICE_MODULE.time,
+            "sleep",
+        ) as sleep:
+            stable = self.service._stabilize_gp_gateway_route("192.0.2.10")
+
+        self.assertFalse(stable)
+        reapply.assert_called_once_with()
+        self.assertEqual(
+            mismatch.call_count,
+            1 + len(SERVICE_MODULE.GP_GATEWAY_ROUTE_STABILIZATION_DELAYS),
+        )
+        self.assertEqual(
+            [item.args[0] for item in sleep.call_args_list],
+            [
+                delay
+                for delay in SERVICE_MODULE.GP_GATEWAY_ROUTE_STABILIZATION_DELAYS
+                if delay
+            ],
+        )
+
+    def test_gp_gateway_route_stabilization_skips_reapply_when_already_stable(self):
+        self.service._uplinks_needing_reapply = set()
+        with patch.object(
+            self.service,
+            "_gp_gateway_route_mismatch",
+            return_value=False,
+        ), patch.object(
+            self.service,
+            "_list_connected_uplinks",
+        ) as list_uplinks, patch.object(
+            self.service,
+            "_reapply_connected_uplinks",
+        ) as reapply:
+            stable = self.service._stabilize_gp_gateway_route("192.0.2.10")
+
+        self.assertTrue(stable)
+        list_uplinks.assert_not_called()
+        reapply.assert_not_called()
 
     def test_gp_optimistic_connection_state_defaults_off(self):
         with patch.dict(os.environ, {
@@ -636,6 +1091,30 @@ class NetworkRecoveryTests(unittest.TestCase):
                 ):
                     self.assertEqual(self.service._base_network_ready(), expected)
 
+    def test_base_network_rejects_stale_gp_gateway_route(self):
+        self.service.current_protocol = "gp"
+        with patch.object(
+            self.service,
+            "_route_to_base_network_uses_uplink",
+            return_value=True,
+        ), patch.object(
+            self.service,
+            "_base_dns_operational",
+            return_value=True,
+        ), patch.object(
+            self.service,
+            "_physical_dns_route_restored",
+            return_value=True,
+        ), patch.object(
+            self.service,
+            "_gp_gateway_route_mismatch",
+            return_value=True,
+        ) as mismatch:
+            ready = self.service._base_network_ready()
+
+        self.assertFalse(ready)
+        mismatch.assert_called_once_with("192.0.2.10")
+
     def test_recovery_reloads_once_then_reapplies_connected_uplinks(self):
         with patch.object(
             self.service,
@@ -673,6 +1152,62 @@ class NetworkRecoveryTests(unittest.TestCase):
         self.assertTrue(result)
         reload_dns.assert_not_called()
         reapply.assert_not_called()
+
+    def test_recovery_reapplies_marked_uplinks_before_health_check(self):
+        events = []
+        self.service._uplinks_needing_reapply = {"eth0"}
+        with patch.object(
+            self.service,
+            "_reapply_connected_uplinks",
+            side_effect=lambda: events.append("reapply"),
+        ) as reapply, patch.object(
+            self.service,
+            "_base_network_ready",
+            side_effect=lambda: events.append("health") or True,
+        ), patch.object(
+            self.service,
+            "_reload_networkmanager_dns",
+        ) as reload_dns:
+            result = self.service._recover_base_network_once(reactivate=True)
+
+        self.assertTrue(result)
+        self.assertEqual(events, ["reapply", "health"])
+        reapply.assert_called_once_with()
+        reload_dns.assert_not_called()
+
+    def test_schedule_post_disconnect_recovery_marks_current_uplinks(self):
+        self.service._uplinks_needing_reapply = set()
+        with patch.object(
+            self.service,
+            "_list_connected_uplinks",
+            return_value={
+                "eth0": "wired-uuid",
+                "wlan0": "wifi-uuid",
+            },
+        ), patch.object(
+            SERVICE_MODULE.time,
+            "monotonic",
+            return_value=100.0,
+        ), patch.object(
+            SERVICE_MODULE.GLib,
+            "timeout_add",
+        ) as timeout_add:
+            self.service._schedule_post_disconnect_recovery()
+
+        self.assertEqual(
+            self.service._uplinks_needing_reapply,
+            {"eth0", "wlan0"},
+        )
+        self.assertEqual(self.service._network_recovery_token, 5)
+        self.assertEqual(
+            self.service._network_recovery_deadline,
+            100.0 + SERVICE_MODULE.NETWORK_RECOVERY_TIMEOUT_SECONDS,
+        )
+        timeout_add.assert_called_once()
+        delay, callback, token = timeout_add.call_args.args
+        self.assertEqual(delay, SERVICE_MODULE.NETWORK_RECOVERY_INITIAL_DELAY_MS)
+        self.assertEqual(callback, self.service._post_disconnect_recovery_tick)
+        self.assertEqual(token, 5)
 
     def test_post_disconnect_recovery_cleans_then_stops_as_soon_as_ready(self):
         self.service._network_recovery_token = 9
@@ -728,6 +1263,18 @@ class NetworkRecoveryTests(unittest.TestCase):
         self.assertFalse(result)
         cleanup.assert_not_called()
         recover.assert_not_called()
+
+    def test_new_recovery_timer_retries_while_old_worker_unwinds(self):
+        old_worker = SimpleNamespace(is_alive=lambda: True)
+        self.service._network_recovery_token = 10
+        self.service._network_recovery_thread = old_worker
+
+        with patch.object(SERVICE_MODULE.threading, "Thread") as thread:
+            result = self.service._post_disconnect_recovery_tick(10)
+
+        self.assertTrue(result)
+        thread.assert_not_called()
+        self.assertIs(self.service._network_recovery_thread, old_worker)
 
     def test_cleanup_rechecks_recovery_token_under_lock(self):
         self.service._network_recovery_token = 10

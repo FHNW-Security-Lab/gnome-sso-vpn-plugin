@@ -24,7 +24,7 @@ Install the exact package path printed by the build with APT so its runtime
 dependencies are resolved automatically. For example:
 
 ```bash
-sudo apt install "$PWD/dist/network-manager-ms-sso_2.0.4-1_amd64.deb"
+sudo apt install "$PWD/dist/network-manager-ms-sso_2.0.5-1_amd64.deb"
 ```
 
 ## Build Or Install On Arch
@@ -155,13 +155,19 @@ half-connected NetworkManager state where the UI shows a tunnel but no VPN IP,
 routes, or DNS are usable yet. IP routes and DNS are only emitted after
 OpenConnect has created and validated a real tunnel.
 
-AnyConnect profiles created or saved through this editor use a 180-second
-NetworkManager activation timeout so slow SAML/MFA can finish without a forced
-reconnect. Existing profiles can be updated once with:
+AnyConnect profiles created or saved through this editor use at least a
+360-second NetworkManager activation timeout so slow or first-time SAML/MFA can
+finish without NetworkManager cancelling a connection that is still making
+progress. A larger maximum does not slow successful connections; it only gives
+a delayed login more time to finish. Existing profiles can be updated once
+without opening the editor:
 
 ```bash
-nmcli connection modify "<connection name>" vpn.timeout 180
+nmcli connection modify "<connection name>" vpn.timeout 360
 ```
+
+For example, use `"FHNW"` as the connection name for the FHNW AnyConnect
+profile. GlobalProtect profiles keep their existing timeout behavior.
 
 ## Nix Flake Usage
 

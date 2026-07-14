@@ -7,7 +7,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_NAME="network-manager-ms-sso"
-VERSION="2.0.4"
+VERSION="2.0.5"
+MIN_OPENCONNECT_VERSION="9.12"
 
 BUILD_DEPENDENCIES=(
     dpkg-dev
@@ -79,8 +80,29 @@ check_dependencies() {
     echo ""
 }
 
+check_minimum_package_version() {
+    local pkg="$1"
+    local minimum_version="$2"
+    local installed_version
+
+    installed_version="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+    if [[ -z "$installed_version" ]]; then
+        return
+    fi
+    if dpkg --compare-versions "$installed_version" ge "$minimum_version"; then
+        echo "$pkg version $installed_version satisfies >= $minimum_version."
+        echo ""
+        return
+    fi
+
+    echo "  Too old: $pkg $installed_version (requires >= $minimum_version)"
+    MISSING_DEPENDENCIES+=("$pkg")
+    echo ""
+}
+
 check_dependencies "build" "${BUILD_DEPENDENCIES[@]}"
 check_dependencies "runtime" "${RUNTIME_DEPENDENCIES[@]}"
+check_minimum_package_version "openconnect" "$MIN_OPENCONNECT_VERSION"
 
 if ((${#MISSING_DEPENDENCIES[@]} > 0)); then
     echo ""

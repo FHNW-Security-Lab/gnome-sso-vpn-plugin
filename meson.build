@@ -1,5 +1,5 @@
 project('network-manager-ms-sso', 'c',
-  version: '2.0.4',
+  version: '2.0.5',
   meson_version: '>= 0.56.0',
   license: 'GPL-2.0-or-later',
   default_options: [

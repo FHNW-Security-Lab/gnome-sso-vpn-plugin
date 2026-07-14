@@ -1,5 +1,9 @@
 # Editor plugin library
 
+timeout_policy_sources = files(
+  'nm-ms-sso-timeout-policy.c',
+)
+
 editor_sources = files(
   'nm-ms-sso-editor.c',
 )
@@ -13,7 +17,10 @@ secret_dep = dependency('libsecret-1', version: '>= 0.18')
 
 # Build the shared library
 editor_lib = shared_library('nm-vpn-plugin-ms-sso-editor',
-  sources: editor_sources,
+  sources: [
+    editor_sources,
+    timeout_policy_sources,
+  ],
   dependencies: [
     nm_dep,
     gtk_dep,
@@ -25,3 +32,15 @@ editor_lib = shared_library('nm-vpn-plugin-ms-sso-editor',
   install: true,
   install_dir: join_paths(libdir, 'NetworkManager'),
 )
+
+timeout_policy_test = executable('test-nm-ms-sso-timeout-policy',
+  sources: [
+    'test-nm-ms-sso-timeout-policy.c',
+    timeout_policy_sources,
+  ],
+  dependencies: [
+    glib_dep,
+  ],
+)
+
+test('nm-ms-sso-timeout-policy', timeout_policy_test)

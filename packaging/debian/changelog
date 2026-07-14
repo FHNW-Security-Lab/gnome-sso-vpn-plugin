@@ -1,3 +1,19 @@
+network-manager-ms-sso (2.0.5-1) unstable; urgency=medium
+
+  * Batch Microsoft UI detection to make first-time authentication substantially faster
+  * Adapt across password, passkey, number-match, method-picker, and TOTP variations
+  * Confirm password dispatch and never replay sensitive authentication actions
+  * Repair stalled AnyConnect browser profiles before one isolated clean-session retry
+  * Give AnyConnect profiles a 360-second NetworkManager activation-timeout floor
+  * Pass complete AnyConnect cookies through an anonymous in-memory config
+  * Detect owned AnyConnect tunnels independently of localized console output
+  * Authorize the correlated Microsoft-to-UniBas password transition securely
+  * Preserve GlobalProtect browser, HIP/OS, cookie, timeout, and tunnel behavior
+  * Restore physical routes and DNS after failed, cancelled, or timed-out VPN attempts
+  * Require OpenConnect 9.12 or newer consistently on every package format
+
+ -- MS SSO OpenConnect Maintainers <maintainers@example.com>  Tue, 14 Jul 2026 18:10:00 +0200
+
 network-manager-ms-sso (2.0.4-1) unstable; urgency=medium
 
   * End a completed VPN activation cleanly instead of reconnecting against stale DNS
