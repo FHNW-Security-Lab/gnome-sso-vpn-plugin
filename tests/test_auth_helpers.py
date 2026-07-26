@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 
@@ -13,6 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
 
 from core.auth import (  # noqa: E402
+    GP_INITIAL_MICROSOFT_PASSWORD_NAVIGATION_MAX_SECONDS,
+    GP_INITIAL_MICROSOFT_PASSWORD_OBSERVATION_SECONDS,
     MICROSOFT_CREDENTIAL_LOOKUP_MAX_SECONDS,
     MICROSOFT_CREDENTIAL_LOOKUP_TIMEOUT_SECONDS,
     MICROSOFT_ALTERNATE_MFA_LABELS,
@@ -44,6 +46,9 @@ from core.auth import (  # noqa: E402
     _SensitiveDispatchEvidenceTracker,
     _account_tile_matches_username,
     _action_patterns,
+    _anyconnect_password_dispatch_is_ambiguous,
+    _anyconnect_retained_password_continuation_ready,
+    _anyconnect_retained_password_guard_unchanged,
     _attempt_locator_click,
     _attempt_locator_press,
     _detect_desktop_user,
@@ -59,7 +64,9 @@ from core.auth import (  # noqa: E402
     _extend_processing_grace,
     _get_gp_prelogin,
     _gp_password_client_replacement_ready,
+    _gp_initial_password_observation_required,
     _gp_password_federated_replacement_ready,
+    _gp_password_navigation_hard_cap_reached,
     _gp_password_navigation_replacement_ready,
     _gp_password_replacement_authorization_route,
     _gp_password_stage_origin_policy_valid,
@@ -89,6 +96,7 @@ from core.auth import (  # noqa: E402
     _password_transition_blocks_alternate_dispatch,
     _persistent_profile_pre_sensitive_expired,
     _prefer_totp_for_number_match,
+    _prime_gp_microsoft_federation_render,
     _remaining_timeout_ms,
     _submission_hard_deadline,
     _should_notify_number_match,
@@ -298,15 +306,24 @@ class BrowserUiRecoveryTests(unittest.TestCase):
     def test_anyconnect_discovery_classification_waits_for_full_lookup_window(self):
         self.assertEqual(
             _password_submission_classification_delay("anyconnect", False),
-            MICROSOFT_CREDENTIAL_LOOKUP_TIMEOUT_SECONDS,
+            MICROSOFT_CREDENTIAL_LOOKUP_MAX_SECONDS,
+        )
+        self.assertEqual(
+            _password_submission_classification_deadline(
+                "anyconnect",
+                False,
+                100.0,
+                400.0,
+            ),
+            100.0 + MICROSOFT_CREDENTIAL_LOOKUP_MAX_SECONDS,
         )
         self.assertTrue(
             _password_discovery_classification_deferred(
                 "anyconnect",
                 False,
                 "password-unknown",
-                108.9,
-                115.0,
+                129.9,
+                130.0,
             )
         )
         self.assertFalse(
@@ -314,10 +331,486 @@ class BrowserUiRecoveryTests(unittest.TestCase):
                 "anyconnect",
                 False,
                 "password-unknown",
-                115.0,
-                115.0,
+                130.0,
+                130.0,
             )
         )
+
+    def test_gp_initial_password_observation_is_bounded_and_gp_only(self):
+        common = {
+            "protocol": "gp",
+            "discovery_completed": False,
+            "recovery_attempts": 0,
+            "password_action_attempts": 0,
+            "password_dispatched": False,
+            "observation_started": True,
+            "password_stage_authorized": True,
+            "password_control_visible": True,
+            "credential_error_visible": False,
+            "elapsed_seconds": (
+                GP_INITIAL_MICROSOFT_PASSWORD_OBSERVATION_SECONDS - 0.1
+            ),
+            "navigation_pending": False,
+        }
+        self.assertTrue(
+            _gp_initial_password_observation_required(**common)
+        )
+        self.assertFalse(
+            _gp_initial_password_observation_required(
+                **(
+                    common
+                    | {
+                        "elapsed_seconds": (
+                            GP_INITIAL_MICROSOFT_PASSWORD_OBSERVATION_SECONDS
+                        )
+                    }
+                )
+            )
+        )
+        self.assertTrue(
+            _gp_initial_password_observation_required(
+                **(
+                    common
+                    | {
+                        "elapsed_seconds": (
+                            GP_INITIAL_MICROSOFT_PASSWORD_OBSERVATION_SECONDS
+                        ),
+                        "navigation_pending": True,
+                    }
+                )
+            )
+        )
+        self.assertTrue(
+            _gp_initial_password_observation_required(
+                **(
+                    common
+                    | {
+                        "elapsed_seconds": (
+                            GP_INITIAL_MICROSOFT_PASSWORD_NAVIGATION_MAX_SECONDS
+                            - 0.1
+                        ),
+                        "navigation_pending": True,
+                    }
+                )
+            )
+        )
+        self.assertFalse(
+            _gp_initial_password_observation_required(
+                **(
+                    common
+                    | {
+                        "elapsed_seconds": (
+                            GP_INITIAL_MICROSOFT_PASSWORD_NAVIGATION_MAX_SECONDS
+                        ),
+                        "navigation_pending": True,
+                    }
+                )
+            )
+        )
+        self.assertTrue(
+            _gp_initial_password_observation_required(
+                **(
+                    common
+                    | {
+                        "password_stage_authorized": False,
+                        "password_control_visible": False,
+                        "elapsed_seconds": 20.0,
+                        "navigation_pending": True,
+                    }
+                )
+            )
+        )
+        for name, override in {
+            "fhnw-unchanged": {"protocol": "anyconnect"},
+            "discovery-complete": {"discovery_completed": True},
+            "after-recovery": {"recovery_attempts": 1},
+            "after-action": {"password_action_attempts": 1},
+            "already-dispatched": {"password_dispatched": True},
+            "not-observed": {"observation_started": False},
+            "unauthorized-stage": {"password_stage_authorized": False},
+            "no-password-control": {"password_control_visible": False},
+            "credential-error": {"credential_error_visible": True},
+        }.items():
+            with self.subTest(name=name):
+                self.assertFalse(
+                    _gp_initial_password_observation_required(
+                        **(common | override)
+                    )
+                )
+
+    def test_gp_password_navigation_hard_cap_is_exact_and_gp_only(self):
+        common = {
+            "protocol": "gp",
+            "discovery_completed": False,
+            "password_action_attempts": 0,
+            "password_dispatched": False,
+            "navigation_pending": True,
+        }
+        self.assertFalse(
+            _gp_password_navigation_hard_cap_reached(
+                **common,
+                elapsed_seconds=(
+                    GP_INITIAL_MICROSOFT_PASSWORD_NAVIGATION_MAX_SECONDS
+                    - 0.001
+                ),
+            )
+        )
+        self.assertTrue(
+            _gp_password_navigation_hard_cap_reached(
+                **common,
+                elapsed_seconds=(
+                    GP_INITIAL_MICROSOFT_PASSWORD_NAVIGATION_MAX_SECONDS
+                ),
+            )
+        )
+        for name, override in {
+            "fhnw": {"protocol": "anyconnect"},
+            "discovery-complete": {"discovery_completed": True},
+            "after-action": {"password_action_attempts": 1},
+            "already-dispatched": {"password_dispatched": True},
+            "settled": {"navigation_pending": False},
+        }.items():
+            with self.subTest(name=name):
+                self.assertFalse(
+                    _gp_password_navigation_hard_cap_reached(
+                        **(common | override),
+                        elapsed_seconds=60.0,
+                    )
+                )
+
+    def test_gp_render_prime_is_in_memory_and_protocol_scoped(self):
+        page = Mock()
+        self.assertTrue(
+            _prime_gp_microsoft_federation_render(
+                page,
+                "gp",
+                "login.microsoftonline.com",
+            )
+        )
+        page.evaluate.assert_called_once()
+        page.screenshot.assert_called_once_with(
+            type="png",
+            clip={"x": 0, "y": 0, "width": 1, "height": 1},
+            timeout=2000,
+        )
+        page.reset_mock()
+        self.assertFalse(
+            _prime_gp_microsoft_federation_render(
+                page,
+                "anyconnect",
+                "login.microsoftonline.com",
+            )
+        )
+        page.screenshot.assert_not_called()
+
+    def test_gp_render_prime_failure_is_nonfatal(self):
+        page = Mock()
+        page.screenshot.side_effect = RuntimeError("compositor unavailable")
+        self.assertFalse(
+            _prime_gp_microsoft_federation_render(
+                page,
+                "gp",
+                "login.microsoftonline.com",
+            )
+        )
+
+    def test_gp_initial_observation_gates_recovery_and_password_action(self):
+        auth_source = (
+            REPO_ROOT / "src" / "python" / "core" / "auth.py"
+        ).read_text(encoding="utf-8")
+        predicate = auth_source.index(
+            "                gp_initial_password_observation_pending = ("
+        )
+        recovery_gate = auth_source.index(
+            "                intentional_transition_pending = bool(",
+            predicate,
+        )
+        password_step = auth_source.index(
+            "                # Step 4: password field",
+            recovery_gate,
+        )
+        self.assertIn(
+            "or gp_initial_password_observation_pending",
+            auth_source[recovery_gate:password_step],
+        )
+        self.assertIn(
+            "if gp_initial_password_observation_pending:",
+            auth_source[password_step:],
+        )
+        self.assertIn(
+            "if gp_password_navigation_pending:",
+            auth_source[password_step:],
+        )
+        hard_cap = auth_source.index(
+            "                if gp_password_navigation_hard_cap:",
+            predicate,
+        )
+        self.assertLess(hard_cap, recovery_gate)
+        self.assertIn(
+            "_recover_stale_browser_ui(now, force=True)",
+            auth_source[hard_cap:recovery_gate],
+        )
+        self.assertIn(
+            "gp_initial_password_observation_started_at = None",
+            auth_source[
+                auth_source.index("def _recover_stale_browser_ui"):predicate
+            ],
+        )
+        self.assertIn(
+            "gp_password_stage_authorization",
+            auth_source[password_step:],
+        )
+        self.assertIn(
+            "_validate_gp_client_password_stage(",
+            auth_source[password_step:],
+        )
+
+    def test_anyconnect_retained_password_continuation_matches_live_hydration(self):
+        common = {
+            "protocol": "anyconnect",
+            "submission_kind": "password-unknown",
+            "attempts": 1,
+            "elapsed_seconds": MICROSOFT_PASSWORD_DISPATCH_CONFIRM_SECONDS,
+            "lookup_observed": False,
+            "dispatch_observed": True,
+            "safe_navigation_observed": False,
+            "credential_tainted": False,
+            "document_replaced": True,
+            "main_navigation_request_observed": False,
+            "write_request_observed": True,
+            "unsafe_write_request_observed": False,
+            "navigation_pending_at_baseline": False,
+            "navigation_pending_now": False,
+            "strong_owning_form": True,
+            "strong_password_input": True,
+            "current_identity": "document:replacement",
+            "submitted_identity": "document:original",
+            "value_retained": True,
+            "original_control_origin": "https://login.microsoftonline.com",
+            "original_top_origin": "https://login.microsoftonline.com",
+            "original_form_action_origin": "https://login.microsoftonline.com",
+            "original_form_signature": "microsoft-post-form",
+            "original_form_method": "post",
+            "current_control_origin": "https://login.microsoftonline.com",
+            "current_top_origin": "https://login.microsoftonline.com",
+            "current_form_action_origin": "https://login.microsoftonline.com",
+            "current_form_signature": "microsoft-post-form",
+            "current_form_method": "post",
+            "credential_error_visible": False,
+        }
+        self.assertTrue(
+            _anyconnect_retained_password_continuation_ready(**common)
+        )
+
+    def test_anyconnect_retained_password_continuation_fails_closed(self):
+        common = {
+            "protocol": "anyconnect",
+            "submission_kind": "password-unknown",
+            "attempts": 1,
+            "elapsed_seconds": MICROSOFT_PASSWORD_DISPATCH_CONFIRM_SECONDS,
+            "lookup_observed": False,
+            "dispatch_observed": True,
+            "safe_navigation_observed": False,
+            "credential_tainted": False,
+            "document_replaced": True,
+            "main_navigation_request_observed": False,
+            "write_request_observed": True,
+            "unsafe_write_request_observed": False,
+            "navigation_pending_at_baseline": False,
+            "navigation_pending_now": False,
+            "strong_owning_form": True,
+            "strong_password_input": True,
+            "current_identity": "document:replacement",
+            "submitted_identity": "document:original",
+            "value_retained": True,
+            "original_control_origin": "https://login.microsoftonline.com",
+            "original_top_origin": "https://login.microsoftonline.com",
+            "original_form_action_origin": "https://login.microsoftonline.com",
+            "original_form_signature": "microsoft-post-form",
+            "original_form_method": "post",
+            "current_control_origin": "https://login.microsoftonline.com",
+            "current_top_origin": "https://login.microsoftonline.com",
+            "current_form_action_origin": "https://login.microsoftonline.com",
+            "current_form_signature": "microsoft-post-form",
+            "current_form_method": "post",
+            "credential_error_visible": False,
+        }
+        cases = {
+            "globalprotect-unchanged": {"protocol": "gp"},
+            "wrong-kind": {"submission_kind": "password"},
+            "second-gesture-used": {"attempts": 2},
+            "too-early": {
+                "elapsed_seconds": (
+                    MICROSOFT_PASSWORD_DISPATCH_CONFIRM_SECONDS - 0.01
+                )
+            },
+            "lookup-started": {"lookup_observed": True},
+            "no-document-event": {"dispatch_observed": False},
+            "safe-navigation": {"safe_navigation_observed": True},
+            "credential-request": {"credential_tainted": True},
+            "same-document": {"document_replaced": False},
+            "navigation-request": {
+                "main_navigation_request_observed": True
+            },
+            "unsafe-write": {"unsafe_write_request_observed": True},
+            "pending-at-baseline": {
+                "navigation_pending_at_baseline": True
+            },
+            "pending-now": {"navigation_pending_now": True},
+            "original-control-origin": {
+                "original_control_origin": "https://example.test"
+            },
+            "original-top-origin": {
+                "original_top_origin": "https://example.test"
+            },
+            "original-action-origin": {
+                "original_form_action_origin": "https://example.test"
+            },
+            "original-method": {"original_form_method": "get"},
+            "current-control-origin": {
+                "current_control_origin": "https://example.test"
+            },
+            "current-top-origin": {
+                "current_top_origin": "https://example.test"
+            },
+            "current-action-origin": {
+                "current_form_action_origin": "https://example.test"
+            },
+            "current-method": {"current_form_method": "get"},
+            "weak-form": {"strong_owning_form": False},
+            "weak-input": {"strong_password_input": False},
+            "missing-current": {"current_identity": None},
+            "missing-submitted": {"submitted_identity": None},
+            "fallback-current": {"current_identity": "fallback:current"},
+            "fallback-submitted": {
+                "submitted_identity": "fallback:submitted"
+            },
+            "same-control": {"current_identity": "document:original"},
+            "empty-value": {"value_retained": False},
+            "form-mismatch": {
+                "current_form_signature": "different-form"
+            },
+            "credential-error": {"credential_error_visible": True},
+        }
+        for name, override in cases.items():
+            with self.subTest(name=name):
+                self.assertFalse(
+                    _anyconnect_retained_password_continuation_ready(
+                        **(common | override)
+                    )
+                )
+
+    def test_retained_password_path_reuses_value_and_keeps_one_shot_guard(self):
+        auth_source = (
+            REPO_ROOT / "src" / "python" / "core" / "auth.py"
+        ).read_text(encoding="utf-8")
+        start = auth_source.index(
+            "                    elif anyconnect_retained_password_continuation:"
+        )
+        end = auth_source.index(
+            "                    elif (\n"
+            "                        password_discovery_classification_deferred",
+            start,
+        )
+        continuation = auth_source[start:end]
+        self.assertEqual(continuation.count("_submit_owned_form("), 1)
+        self.assertIn("pre_sensitive_action_guard=", continuation)
+        self.assertIn(
+            "_validate_anyconnect_retained_password_stage(",
+            continuation,
+        )
+        self.assertIn("password_lookup_generation_snapshot", continuation)
+        self.assertIn("password_lookup_pending_count_snapshot", continuation)
+        self.assertIn("allow_known_ids=False", continuation)
+        self.assertIn("password_action_attempts = 2", continuation)
+        self.assertIn('"password-unknown"', continuation)
+        self.assertNotIn("_enter_password_value(", continuation)
+        self.assertNotIn("generate_totp(", continuation)
+
+    def test_retained_password_late_guard_revalidates_async_evidence(self):
+        common = {
+            "expected_lookup_generation": 4,
+            "expected_lookup_pending_count": 0,
+            "expected_safe_navigation_generation": 7,
+            "expected_unsafe_write_generation": 2,
+            "current_lookup_generation": 4,
+            "current_lookup_pending_count": 0,
+            "current_safe_navigation_generation": 7,
+            "current_unsafe_write_generation": 2,
+        }
+        self.assertTrue(
+            _anyconnect_retained_password_guard_unchanged(**common)
+        )
+        cases = {
+            "lookup-started": {"current_lookup_generation": 5},
+            "lookup-pending": {"current_lookup_pending_count": 1},
+            "invalid-snapshot": {"expected_lookup_pending_count": 1},
+            "safe-navigation-completed": {
+                "current_safe_navigation_generation": 8
+            },
+            "unsafe-write-started": {
+                "current_unsafe_write_generation": 3
+            },
+        }
+        for name, override in cases.items():
+            with self.subTest(name=name):
+                self.assertFalse(
+                    _anyconnect_retained_password_guard_unchanged(
+                        **(common | override)
+                    )
+                )
+
+    def test_anyconnect_hydration_dispatch_expires_as_ambiguous(self):
+        common = {
+            "protocol": "anyconnect",
+            "submission_kind": "password-unknown",
+            "dispatch_observed": True,
+            "credential_tainted": False,
+            "unsafe_write_request_observed": False,
+            "main_navigation_request_observed": False,
+        }
+        self.assertTrue(
+            _anyconnect_password_dispatch_is_ambiguous(**common)
+        )
+        cases = {
+            "gp-semantics-unchanged": {"protocol": "gp"},
+            "known-password-stage": {"submission_kind": "password"},
+            "no-dispatch": {"dispatch_observed": False},
+            "credential-taint": {"credential_tainted": True},
+            "unsafe-write": {"unsafe_write_request_observed": True},
+            "main-navigation": {
+                "main_navigation_request_observed": True
+            },
+        }
+        for name, override in cases.items():
+            with self.subTest(name=name):
+                self.assertFalse(
+                    _anyconnect_password_dispatch_is_ambiguous(
+                        **(common | override)
+                    )
+                )
+
+    def test_ambiguous_dispatch_branch_precedes_generic_confirmation(self):
+        auth_source = (
+            REPO_ROOT / "src" / "python" / "core" / "auth.py"
+        ).read_text(encoding="utf-8")
+        deferred = auth_source.index(
+            "                    elif (\n"
+            "                        password_discovery_classification_deferred"
+        )
+        ambiguous = auth_source.index(
+            "                    elif _anyconnect_password_dispatch_is_ambiguous(",
+            deferred,
+        )
+        confirmed = auth_source.index(
+            "                    elif password_dispatch_observed:",
+            ambiguous,
+        )
+        self.assertLess(deferred, ambiguous)
+        self.assertLess(ambiguous, confirmed)
+        ambiguous_branch = auth_source[ambiguous:confirmed]
+        self.assertIn('"password-dispatch-uncertain"', ambiguous_branch)
+        self.assertNotIn('"password-dispatch-confirmed"', ambiguous_branch)
 
     def test_discovery_classification_supports_gp_without_delaying_stage_two(self):
         self.assertTrue(_password_discovery_supported("anyconnect"))

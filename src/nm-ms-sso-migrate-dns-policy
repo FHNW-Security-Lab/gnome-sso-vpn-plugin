@@ -1,0 +1,53 @@
+#!/bin/sh
+# Upgrade saved MS SSO VPN profiles before their next activation.
+
+set -u
+
+if ! command -v nmcli >/dev/null 2>&1; then
+    exit 0
+fi
+
+connections="$(
+    nmcli --terse --escape no --fields UUID,TYPE connection show 2>/dev/null
+)" || exit 0
+
+printf '%s\n' "$connections" | while IFS=: read -r connection_uuid connection_type; do
+    [ "$connection_type" = "vpn" ] || continue
+    [ -n "$connection_uuid" ] || continue
+
+    service_type="$(
+        nmcli --get-values vpn.service-type connection show \
+            uuid "$connection_uuid" 2>/dev/null | head -n 1
+    )"
+    [ "$service_type" = "org.freedesktop.NetworkManager.ms-sso" ] || continue
+
+    search_domains="$(
+        nmcli --get-values ipv4.dns-search connection show \
+            uuid "$connection_uuid" 2>/dev/null
+    )"
+    has_root_route=0
+    if printf '%s\n' "$search_domains" \
+        | tr ',;' '\n\n' \
+        | awk '{ for (i = 1; i <= NF; i++) if ($i == "~.") found = 1 }
+               END { exit(found ? 0 : 1) }'; then
+        has_root_route=1
+    fi
+
+    set -- connection modify uuid "$connection_uuid" \
+        ipv4.dns-priority -100 \
+        ipv4.ignore-auto-dns no \
+        ipv6.dns-priority -100
+    if [ "$has_root_route" -eq 0 ]; then
+        set -- "$@" +ipv4.dns-search '~.'
+    fi
+
+    if nmcli "$@" >/dev/null 2>&1; then
+        printf 'Updated exclusive DNS policy for MS SSO VPN %s\n' \
+            "$connection_uuid"
+    else
+        printf 'warning: could not update DNS policy for MS SSO VPN %s\n' \
+            "$connection_uuid" >&2
+    fi
+done
+
+exit 0

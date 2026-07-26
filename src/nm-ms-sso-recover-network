@@ -26,6 +26,19 @@ log_message() {
     logger -t nm-ms-sso-recovery -- "$1" 2>/dev/null || true
 }
 
+# Serialize teardown with VPN activation so a queued vpn-down event cannot
+# consume firewall or route ownership written by a newer connection.
+recovery_lock="/run/network-manager-ms-sso/recovery.lock"
+umask 077
+if ! exec 9>>"$recovery_lock"; then
+    log_message "could not open recovery lock; preserving MS SSO network state"
+    exit 0
+fi
+if ! flock -x 9; then
+    log_message "could not acquire recovery lock; preserving MS SSO network state"
+    exit 0
+fi
+
 ms_sso_vpn_active() {
     active_connections="$(
         run_bounded 5 nmcli --terse --fields UUID,TYPE \
@@ -180,7 +193,7 @@ if [ "$preserve_state" -eq 0 ]; then
     rm -f -- "$state_file"
 fi
 
-# Remove an opt-in crash-safe IPv6 block only when this plugin's marker exists.
+# Remove a crash-safe IPv6 block only when this plugin's fixed marker exists.
 ipv6_marker="/run/network-manager-ms-sso/ipv6-leak-route"
 if [ -e "$ipv6_marker" ]; then
     abort_if_new_ms_sso_active
@@ -188,21 +201,104 @@ if [ -e "$ipv6_marker" ]; then
         sed -n 's/^connection_uuid=\([0-9A-Fa-f-][0-9A-Fa-f-]*\)$/\1/p' \
             "$ipv6_marker" 2>/dev/null | head -n 1
     )"
+    marker_version="$(
+        sed -n 's/^version=\([0-9][0-9]*\)$/\1/p' \
+            "$ipv6_marker" 2>/dev/null | head -n 1
+    )"
+    marker_metric="$(
+        sed -n 's/^metric=\([0-9][0-9]*\)$/\1/p' \
+            "$ipv6_marker" 2>/dev/null | head -n 1
+    )"
+    marker_protocol="$(
+        sed -n 's/^protocol=\([0-9][0-9]*\)$/\1/p' \
+            "$ipv6_marker" 2>/dev/null | head -n 1
+    )"
     if [ -z "$marker_uuid" ] || [ "$marker_uuid" = "$connection_uuid" ]; then
-        run_bounded 5 ip -6 route del unreachable ::/0 metric 42760 proto 186 \
-            >/dev/null 2>&1 || true
-        if owned_ipv6_route="$(
-            run_bounded 5 ip -6 route show table all type unreachable ::/0 \
-                metric 42760 proto 186 2>/dev/null
-        )"; then
-            if [ -z "$owned_ipv6_route" ]; then
-                rm -f -- "$ipv6_marker"
+        if [ "$marker_version" = "2" ] \
+            && [ "$marker_metric" = "1" ] \
+            && [ "$marker_protocol" = "99" ]; then
+            run_bounded 5 ip -6 route del unreachable ::/0 metric 1 proto 99 \
+                >/dev/null 2>&1 || true
+            route_metric=1
+            route_protocol=99
+        elif [ -z "$marker_version" ] \
+            && [ -z "$marker_metric" ] \
+            && [ -z "$marker_protocol" ]; then
+            # v2.0.4/v2.0.5 marker and route signature.
+            run_bounded 5 ip -6 route del unreachable ::/0 metric 42760 proto 186 \
+                >/dev/null 2>&1 || true
+            route_metric=42760
+            route_protocol=186
+        else
+            log_message "invalid IPv6 leak-route marker; refusing global route mutation"
+            route_metric=""
+            route_protocol=""
+        fi
+        if [ -n "$route_metric" ]; then
+            if owned_ipv6_route="$(
+                run_bounded 5 ip -6 route show table all type unreachable ::/0 \
+                    metric "$route_metric" proto "$route_protocol" 2>/dev/null
+            )"; then
+                if [ -z "$owned_ipv6_route" ]; then
+                    rm -f -- "$ipv6_marker"
+                else
+                    log_message "owned IPv6 leak route still exists; preserving marker"
+                fi
             else
-                log_message "owned IPv6 leak route still exists; preserving marker"
+                log_message "could not verify IPv6 leak route removal; preserving marker"
+            fi
+        fi
+    fi
+fi
+
+# Remove the owned nftables IPv6 kill switch only when the marker has exactly
+# the expected four-line format and belongs to this (or an unscoped) profile.
+ipv6_firewall_marker="/run/network-manager-ms-sso/ipv6-firewall"
+if [ -e "$ipv6_firewall_marker" ]; then
+    abort_if_new_ms_sso_active
+    if firewall_marker_uuid="$(
+        awk '
+            BEGIN { valid = 1 }
+            NR == 1 { valid = valid && ($0 == "version=1") }
+            NR == 2 {
+                prefix = "connection_uuid="
+                valid = valid && (index($0, prefix) == 1)
+                marker_uuid = substr($0, length(prefix) + 1)
+            }
+            NR == 3 { valid = valid && ($0 == "family=inet") }
+            NR == 4 { valid = valid && ($0 == "table=nm_ms_sso_ipv6") }
+            NR > 4 { valid = 0 }
+            END {
+                if (NR != 4 || !valid) {
+                    exit 1
+                }
+                print marker_uuid
+            }
+        ' "$ipv6_firewall_marker" 2>/dev/null
+    )"; then
+        if [ -z "$firewall_marker_uuid" ] \
+            || [ "$firewall_marker_uuid" = "$connection_uuid" ]; then
+            abort_if_new_ms_sso_active
+            run_bounded 5 nft delete table inet nm_ms_sso_ipv6 \
+                >/dev/null 2>&1 || true
+            abort_if_new_ms_sso_active
+            if nft_tables="$(
+                run_bounded 5 nft list tables 2>/dev/null
+            )"; then
+                if printf '%s\n' "$nft_tables" \
+                    | grep -Eq '^[[:space:]]*table[[:space:]]+inet[[:space:]]+nm_ms_sso_ipv6([[:space:]]|$)'; then
+                    log_message "owned IPv6 firewall table still exists; preserving marker"
+                else
+                    rm -f -- "$ipv6_firewall_marker"
+                fi
+            else
+                log_message "could not verify IPv6 firewall removal; preserving marker"
             fi
         else
-            log_message "could not verify IPv6 leak route removal; preserving marker"
+            log_message "IPv6 firewall belongs to another VPN activation; preserving marker"
         fi
+    else
+        log_message "invalid IPv6 firewall marker; refusing nftables mutation"
     fi
 fi
 

@@ -24,7 +24,7 @@ Install the exact package path printed by the build with APT so its runtime
 dependencies are resolved automatically. For example:
 
 ```bash
-sudo apt install "$PWD/dist/network-manager-ms-sso_2.0.5-1_amd64.deb"
+sudo apt install "$PWD/dist/network-manager-ms-sso_2.0.6-1_amd64.deb"
 ```
 
 ## Build Or Install On Arch
@@ -138,9 +138,16 @@ nmcli connection modify "<connection name>" +vpn.data "mfa-preference=totp"
 
 Use `auto`, `push`, or `totp`; `auto` is recommended.
 
-GlobalProtect emits only the first VPN DNS server by default. This avoids slow
-failover behavior when a secondary VPN DNS server is reachable but degraded.
-Override it if your VPN needs more DNS servers:
+Both protocols use leak-safe DNS by default. Before reporting a connection as
+active, the plugin verifies that each selected resolver is routed through and
+answers on the exact tunnel interface. It then installs the route-only DNS root
+(`~.`), gives the VPN an exclusive negative NetworkManager DNS priority, and
+refuses the connection instead of falling back to a physical-link resolver.
+UniBas uses its two known tunnel resolvers when GlobalProtect does not push DNS;
+FHNW keeps the DNS servers pushed by AnyConnect.
+
+Both UniBas resolvers are retained by default for reliable failover. Override
+the maximum for a gateway only when required:
 
 ```bash
 nmcli connection modify "<connection name>" +vpn.data "dns-server-limit=2"
@@ -149,6 +156,30 @@ nmcli connection modify "<connection name>" +vpn.data "dns-server-limit=2"
 AnyConnect keeps all pushed VPN DNS servers by default. The plugin waits for a
 real tunnel interface with IPv4 configuration before publishing the VPN routes
 and DNS settings to NetworkManager.
+
+An institution-specific resolver list can be configured as VPN data. Every
+address is still route-checked and queried through the tunnel before use:
+
+```bash
+nmcli connection modify "<connection name>" +vpn.data "dns-servers=10.0.0.53,10.0.0.54"
+```
+
+Because both supported VPNs are IPv4-only, direct public IPv6 is blocked while
+either is active. An owned nftables output policy blocks physical IPv6 even when
+a more-specific route or alternate policy-routing table exists; only loopback,
+the owned VPN tunnel, and kernel-confirmed WireGuard interfaces remain allowed.
+The unreachable IPv6 default remains as defense in depth, so WireGuard-specific
+routes still win by longest-prefix routing. Standard DNS and DNS-over-TLS egress
+(TCP/UDP ports 53 and 853) is also restricted to loopback and the owned VPN
+tunnel, preventing a physical or WireGuard resolver fallback. Install/upgrade
+hooks migrate existing profiles to exclusive DNS priority before their next
+activation. All owned firewall, route, and resolver state is removed on
+disconnect and by the crash-recovery dispatcher.
+
+Applications explicitly configured to send DNS inside ordinary HTTPS (custom
+DoH) are outside the operating-system resolver path and cannot be separated
+from normal split-tunnel HTTPS traffic. Disable custom application DoH when the
+institutional tunnel resolver must be authoritative.
 
 AnyConnect does not emit a pre-tunnel "started" state by default. This avoids a
 half-connected NetworkManager state where the UI shows a tunnel but no VPN IP,

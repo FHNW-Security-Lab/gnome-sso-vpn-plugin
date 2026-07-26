@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_NAME="network-manager-ms-sso"
-VERSION="2.0.5"
+VERSION="2.0.6"
 MIN_OPENCONNECT_VERSION="9.12"
 
 BUILD_DEPENDENCIES=(
@@ -26,6 +26,7 @@ RUNTIME_DEPENDENCIES=(
     network-manager
     openconnect
     iproute2
+    nftables
     python3
     python3-pip
     python3-gi

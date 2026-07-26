@@ -6,6 +6,7 @@ let
     export PATH=${lib.makeBinPath [
       pkgs.networkmanager
       pkgs.iproute2
+      pkgs.nftables
       pkgs.systemd
       pkgs.openresolv
       pkgs.glibc.bin
@@ -51,7 +52,7 @@ in
     autoCleanupDns = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Clean up DNS entries on VPN disconnect.";
+      description = "Deprecated compatibility option; secure teardown is always enabled.";
     };
   };
 
@@ -74,10 +75,29 @@ in
         lib.optional cfg.autoKillStale
           "-${stopStaleScript}";
 
-      networking.networkmanager.dispatcherScripts = lib.optional cfg.autoCleanupDns {
-        source = cleanupScript;
-        type = "basic";
+      # NetworkManager snapshots DNS policy when an activation begins. Migrate
+      # persistent profiles after NM starts so the first VPN activation already
+      # has exclusive negative priority on non-resolved backends as well.
+      systemd.services.nm-ms-sso-dns-policy = {
+        description = "Migrate MS SSO VPN profiles to exclusive DNS";
+        wantedBy = [ "multi-user.target" ];
+        wants = [ "NetworkManager.service" ];
+        after = [ "NetworkManager.service" ];
+        path = [ pkgs.networkmanager pkgs.gawk pkgs.coreutils ];
+        serviceConfig.Type = "oneshot";
+        script = ''
+          ${pkgs.networkmanager-ms-sso}/libexec/nm-ms-sso-migrate-dns-policy
+        '';
       };
+
+      # This dispatcher also removes the crash-safe IPv6 kill route. Security
+      # teardown must not be disabled by the legacy DNS-cleanup option.
+      networking.networkmanager.dispatcherScripts = [
+        {
+          source = cleanupScript;
+          type = "basic";
+        }
+      ];
 
       systemd.tmpfiles.rules = pkgs.networkmanager-ms-sso.networkManagerTmpfilesRules or [ ];
     })

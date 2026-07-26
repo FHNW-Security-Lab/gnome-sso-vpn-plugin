@@ -1,3 +1,16 @@
+network-manager-ms-sso (2.0.6-1) unstable; urgency=medium
+
+  * Route every DNS query through validated tunnel-bound resolvers
+  * Wait for vpnc-script routing to converge before validating tunnel DNS
+  * Add UniBas DNS fallback servers and retain FHNW pushed DNS dynamically
+  * Block direct public IPv6 by default while preserving specific WireGuard routes
+  * Fail VPN activation closed when DNS or IPv6 protection cannot be enforced
+  * Restore owned DNS and IPv6 state safely after disconnects and crashes
+  * Apply exclusive NetworkManager DNS priority on existing and edited profiles
+  * Align Debian, Arch Linux, and NixOS security teardown dependencies
+
+ -- MS SSO OpenConnect Maintainers <maintainers@example.com>  Tue, 14 Jul 2026 21:30:00 +0200
+
 network-manager-ms-sso (2.0.5-1) unstable; urgency=medium
 
   * Batch Microsoft UI detection to make first-time authentication substantially faster

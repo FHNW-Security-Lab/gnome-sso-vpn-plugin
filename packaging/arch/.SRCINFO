@@ -1,6 +1,6 @@
 pkgbase = networkmanager-ms-sso-git
 	pkgdesc = NetworkManager VPN plugin for MS SSO OpenConnect
-	pkgver = 2.0.5.r79.ga4a18a5
+	pkgver = 2.0.6.r80.g8a871e5
 	pkgrel = 1
 	url = https://github.com/FHNW-Security-Lab/gnome-sso-vpn-plugin
 	install = networkmanager-ms-sso-git.install
@@ -21,6 +21,8 @@ pkgbase = networkmanager-ms-sso-git
 	depends = python-keyring
 	depends = python-platformdirs
 	depends = python-playwright
+	depends = iproute2
+	depends = nftables
 	depends = procps-ng
 	depends = util-linux
 	optdepends = gnome-control-center: configure the VPN connection from GNOME Settings

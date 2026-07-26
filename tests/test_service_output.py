@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import errno
+import json
 import logging.handlers
 import os
 import subprocess
@@ -8,9 +10,10 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +71,8 @@ class OpenConnectOutputTests(unittest.TestCase):
     def setUp(self):
         self.service = object.__new__(SERVICE_MODULE.VPNPluginService)
         self.service.vpn_dns_servers = []
+        self.service.configured_dns_servers = []
+        self.service.dns_leak_protection_ready = False
         self.service.vpn_domains = []
         self.service.vpn_split_excludes = []
         self.service.vpn_split_includes = []
@@ -137,8 +142,11 @@ class OpenConnectOutputTests(unittest.TestCase):
         self.service.current_gateway = "vpn.example.edu"
         self.service.current_gateway_ip = "192.0.2.10"
         self.service.current_dns_server_limit = 1
+        self.service.vpn_dns_servers = ["10.0.0.53"]
+        self.service.dns_leak_protection_ready = True
         self.service._get_tun_ipv4_config = lambda _device: ("10.3.0.38", 32)
-        self.service._apply_ipv6_leak_protection = lambda: None
+        self.service._apply_ipv6_leak_protection = lambda: True
+        self.service._apply_full_dns_resolved = lambda *_args: True
         no_resolved_dns = SimpleNamespace(
             returncode=1,
             stdout="",
@@ -182,6 +190,11 @@ class OpenConnectOutputTests(unittest.TestCase):
                 self.assertTrue(bool(ip4_config["never-default"]))
                 self.assertNotIn("addresses", ip4_config)
                 self.assertNotIn("routes", ip4_config)
+                self.assertEqual(list(ip4_config["domains"]).count("~."), 1)
+                self.assertEqual(
+                    [int(value) for value in ip4_config["dns"]],
+                    [self.service._ipv4_to_nm_uint32("10.0.0.53")],
+                )
                 self.assertEqual(
                     states,
                     [SERVICE_MODULE.NM_VPN_SERVICE_STATE_STARTED],
@@ -558,6 +571,145 @@ class OpenConnectOutputTests(unittest.TestCase):
 
         auth.assert_called_once()
 
+    def test_failed_attempt_cleanup_precedes_fresh_anyconnect_auth_retries(self):
+        """A failed attempt's DNS firewall must not reach the next SAML flow."""
+        settings = {
+            "connection": {"uuid": "test-anyconnect-uuid"},
+            "vpn": {
+                "data": {
+                    "gateway": "vpn.example.edu",
+                    "protocol": "anyconnect",
+                    "username": "test-user",
+                    "auto-reconnect": "false",
+                },
+                "secrets": {
+                    "password": "test-password",
+                    "totp-secret": "TESTTOTP",
+                },
+            },
+            "ipv4": {"dns-priority": -100, "dns-search": ["~."]},
+            "ipv6": {"dns-priority": -100},
+        }
+        cached_cookies = {
+            "webvpn": "cached",
+            "webvpnc": "cached-config",
+        }
+        events = []
+        dns_firewall = {"active": False}
+        fresh_auth_count = 0
+
+        self.service.auth_in_progress = False
+        self.service.auth_generation = None
+        self.service.saml_start_time = None
+        self.service._auth_started_guard_triggered = False
+
+        def ensure_dns_profile_policy():
+            self.service.dns_profile_policy_ready = True
+            return True
+
+        def attempt_vpn(_gateway, _protocol, cookies, _username, **_kwargs):
+            dns_firewall["active"] = True
+            events.append(f"attempt:{cookies['webvpn']}")
+            if cookies["webvpn"] == "cached":
+                return False, "Cookie rejected by server", 0
+            return False, "VPN transport unavailable", 0
+
+        def cleanup_dns():
+            events.append("cleanup")
+            dns_firewall["active"] = False
+            return True
+
+        def saml_auth(**_kwargs):
+            nonlocal fresh_auth_count
+            self.assertFalse(
+                dns_firewall["active"],
+                "fresh Microsoft SAML started behind the previous attempt's DNS firewall",
+            )
+            fresh_auth_count += 1
+            events.append(f"saml:{fresh_auth_count}")
+            return {
+                "webvpn": f"fresh-{fresh_auth_count}",
+                "webvpnc": "fresh-config",
+            }
+
+        test_environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "MS_SSO_NM_ANYCONNECT_FRESH_RETRIES": "1",
+            "MS_SSO_NM_ANYCONNECT_RETRY_DELAY_SECONDS": "0",
+        }
+        with patch.dict(os.environ, test_environment, clear=True), patch.object(
+            self.service,
+            "_reset_inactivity_timeout",
+        ), patch.object(
+            self.service,
+            "_systemd_resolved_is_active",
+            return_value=False,
+        ), patch.object(
+            self.service,
+            "_ensure_dns_profile_policy",
+            side_effect=ensure_dns_profile_policy,
+        ), patch.object(
+            self.service,
+            "_capture_base_network_state",
+        ), patch.object(
+            self.service,
+            "_wait_for_base_network_before_connect",
+            return_value=True,
+        ), patch.object(
+            self.service,
+            "_clear_onlink_host_route",
+        ), patch.object(
+            self.service,
+            "_ensure_tun_available",
+            return_value=True,
+        ), patch.object(
+            self.service,
+            "_attempt_vpn_connection",
+            side_effect=attempt_vpn,
+        ), patch.object(
+            self.service,
+            "_cleanup_dns",
+            side_effect=cleanup_dns,
+        ), patch.object(
+            self.service,
+            "_do_saml_auth_with_ui_stall_fallback",
+            side_effect=saml_auth,
+        ), patch.object(
+            SERVICE_MODULE.socket,
+            "gethostbyname",
+            return_value="192.0.2.10",
+        ), patch.object(
+            SERVICE_MODULE,
+            "get_nm_stored_cookies",
+            return_value=(cached_cookies, None),
+        ), patch.object(
+            SERVICE_MODULE,
+            "clear_nm_cookies",
+        ), patch.object(
+            SERVICE_MODULE,
+            "store_nm_cookies",
+        ), patch.object(
+            SERVICE_MODULE.GLib,
+            "idle_add",
+            return_value=1,
+        ):
+            self.service._connect_thread(settings, connect_generation=2)
+
+        self.assertEqual(
+            events,
+            [
+                "attempt:cached",
+                "cleanup",
+                "saml:1",
+                "attempt:fresh-1",
+                "cleanup",
+                "saml:2",
+                "attempt:fresh-2",
+                "cleanup",
+            ],
+        )
+        self.assertFalse(dns_firewall["active"])
+
     def test_non_ui_saml_failure_is_not_retried(self):
         with patch.object(
             SERVICE_MODULE,
@@ -783,6 +935,656 @@ class OpenConnectOutputTests(unittest.TestCase):
         self.assertEqual(diagnostic, "waiting for additional credential input")
         self.assertNotIn("super-secret", diagnostic)
 
+    def test_vpn_dns_domains_always_include_root_route(self):
+        self.service.vpn_domains = ["corp.example", "~corp.example", "~."]
+        for protocol in ("gp", "anyconnect"):
+            for tunnel_all_dns in (None, False, True):
+                with self.subTest(protocol=protocol, tunnel_all_dns=tunnel_all_dns):
+                    self.service.current_protocol = protocol
+                    self.service.vpn_tunnel_all_dns = tunnel_all_dns
+                    domains = self.service._normalize_vpn_domains()
+                    self.assertEqual(domains.count("~."), 1)
+                    self.assertIn("~corp.example", domains)
+
+    def test_dns_candidates_prefer_configured_pushed_then_unibas_fallback(self):
+        self.service.current_gateway_host = "vpn.unibas.ch"
+        self.service.configured_dns_servers = "10.0.0.53, 10.0.0.54"
+        self.service.vpn_dns_servers = ["10.0.0.55"]
+        self.assertEqual(
+            self.service._dns_candidates_for_vpn("gp"),
+            ["10.0.0.53", "10.0.0.54"],
+        )
+
+        self.service.configured_dns_servers = []
+        self.assertEqual(
+            self.service._dns_candidates_for_vpn("gp"),
+            ["10.0.0.55"],
+        )
+
+        self.service.vpn_dns_servers = []
+        self.assertEqual(
+            self.service._dns_candidates_for_vpn("gp"),
+            ["131.152.1.1", "131.152.1.5"],
+        )
+        self.service.current_gateway_host = "vpn.unibas.ch.evil"
+        self.assertEqual(self.service._dns_candidates_for_vpn("gp"), [])
+        self.service.current_gateway_host = "vpn.unibas.ch"
+        self.assertEqual(self.service._dns_candidates_for_vpn("anyconnect"), [])
+
+    def test_connection_secrets_capture_configured_dns_servers(self):
+        settings = {
+            "vpn": {
+                "data": {"dns-servers": "10.0.0.53,10.0.0.54"},
+                "secrets": {"password": "set", "totp-secret": "set"},
+            },
+        }
+
+        secrets = self.service._get_connection_secrets(settings)
+
+        self.assertEqual(secrets["dns_servers"], "10.0.0.53,10.0.0.54")
+
+    def test_dns_route_must_use_exact_owned_tunnel(self):
+        for output, returncode, expected in (
+            ("10.0.0.53 dev tun-ms-sso7 src 10.3.0.1", 0, True),
+            ("10.0.0.53 dev eth0 src 192.0.2.10", 0, False),
+            ("10.0.0.53 dev tun-ms-sso70 src 10.3.0.1", 0, False),
+            ("", 2, False),
+        ):
+            with self.subTest(output=output, returncode=returncode), patch.object(
+                SERVICE_MODULE.subprocess,
+                "run",
+                return_value=SimpleNamespace(
+                    returncode=returncode,
+                    stdout=output,
+                    stderr="",
+                ),
+            ):
+                self.assertEqual(
+                    self.service._dns_route_uses_tunnel(
+                        "10.0.0.53",
+                        "tun-ms-sso7",
+                    ),
+                    expected,
+                )
+
+    def test_dns_probe_binds_to_tunnel_and_requires_answer(self):
+        class FakeSocketContext:
+            def __init__(self, response):
+                self.response = response
+                self.options = []
+                self.destination = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def setsockopt(self, *args):
+                self.options.append(args)
+
+            def settimeout(self, _timeout):
+                pass
+
+            def sendto(self, _packet, destination):
+                self.destination = destination
+
+            def recvfrom(self, _size):
+                return self.response, ("10.0.0.53", 53)
+
+        response = b"\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
+        fake_socket = FakeSocketContext(response)
+        with patch.object(
+            self.service,
+            "_build_dns_probe_query",
+            return_value=(b"\x12\x34", b"query"),
+        ), patch.object(
+            SERVICE_MODULE.socket,
+            "socket",
+            return_value=fake_socket,
+        ):
+            self.assertTrue(self.service._probe_dns_server(
+                "10.0.0.53",
+                tun_device="tun-ms-sso7",
+                require_answer=True,
+            ))
+
+        self.assertIn(
+            (
+                SERVICE_MODULE.socket.SOL_SOCKET,
+                SERVICE_MODULE.socket.SO_BINDTODEVICE,
+                b"tun-ms-sso7\0",
+            ),
+            fake_socket.options,
+        )
+        self.assertEqual(fake_socket.destination, ("10.0.0.53", 53))
+
+        no_answer = FakeSocketContext(
+            b"\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00"
+        )
+        with patch.object(
+            self.service,
+            "_build_dns_probe_query",
+            return_value=(b"\x12\x34", b"query"),
+        ), patch.object(SERVICE_MODULE.socket, "socket", return_value=no_answer):
+            self.assertFalse(self.service._probe_dns_server(
+                "10.0.0.53",
+                tun_device="tun-ms-sso7",
+                require_answer=True,
+            ))
+
+    def test_full_dns_resolved_applies_global_route_on_owned_generation(self):
+        self.service.current_tun_device = "tun-ms-sso7"
+        self.service.owned_tun_devices = {"tun-ms-sso7"}
+        self.service.owned_tun_ifindices = {"tun-ms-sso7": 42}
+        successful = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch.object(
+            self.service,
+            "_link_ifindex",
+            return_value=42,
+        ), patch.object(
+            self.service,
+            "_systemd_resolved_is_active",
+            return_value=True,
+        ), patch.object(
+            self.service,
+            "_resolved_dns_protection_matches",
+            return_value=True,
+        ), patch.object(
+            SERVICE_MODULE.shutil,
+            "which",
+            return_value="/usr/bin/resolvectl",
+        ), patch.object(
+            SERVICE_MODULE.subprocess,
+            "run",
+            return_value=successful,
+        ) as run:
+            self.assertTrue(self.service._apply_full_dns_resolved(
+                "tun-ms-sso7",
+                ["10.0.0.53", "10.0.0.54"],
+                2,
+            ))
+
+        commands = [item.args[0] for item in run.call_args_list]
+        self.assertEqual(commands[:3], [
+            ["resolvectl", "dns", "tun-ms-sso7", "10.0.0.53", "10.0.0.54"],
+            ["resolvectl", "domain", "tun-ms-sso7", "~."],
+            ["resolvectl", "default-route", "tun-ms-sso7", "true"],
+        ])
+
+    def test_resolved_dns_verifier_requires_servers_root_and_owned_ifindex(self):
+        self.service.current_tun_device = "tun-ms-sso7"
+        self.service.owned_tun_devices = {"tun-ms-sso7"}
+        self.service.owned_tun_ifindices = {"tun-ms-sso7": 42}
+        replies = [
+            SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout=(
+                    '[{"ifname":"tun-ms-sso7","ifindex":42,'
+                    '"servers":[{"addressString":"10.0.0.53"}]}]'
+                ),
+            ),
+            SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout=(
+                    '[{"ifname":"tun-ms-sso7","ifindex":42,'
+                    '"searchDomains":[{"name":".","routeOnly":true}]}]'
+                ),
+            ),
+            SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout=(
+                    '[{"ifname":"tun-ms-sso7","ifindex":42,'
+                    '"defaultRoute":true}]'
+                ),
+            ),
+        ]
+        with patch.object(
+            self.service,
+            "_link_ifindex",
+            return_value=42,
+        ), patch.object(
+            SERVICE_MODULE.subprocess,
+            "run",
+            side_effect=replies,
+        ):
+            self.assertTrue(self.service._resolved_dns_protection_matches(
+                "tun-ms-sso7",
+                ["10.0.0.53"],
+            ))
+
+        self.service.owned_tun_ifindices["tun-ms-sso7"] = 41
+        with patch.object(
+            self.service,
+            "_link_ifindex",
+            return_value=42,
+        ), patch.object(SERVICE_MODULE.subprocess, "run") as run:
+            self.assertFalse(self.service._resolved_dns_protection_matches(
+                "tun-ms-sso7",
+                ["10.0.0.53"],
+            ))
+            run.assert_not_called()
+
+    def test_resolved_dns_verifier_falls_back_to_locale_pinned_text(self):
+        self.service.current_tun_device = "tun-ms-sso7"
+        self.service.owned_tun_devices = {"tun-ms-sso7"}
+        self.service.owned_tun_ifindices = {"tun-ms-sso7": 42}
+        replies = [
+            SimpleNamespace(
+                returncode=1,
+                stderr="Unknown option --json=short",
+                stdout="",
+            ),
+            SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout="Link 42 (tun-ms-sso7): 10.0.0.53 10.0.0.54\n",
+            ),
+            SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout="Link 42 (tun-ms-sso7): ~.\n",
+            ),
+            SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout="Link 42 (tun-ms-sso7): yes\n",
+            ),
+        ]
+        with patch.object(
+            self.service,
+            "_link_ifindex",
+            return_value=42,
+        ), patch.object(
+            SERVICE_MODULE.subprocess,
+            "run",
+            side_effect=replies,
+        ) as run:
+            self.assertTrue(self.service._resolved_dns_protection_matches(
+                "tun-ms-sso7",
+                ["10.0.0.53", "10.0.0.54"],
+            ))
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["resolvectl", "dns", "tun-ms-sso7", "--json=short"],
+                ["resolvectl", "dns", "tun-ms-sso7"],
+                ["resolvectl", "domain", "tun-ms-sso7"],
+                ["resolvectl", "default-route", "tun-ms-sso7"],
+            ],
+        )
+        for call in run.call_args_list[1:]:
+            self.assertEqual(call.kwargs["env"]["LC_ALL"], "C")
+
+    def test_resolved_dns_verifier_rejects_an_extra_resolver(self):
+        self.service.current_tun_device = "tun-ms-sso7"
+        self.service.owned_tun_devices = {"tun-ms-sso7"}
+        self.service.owned_tun_ifindices = {"tun-ms-sso7": 42}
+        replies = [
+            SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout=(
+                    '[{"ifindex":42,"servers":['
+                    '{"addressString":"10.0.0.53"},'
+                    '{"addressString":"192.0.2.53"}]}]'
+                ),
+            ),
+            SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout=(
+                    '[{"ifindex":42,"searchDomains":['
+                    '{"name":".","routeOnly":true}]}]'
+                ),
+            ),
+            SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout='[{"ifindex":42,"defaultRoute":true}]',
+            ),
+        ]
+        with patch.object(
+            self.service,
+            "_link_ifindex",
+            return_value=42,
+        ), patch.object(
+            SERVICE_MODULE.subprocess,
+            "run",
+            side_effect=replies,
+        ):
+            self.assertFalse(self.service._resolved_dns_protection_matches(
+                "tun-ms-sso7", ["10.0.0.53"],
+            ))
+
+    def test_full_dns_resolved_rejects_stale_or_reused_tunnel(self):
+        self.service.current_tun_device = "tun-ms-sso7"
+        self.service.owned_tun_devices = {"tun-ms-sso7"}
+        self.service.owned_tun_ifindices = {"tun-ms-sso7": 42}
+        with patch.object(SERVICE_MODULE.subprocess, "run") as run:
+            self.assertFalse(self.service._apply_full_dns_resolved(
+                "tun-ms-sso7", ["10.0.0.53"], 1,
+            ))
+            run.assert_not_called()
+        with patch.object(
+            self.service,
+            "_link_ifindex",
+            return_value=99,
+        ), patch.object(SERVICE_MODULE.subprocess, "run") as run:
+            self.assertFalse(self.service._apply_full_dns_resolved(
+                "tun-ms-sso7", ["10.0.0.53"], 2,
+            ))
+            run.assert_not_called()
+
+    def test_collect_tunnel_dns_waits_for_vpnc_script_route_convergence(self):
+        # vpnc-script addresses the tunnel before it replaces the default
+        # route, so the first route lookups still resolve via an uplink.
+        process = object()
+        self.service.vpn_process = process
+        route_results = [False, False, False, True]
+        with patch.object(
+            self.service,
+            "_dns_route_uses_tunnel",
+            side_effect=route_results,
+        ) as route, patch.object(
+            self.service,
+            "_probe_dns_server",
+            return_value=True,
+        ), patch("time.sleep"):
+            working = self.service._collect_tunnel_dns_servers(
+                ["10.0.0.53"],
+                "tun-ms-sso7",
+                1,
+                connect_generation=2,
+                process=process,
+                timeout_seconds=20,
+            )
+
+        self.assertEqual(working, ["10.0.0.53"])
+        self.assertEqual(route.call_count, len(route_results))
+
+    def test_collect_tunnel_dns_fails_closed_when_route_never_converges(self):
+        process = object()
+        self.service.vpn_process = process
+        with patch.object(
+            self.service,
+            "_dns_route_uses_tunnel",
+            return_value=False,
+        ) as route, patch.object(
+            self.service,
+            "_probe_dns_server",
+            return_value=True,
+        ) as probe, patch("time.sleep"):
+            working = self.service._collect_tunnel_dns_servers(
+                ["10.0.0.53"],
+                "tun-ms-sso7",
+                1,
+                connect_generation=2,
+                process=process,
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(working, [])
+        probe.assert_not_called()
+        # The mismatch is reported once the wait is abandoned, not per poll.
+        self.assertEqual(
+            [call.kwargs.get("log_mismatch") for call in route.call_args_list].count(True),
+            1,
+        )
+
+    def test_collect_tunnel_dns_stops_when_openconnect_exits(self):
+        process = MagicMock()
+        process.poll.return_value = 1
+        self.service.vpn_process = process
+        with patch.object(
+            self.service,
+            "_dns_route_uses_tunnel",
+            return_value=False,
+        ) as route, patch("time.sleep"):
+            working = self.service._collect_tunnel_dns_servers(
+                ["10.0.0.53"],
+                "tun-ms-sso7",
+                1,
+                connect_generation=2,
+                process=process,
+                timeout_seconds=20,
+            )
+
+        self.assertEqual(working, [])
+        route.assert_not_called()
+
+    def test_prepare_dns_protection_filters_to_tunnel_responders(self):
+        process = object()
+        self.service.vpn_process = process
+        self.service.current_tun_device = "tun-ms-sso7"
+        self.service.owned_tun_devices = {"tun-ms-sso7"}
+        self.service.owned_tun_ifindices = {"tun-ms-sso7": 42}
+        self.service.current_dns_server_limit = 1
+        with patch.object(
+            self.service,
+            "_dns_candidates_for_vpn",
+            return_value=["10.0.0.53", "10.0.0.54"],
+        ), patch.object(
+            self.service,
+            "_dns_route_uses_tunnel",
+            side_effect=[False, True],
+        ), patch.object(
+            self.service,
+            "_probe_dns_server",
+            return_value=True,
+        ) as probe, patch.object(
+            self.service,
+            "_apply_full_dns_resolved",
+            return_value=True,
+        ) as apply_dns:
+            self.assertTrue(self.service._prepare_vpn_dns_protection(
+                "gp", "tun-ms-sso7", 2, process=process,
+            ))
+
+        self.assertEqual(self.service.vpn_dns_servers, ["10.0.0.54"])
+        self.assertTrue(self.service.dns_leak_protection_ready)
+        probe.assert_called_once_with(
+            "10.0.0.54",
+            tun_device="tun-ms-sso7",
+            require_answer=True,
+        )
+        apply_dns.assert_called_once_with("tun-ms-sso7", ["10.0.0.54"], 2)
+
+    def test_prepare_dns_protection_fails_closed_without_candidates(self):
+        process = object()
+        self.service.vpn_process = process
+        with patch.object(
+            self.service,
+            "_dns_candidates_for_vpn",
+            return_value=[],
+        ):
+            self.assertFalse(self.service._prepare_vpn_dns_protection(
+                "gp", "tun-ms-sso7", 2, process=process,
+            ))
+        self.assertFalse(self.service.dns_leak_protection_ready)
+
+    def test_dns_profile_policy_sets_exclusive_priority_and_root(self):
+        self.service.current_connection_uuid = "vpn-uuid"
+        modifications = []
+        reads = {
+            "vpn.service-type": ["org.freedesktop.NetworkManager.ms-sso\n"],
+            "ipv4.dns-priority": ["0\n", "-100\n"],
+            "ipv4.dns-search": ["\n", "~.\n"],
+            "ipv6.dns-priority": ["0\n", "-100\n"],
+        }
+
+        def run_nmcli(command, **_kwargs):
+            if command[1] == "--get-values":
+                value = reads[command[2]].pop(0)
+                return SimpleNamespace(returncode=0, stdout=value, stderr="")
+            modifications.append(command)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(
+            SERVICE_MODULE.shutil,
+            "which",
+            return_value="/usr/bin/nmcli",
+        ), patch.object(
+            SERVICE_MODULE.subprocess,
+            "run",
+            side_effect=run_nmcli,
+        ):
+            self.assertTrue(self.service._ensure_dns_profile_policy())
+
+        self.assertEqual(len(modifications), 1)
+        command = modifications[0]
+        self.assertIn("ipv4.dns-priority", command)
+        self.assertIn("ipv6.dns-priority", command)
+        self.assertIn("+ipv4.dns-search", command)
+        self.assertIn("~.", command)
+
+    def test_networkmanager_backend_requires_both_dns_policy_snapshots(self):
+        self.service.current_tun_device = "tun-ms-sso7"
+        self.service.owned_tun_devices = {"tun-ms-sso7"}
+        self.service.owned_tun_ifindices = {"tun-ms-sso7": 42}
+        self.service.vpn_dns_backend = "networkmanager"
+        with patch.object(
+            self.service,
+            "_link_ifindex",
+            return_value=42,
+        ), patch.object(SERVICE_MODULE.subprocess, "run") as run:
+            cases = (
+                (True, True, True),
+                (False, True, False),
+                (True, False, False),
+                (False, False, False),
+            )
+            for profile_ready, activation_ready, expected in cases:
+                with self.subTest(
+                    profile_ready=profile_ready,
+                    activation_ready=activation_ready,
+                ):
+                    self.service.dns_profile_policy_ready = profile_ready
+                    self.service.dns_activation_policy_ready = activation_ready
+                    self.assertEqual(
+                        self.service._apply_full_dns_resolved(
+                            "tun-ms-sso7", ["10.0.0.53"], 2,
+                        ),
+                        expected,
+                    )
+            run.assert_not_called()
+
+    def test_connection_snapshot_requires_exclusive_v4_v6_dns_and_root_route(self):
+        valid = {
+            "ipv4": {
+                "dns-priority": -100,
+                "dns-search": ["vpn.example.edu", "~."],
+            },
+            "ipv6": {"dns-priority": "-25"},
+        }
+        self.assertTrue(self.service._connection_snapshot_has_dns_policy(valid))
+
+        invalid = {
+            "missing_ipv4_priority": {
+                "ipv4": {"dns-search": ["~."]},
+                "ipv6": {"dns-priority": -100},
+            },
+            "missing_ipv6_priority": {
+                "ipv4": {"dns-priority": -100, "dns-search": ["~."]},
+                "ipv6": {},
+            },
+            "missing_root_route": {
+                "ipv4": {
+                    "dns-priority": -100,
+                    "dns-search": ["vpn.example.edu"],
+                },
+                "ipv6": {"dns-priority": -100},
+            },
+        }
+        for label, settings in invalid.items():
+            with self.subTest(label=label):
+                self.assertFalse(
+                    self.service._connection_snapshot_has_dns_policy(settings)
+                )
+
+    def test_pinned_resolved_backend_fails_closed_if_daemon_disappears(self):
+        self.service.current_tun_device = "tun-ms-sso7"
+        self.service.owned_tun_devices = {"tun-ms-sso7"}
+        self.service.owned_tun_ifindices = {"tun-ms-sso7": 42}
+        self.service.vpn_dns_backend = "resolved"
+        with patch.object(
+            self.service,
+            "_link_ifindex",
+            return_value=42,
+        ), patch.object(
+            self.service,
+            "_systemd_resolved_is_active",
+            return_value=False,
+        ), patch.object(SERVICE_MODULE.subprocess, "run") as run:
+            self.assertFalse(self.service._apply_full_dns_resolved(
+                "tun-ms-sso7", ["10.0.0.53"], 2,
+            ))
+            run.assert_not_called()
+
+    def test_dns_profile_policy_repairs_ipv6_priority_when_ipv4_is_ready(self):
+        self.service.current_connection_uuid = "vpn-uuid"
+        reads = {
+            "vpn.service-type": ["org.freedesktop.NetworkManager.ms-sso\n"],
+            "ipv4.dns-priority": ["-100\n", "-100\n"],
+            "ipv4.dns-search": ["~.\n", "~.\n"],
+            "ipv6.dns-priority": ["0\n", "-100\n"],
+        }
+        modifications = []
+
+        def run_nmcli(command, **_kwargs):
+            if command[1] == "--get-values":
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=reads[command[2]].pop(0),
+                    stderr="",
+                )
+            modifications.append(command)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(
+            SERVICE_MODULE.shutil,
+            "which",
+            return_value="/usr/bin/nmcli",
+        ), patch.object(
+            SERVICE_MODULE.subprocess,
+            "run",
+            side_effect=run_nmcli,
+        ):
+            self.assertTrue(self.service._ensure_dns_profile_policy())
+
+        self.assertEqual(len(modifications), 1)
+        self.assertIn("ipv6.dns-priority", modifications[0])
+        self.assertNotIn("+ipv4.dns-search", modifications[0])
+
+    def test_only_explicit_leak_failure_prefix_is_terminal(self):
+        self.assertTrue(self.service._is_leak_protection_failure(
+            "Leak protection failed: DNS unavailable"
+        ))
+        self.assertFalse(self.service._is_leak_protection_failure(
+            "OpenConnect DNS negotiation failed"
+        ))
+
+    def test_connected_callback_refuses_missing_leak_readiness(self):
+        process = SimpleNamespace(poll=lambda: None)
+        self.service.vpn_process = process
+        self.service.current_tun_device = "tun-ms-sso7"
+        self.service.current_gateway = "vpn.example.edu"
+        self.service.Config = lambda _config: self.fail("Config must not be emitted")
+        self.service.Ip4Config = lambda _config: self.fail("Ip4Config must not be emitted")
+        self.service._emit_failure = lambda *_args: False
+        self.service._stop_vpn_process = lambda **_kwargs: None
+
+        self.service.dns_leak_protection_ready = False
+        self.assertFalse(self.service._emit_connected(2, process, "tun-ms-sso7"))
+
+        self.service.dns_leak_protection_ready = True
+        self.service._apply_ipv6_leak_protection = lambda: False
+        self.assertFalse(self.service._emit_connected(2, process, "tun-ms-sso7"))
+
 
 class NetworkRecoveryTests(unittest.TestCase):
     def setUp(self):
@@ -796,8 +1598,14 @@ class NetworkRecoveryTests(unittest.TestCase):
         self.service.current_protocol = "anyconnect"
         self.service.current_connection_uuid = "vpn-uuid"
         self.service.current_tun_device = None
+        self.service.pending_tun_device = None
         self.service.current_dns_server_limit = 3
+        self.service.configured_dns_servers = []
         self.service.vpn_dns_servers = []
+        self.service.vpn_dns_backend = None
+        self.service.dns_profile_policy_ready = False
+        self.service.dns_activation_policy_ready = False
+        self.service.dns_leak_protection_ready = False
         self.service.vpn_domains = []
         self.service.vpn_split_excludes = []
         self.service.vpn_split_includes = []
@@ -817,15 +1625,406 @@ class NetworkRecoveryTests(unittest.TestCase):
         self.service.cancel_requested = False
         self.service._connect_generation = 2
 
+    @staticmethod
+    def _ipv6_firewall_marker_text(connection_uuid="vpn-uuid"):
+        return (
+            "version=1\n"
+            f"connection_uuid={connection_uuid}\n"
+            "family=inet\n"
+            "table=nm_ms_sso_ipv6\n"
+        )
+
+    @staticmethod
+    def _nft_firewall_document(ipv6_devices, dns_devices):
+        def oif_match(devices):
+            return {
+                "match": {
+                    "op": "!=",
+                    "left": {"meta": {"key": "oifname"}},
+                    "right": {"set": sorted(devices)},
+                },
+            }
+
+        def dns_rule(protocol, comment):
+            return {
+                "rule": {
+                    "family": "inet",
+                    "table": "nm_ms_sso_ipv6",
+                    "chain": "output",
+                    "comment": comment,
+                    "expr": [
+                        oif_match(dns_devices),
+                        {
+                            "match": {
+                                "op": "==",
+                                "left": {
+                                    "payload": {
+                                        "protocol": protocol,
+                                        "field": "dport",
+                                    },
+                                },
+                                "right": {"set": [53, 853]},
+                            },
+                        },
+                        {"counter": {"packets": 0, "bytes": 0}},
+                        {"drop": None},
+                    ],
+                },
+            }
+
+        return {
+            "nftables": [
+                {
+                    "table": {
+                        "family": "inet",
+                        "name": "nm_ms_sso_ipv6",
+                    },
+                },
+                {
+                    "chain": {
+                        "family": "inet",
+                        "table": "nm_ms_sso_ipv6",
+                        "name": "output",
+                        "type": "filter",
+                        "hook": "output",
+                        "prio": -150,
+                        "policy": "accept",
+                    },
+                },
+                {
+                    "rule": {
+                        "family": "inet",
+                        "table": "nm_ms_sso_ipv6",
+                        "chain": "output",
+                        "comment": SERVICE_MODULE.IPV6_FIREWALL_COMMENT,
+                        "expr": [
+                            {
+                                "match": {
+                                    "op": "==",
+                                    "left": {"meta": {"key": "nfproto"}},
+                                    "right": "ipv6",
+                                },
+                            },
+                            oif_match(ipv6_devices),
+                            {"counter": {"packets": 0, "bytes": 0}},
+                            {"drop": None},
+                        ],
+                    },
+                },
+                dns_rule("udp", SERVICE_MODULE.DNS_UDP_FIREWALL_COMMENT),
+                dns_rule("tcp", SERVICE_MODULE.DNS_TCP_FIREWALL_COMMENT),
+            ],
+        }
+
+    @staticmethod
+    def _nft_rule(document, comment):
+        return next(
+            entry["rule"]
+            for entry in document["nftables"]
+            if entry.get("rule", {}).get("comment") == comment
+        )
+
+    def test_ipv6_firewall_policy_is_written_after_durable_marker(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            route_marker = Path(tempdir) / "ipv6-leak-route"
+            firewall_marker = Path(tempdir) / "ipv6-firewall"
+            recovery_lock = Path(tempdir) / "recovery.lock"
+            self.service.current_tun_device = "tun-current"
+            self.service.pending_tun_device = "tun-pending"
+            expected_ipv6_devices = {
+                "lo",
+                "tun-current",
+                "tun-pending",
+                "wg-dgx",
+                "wg0",
+            }
+            expected_dns_devices = {"lo", "tun-current", "tun-pending"}
+            nft_batches = []
+
+            def run(command, **kwargs):
+                if command == ["ip", "-o", "link", "show", "type", "wireguard"]:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=(
+                            "5: wg0: <POINTOPOINT,NOARP,UP> mtu 1420 state UNKNOWN\n"
+                            "6: wg-dgx@NONE: <POINTOPOINT,NOARP,UP> mtu 1420 "
+                            "state UNKNOWN\n"
+                        ),
+                        stderr="",
+                    )
+                if command == ["nft", "-f", "-"]:
+                    self.assertTrue(firewall_marker.exists())
+                    self.assertEqual(
+                        firewall_marker.read_text(encoding="utf-8"),
+                        self._ipv6_firewall_marker_text(),
+                    )
+                    nft_batches.append(kwargs["input"])
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                self.fail(f"Unexpected command: {command!r}")
+
+            with patch.object(
+                SERVICE_MODULE,
+                "IPV6_LEAK_ROUTE_MARKER",
+                route_marker,
+            ), patch.object(
+                SERVICE_MODULE,
+                "IPV6_FIREWALL_MARKER",
+                firewall_marker,
+            ), patch.object(
+                SERVICE_MODULE,
+                "RECOVERY_LOCK_FILE",
+                recovery_lock,
+            ), patch.object(
+                self.service,
+                "_ipv6_firewall_table_present",
+                return_value=False,
+            ), patch.object(
+                self.service,
+                "_verify_ipv6_firewall",
+                return_value=True,
+            ) as verify, patch.object(
+                SERVICE_MODULE.subprocess,
+                "run",
+                side_effect=run,
+            ):
+                self.assertTrue(self.service._install_ipv6_firewall())
+
+            verify.assert_called_once_with(
+                expected_ipv6_devices,
+                expected_dns_devices,
+            )
+            self.assertEqual(len(nft_batches), 1)
+            self.assertEqual(
+                nft_batches[0],
+                "add table inet nm_ms_sso_ipv6\n"
+                "add chain inet nm_ms_sso_ipv6 output "
+                "{ type filter hook output priority -150; policy accept; }\n"
+                "add rule inet nm_ms_sso_ipv6 output meta nfproto ipv6 "
+                "oifname != { \"lo\", \"tun-current\", \"tun-pending\", "
+                "\"wg-dgx\", \"wg0\" } counter drop "
+                "comment \"nm-ms-sso direct IPv6 kill switch\"\n"
+                "add rule inet nm_ms_sso_ipv6 output "
+                "oifname != { \"lo\", \"tun-current\", \"tun-pending\" } "
+                "udp dport { 53, 853 } counter drop "
+                "comment \"nm-ms-sso direct UDP DNS kill switch\"\n"
+                "add rule inet nm_ms_sso_ipv6 output "
+                "oifname != { \"lo\", \"tun-current\", \"tun-pending\" } "
+                "tcp dport { 53, 853 } counter drop "
+                "comment \"nm-ms-sso direct TCP DNS kill switch\"\n",
+            )
+            self.assertNotIn("eth0", nft_batches[0])
+            # WireGuard remains available for IPv6 routes but cannot bypass
+            # the VPN-only resolver path.
+            self.assertEqual(nft_batches[0].count('"wg-dgx"'), 1)
+            self.assertEqual(nft_batches[0].count('"wg0"'), 1)
+
+    def test_ipv6_firewall_json_verifier_accepts_exact_three_rule_policy(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "ipv6-firewall"
+            marker.write_text(
+                self._ipv6_firewall_marker_text(),
+                encoding="utf-8",
+            )
+            expected_ipv6 = {"lo", "tun-current", "tun-pending", "wg0"}
+            expected_dns = {"lo", "tun-current", "tun-pending"}
+            document = self._nft_firewall_document(expected_ipv6, expected_dns)
+            result = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(document),
+                stderr="",
+            )
+
+            with patch.object(
+                SERVICE_MODULE,
+                "IPV6_FIREWALL_MARKER",
+                marker,
+            ), patch.object(
+                SERVICE_MODULE.subprocess,
+                "run",
+                return_value=result,
+            ) as run:
+                self.assertTrue(self.service._verify_ipv6_firewall(
+                    expected_ipv6,
+                    expected_dns,
+                ))
+
+            run.assert_called_once_with(
+                ["nft", "-j", "list", "table", "inet", "nm_ms_sso_ipv6"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+
+    def test_ipv6_firewall_json_verifier_rejects_policy_variations(self):
+        expected_ipv6 = {"lo", "tun-current", "tun-pending", "wg0"}
+        expected_dns = {"lo", "tun-current", "tun-pending"}
+
+        extra_physical = self._nft_firewall_document(
+            expected_ipv6 | {"eth0"},
+            expected_dns,
+        )
+        missing_wireguard = self._nft_firewall_document(
+            expected_ipv6 - {"wg0"},
+            expected_dns,
+        )
+        dns_over_wireguard = self._nft_firewall_document(
+            expected_ipv6,
+            expected_dns | {"wg0"},
+        )
+        wrong_drop = self._nft_firewall_document(expected_ipv6, expected_dns)
+        ipv6_rule = self._nft_rule(
+            wrong_drop,
+            SERVICE_MODULE.IPV6_FIREWALL_COMMENT,
+        )
+        ipv6_rule["expr"][-1] = {"accept": None}
+        wrong_match = self._nft_firewall_document(expected_ipv6, expected_dns)
+        ipv6_rule = self._nft_rule(
+            wrong_match,
+            SERVICE_MODULE.IPV6_FIREWALL_COMMENT,
+        )
+        ipv6_rule["expr"][1]["match"]["op"] = "=="
+        wrong_dns_ports = self._nft_firewall_document(expected_ipv6, expected_dns)
+        udp_rule = self._nft_rule(
+            wrong_dns_ports,
+            SERVICE_MODULE.DNS_UDP_FIREWALL_COMMENT,
+        )
+        udp_rule["expr"][1]["match"]["right"] = {"set": [53]}
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "ipv6-firewall"
+            marker.write_text(
+                self._ipv6_firewall_marker_text(),
+                encoding="utf-8",
+            )
+            with patch.object(
+                SERVICE_MODULE,
+                "IPV6_FIREWALL_MARKER",
+                marker,
+            ):
+                for name, document in (
+                    ("extra physical IPv6 interface", extra_physical),
+                    ("missing WireGuard IPv6 interface", missing_wireguard),
+                    ("DNS allowed over WireGuard", dns_over_wireguard),
+                    ("wrong IPv6 verdict", wrong_drop),
+                    ("wrong IPv6 interface match", wrong_match),
+                    ("missing encrypted-DNS port", wrong_dns_ports),
+                ):
+                    with self.subTest(name=name), patch.object(
+                        SERVICE_MODULE.subprocess,
+                        "run",
+                        return_value=SimpleNamespace(
+                            returncode=0,
+                            stdout=json.dumps(document),
+                            stderr="",
+                        ),
+                    ):
+                        self.assertFalse(self.service._verify_ipv6_firewall(
+                            expected_ipv6,
+                            expected_dns,
+                        ))
+
+    def test_ipv6_firewall_cleanup_requires_valid_marker_and_verified_absence(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "ipv6-firewall"
+            marker.write_text(
+                self._ipv6_firewall_marker_text(),
+                encoding="utf-8",
+            )
+            successful = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch.object(
+                SERVICE_MODULE,
+                "IPV6_FIREWALL_MARKER",
+                marker,
+            ), patch.object(
+                self.service,
+                "_ipv6_firewall_table_present",
+                side_effect=[True, False],
+            ), patch.object(
+                SERVICE_MODULE.subprocess,
+                "run",
+                return_value=successful,
+            ) as run:
+                self.assertTrue(self.service._remove_owned_ipv6_firewall())
+
+            run.assert_called_once_with(
+                ["nft", "delete", "table", "inet", "nm_ms_sso_ipv6"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertFalse(marker.exists())
+
+        for name, marker_text, table_states, delete_result in (
+            (
+                "invalid marker",
+                "version=1\nconnection_uuid=vpn-uuid\n"
+                "family=ip6\ntable=nm_ms_sso_ipv6\n",
+                [],
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ),
+            (
+                "delete failed",
+                self._ipv6_firewall_marker_text(),
+                [True],
+                SimpleNamespace(returncode=1, stdout="", stderr="denied"),
+            ),
+            (
+                "absence unverified",
+                self._ipv6_firewall_marker_text(),
+                [True, None],
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tempdir:
+                marker = Path(tempdir) / "ipv6-firewall"
+                marker.write_text(marker_text, encoding="utf-8")
+                with patch.object(
+                    SERVICE_MODULE,
+                    "IPV6_FIREWALL_MARKER",
+                    marker,
+                ), patch.object(
+                    self.service,
+                    "_ipv6_firewall_table_present",
+                    side_effect=table_states,
+                ), patch.object(
+                    SERVICE_MODULE.subprocess,
+                    "run",
+                    return_value=delete_result,
+                ) as run:
+                    self.assertFalse(self.service._remove_owned_ipv6_firewall())
+
+                self.assertTrue(marker.exists())
+                if name == "invalid marker":
+                    run.assert_not_called()
+                else:
+                    run.assert_called_once_with(
+                        [
+                            "nft", "delete", "table", "inet",
+                            "nm_ms_sso_ipv6",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=5,
+                    )
+
     def test_ipv6_leak_marker_is_durable_before_route_is_added(self):
         with tempfile.TemporaryDirectory() as tempdir:
             marker = Path(tempdir) / "ipv6-leak-route"
+            firewall_marker = Path(tempdir) / "ipv6-firewall"
+            route_commands = []
 
-            def add_route(_command, **_kwargs):
+            def add_route(command, **_kwargs):
+                route_commands.append(command)
                 self.assertTrue(marker.exists())
                 self.assertEqual(
                     marker.read_text(encoding="utf-8"),
-                    "connection_uuid=vpn-uuid\n",
+                    "version=2\n"
+                    "connection_uuid=vpn-uuid\n"
+                    "metric=1\n"
+                    "protocol=99\n",
                 )
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -833,22 +2032,128 @@ class NetworkRecoveryTests(unittest.TestCase):
                 SERVICE_MODULE,
                 "IPV6_LEAK_ROUTE_MARKER",
                 marker,
-            ), patch.dict(
-                SERVICE_MODULE.os.environ,
-                {"MS_SSO_NM_BLOCK_IPV6": "1"},
+            ), patch.object(
+                SERVICE_MODULE,
+                "IPV6_FIREWALL_MARKER",
+                firewall_marker,
+            ), patch.dict(SERVICE_MODULE.os.environ, {}, clear=True), patch.object(
+                self.service,
+                "_recovery_state_lock",
+                return_value=nullcontext(),
+            ), patch.object(
+                self.service,
+                "_install_ipv6_firewall",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_ipv6_leak_route_present",
+                return_value=False,
+            ), patch.object(
+                self.service,
+                "_verify_ipv6_leak_protection",
+                return_value=True,
             ), patch.object(
                 SERVICE_MODULE.subprocess,
                 "run",
                 side_effect=add_route,
             ):
-                self.service._apply_ipv6_leak_protection()
+                self.assertTrue(self.service._apply_ipv6_leak_protection())
 
             self.assertTrue(self.service.ipv6_leak_protection_enabled)
             self.assertTrue(marker.exists())
+            self.assertEqual(route_commands, [[
+                "ip", "-6", "route", "add", "unreachable", "::/0",
+                "metric", "1", "proto", "99",
+            ]])
+            self.assertNotIn("replace", route_commands[0])
+
+    def test_ipv6_leak_protection_explicit_opt_out_is_successful(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "ipv6-leak-route"
+            with patch.object(
+                SERVICE_MODULE,
+                "IPV6_LEAK_ROUTE_MARKER",
+                marker,
+            ), patch.dict(
+                SERVICE_MODULE.os.environ,
+                {"MS_SSO_NM_BLOCK_IPV6": "0"},
+                clear=True,
+            ), patch.object(SERVICE_MODULE.subprocess, "run") as run:
+                self.assertTrue(self.service._apply_ipv6_leak_protection())
+
+            self.assertFalse(self.service.ipv6_leak_protection_enabled)
+            self.assertFalse(marker.exists())
+            run.assert_not_called()
+
+    def test_ipv6_leak_protection_does_not_claim_preexisting_route(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "ipv6-leak-route"
+            firewall_marker = Path(tempdir) / "ipv6-firewall"
+            with patch.object(
+                SERVICE_MODULE,
+                "IPV6_LEAK_ROUTE_MARKER",
+                marker,
+            ), patch.object(
+                SERVICE_MODULE,
+                "IPV6_FIREWALL_MARKER",
+                firewall_marker,
+            ), patch.dict(SERVICE_MODULE.os.environ, {}, clear=True), patch.object(
+                self.service,
+                "_recovery_state_lock",
+                return_value=nullcontext(),
+            ), patch.object(
+                self.service,
+                "_install_ipv6_firewall",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_ipv6_leak_route_present",
+                return_value=True,
+            ), patch.object(SERVICE_MODULE.subprocess, "run") as run:
+                self.assertFalse(self.service._apply_ipv6_leak_protection())
+
+            self.assertFalse(marker.exists())
+            self.assertFalse(self.service.ipv6_leak_protection_enabled)
+            run.assert_not_called()
+
+    def test_ipv6_leak_protection_add_failure_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "ipv6-leak-route"
+            firewall_marker = Path(tempdir) / "ipv6-firewall"
+            with patch.object(
+                SERVICE_MODULE,
+                "IPV6_LEAK_ROUTE_MARKER",
+                marker,
+            ), patch.object(
+                SERVICE_MODULE,
+                "IPV6_FIREWALL_MARKER",
+                firewall_marker,
+            ), patch.dict(SERVICE_MODULE.os.environ, {}, clear=True), patch.object(
+                self.service,
+                "_recovery_state_lock",
+                return_value=nullcontext(),
+            ), patch.object(
+                self.service,
+                "_install_ipv6_firewall",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_ipv6_leak_route_present",
+                side_effect=[False, False],
+            ), patch.object(
+                SERVICE_MODULE.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=2, stdout="", stderr="denied"),
+            ):
+                self.assertFalse(self.service._apply_ipv6_leak_protection())
+
+            self.assertFalse(marker.exists())
+            self.assertFalse(self.service.ipv6_leak_protection_enabled)
 
     def test_ipv6_leak_marker_survives_until_route_absence_is_verified(self):
         with tempfile.TemporaryDirectory() as tempdir:
             marker = Path(tempdir) / "ipv6-leak-route"
+            firewall_marker = Path(tempdir) / "ipv6-firewall"
             marker.write_text("connection_uuid=vpn-uuid\n", encoding="utf-8")
             self.service.ipv6_leak_protection_enabled = True
 
@@ -857,12 +2162,24 @@ class NetworkRecoveryTests(unittest.TestCase):
                 "IPV6_LEAK_ROUTE_MARKER",
                 marker,
             ), patch.object(
+                SERVICE_MODULE,
+                "IPV6_FIREWALL_MARKER",
+                firewall_marker,
+            ), patch.object(
+                self.service,
+                "_recovery_state_lock",
+                return_value=nullcontext(),
+            ), patch.object(
                 self.service,
                 "_run_recovery_command",
                 return_value=False,
             ), patch.object(
                 self.service,
                 "_ipv6_leak_route_present",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_remove_owned_ipv6_firewall",
                 return_value=True,
             ):
                 self.service._remove_ipv6_leak_protection()
@@ -875,6 +2192,14 @@ class NetworkRecoveryTests(unittest.TestCase):
                 "IPV6_LEAK_ROUTE_MARKER",
                 marker,
             ), patch.object(
+                SERVICE_MODULE,
+                "IPV6_FIREWALL_MARKER",
+                firewall_marker,
+            ), patch.object(
+                self.service,
+                "_recovery_state_lock",
+                return_value=nullcontext(),
+            ), patch.object(
                 self.service,
                 "_run_recovery_command",
                 return_value=False,
@@ -882,11 +2207,225 @@ class NetworkRecoveryTests(unittest.TestCase):
                 self.service,
                 "_ipv6_leak_route_present",
                 return_value=False,
+            ), patch.object(
+                self.service,
+                "_remove_owned_ipv6_firewall",
+                return_value=True,
             ):
                 self.service._remove_ipv6_leak_protection()
 
             self.assertFalse(marker.exists())
             self.assertFalse(self.service.ipv6_leak_protection_enabled)
+
+    def test_ipv6_leak_cleanup_deletes_only_the_exact_owned_route(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "ipv6-leak-route"
+            firewall_marker = Path(tempdir) / "ipv6-firewall"
+            marker.write_text("owned\n", encoding="utf-8")
+            commands = []
+            self.service.ipv6_leak_protection_enabled = True
+            with patch.object(
+                SERVICE_MODULE,
+                "IPV6_LEAK_ROUTE_MARKER",
+                marker,
+            ), patch.object(
+                SERVICE_MODULE,
+                "IPV6_FIREWALL_MARKER",
+                firewall_marker,
+            ), patch.object(
+                self.service,
+                "_recovery_state_lock",
+                return_value=nullcontext(),
+            ), patch.object(
+                self.service,
+                "_run_recovery_command",
+                side_effect=lambda command: commands.append(command) or True,
+            ), patch.object(
+                self.service,
+                "_ipv6_leak_route_present",
+                return_value=False,
+            ), patch.object(
+                self.service,
+                "_remove_owned_ipv6_firewall",
+                return_value=True,
+            ):
+                self.service._remove_ipv6_leak_protection()
+
+            self.assertEqual(commands, [[
+                "ip", "-6", "route", "del", "unreachable", "::/0",
+                "metric", "1", "proto", "99",
+            ]])
+            self.assertFalse(marker.exists())
+
+    def test_ipv6_verifier_accepts_unreachable_public_targets(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "ipv6-leak-route"
+            marker.touch()
+            for route_error in (
+                errno.EHOSTUNREACH,
+                errno.ENETUNREACH,
+            ):
+                with self.subTest(route_error=route_error), patch.object(
+                    SERVICE_MODULE,
+                    "IPV6_LEAK_ROUTE_MARKER",
+                    marker,
+                ), patch.object(
+                    self.service,
+                    "_ipv6_leak_marker_matches_current",
+                    return_value=True,
+                ), patch.object(
+                    self.service,
+                    "_ipv6_leak_route_present",
+                    return_value=True,
+                ), patch.object(
+                    self.service,
+                    "_verify_ipv6_firewall",
+                    return_value=True,
+                ), patch.object(
+                    self.service,
+                    "_ipv6_route_probe_error",
+                    return_value=route_error,
+                ), patch.object(SERVICE_MODULE.subprocess, "run") as run:
+                    self.assertTrue(
+                        self.service._verify_ipv6_leak_protection()
+                    )
+                    run.assert_not_called()
+
+    def test_ipv6_verifier_preserves_wireguard_but_rejects_physical_route(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "ipv6-leak-route"
+            marker.touch()
+            route = SimpleNamespace(
+                returncode=0,
+                stdout="2606:4700:4700::1111 dev wg0 src fd00::1",
+                stderr="",
+            )
+            common = (
+                patch.object(SERVICE_MODULE, "IPV6_LEAK_ROUTE_MARKER", marker),
+                patch.object(
+                    self.service,
+                    "_ipv6_leak_marker_matches_current",
+                    return_value=True,
+                ),
+                patch.object(
+                    self.service,
+                    "_ipv6_leak_route_present",
+                    return_value=True,
+                ),
+                patch.object(
+                    self.service,
+                    "_verify_ipv6_firewall",
+                    return_value=True,
+                ),
+                patch.object(
+                    self.service,
+                    "_ipv6_route_probe_error",
+                    return_value=0,
+                ),
+                patch.object(SERVICE_MODULE.subprocess, "run", return_value=route),
+            )
+            with common[0], common[1], common[2], common[3], common[4], common[5], patch.object(
+                self.service,
+                "_is_wireguard_device",
+                return_value=True,
+            ):
+                self.assertTrue(self.service._verify_ipv6_leak_protection())
+
+            route.stdout = "2606:4700:4700::1111 dev eth0 src 2001:db8::1"
+            with patch.object(
+                SERVICE_MODULE,
+                "IPV6_LEAK_ROUTE_MARKER",
+                marker,
+            ), patch.object(
+                self.service,
+                "_ipv6_leak_marker_matches_current",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_ipv6_leak_route_present",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_verify_ipv6_firewall",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_ipv6_route_probe_error",
+                return_value=0,
+            ), patch.object(
+                SERVICE_MODULE.subprocess,
+                "run",
+                return_value=route,
+            ), patch.object(
+                self.service,
+                "_is_wireguard_device",
+                return_value=False,
+            ):
+                self.assertFalse(self.service._verify_ipv6_leak_protection())
+
+    def test_ipv6_verifier_does_not_treat_generic_command_error_as_blocked(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "ipv6-leak-route"
+            marker.touch()
+            failed = SimpleNamespace(
+                returncode=2,
+                stdout="",
+                stderr="Operation not permitted",
+            )
+            with patch.object(
+                SERVICE_MODULE,
+                "IPV6_LEAK_ROUTE_MARKER",
+                marker,
+            ), patch.object(
+                self.service,
+                "_ipv6_leak_marker_matches_current",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_ipv6_leak_route_present",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_verify_ipv6_firewall",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_ipv6_route_probe_error",
+                return_value=0,
+            ), patch.object(
+                SERVICE_MODULE.subprocess,
+                "run",
+                return_value=failed,
+            ):
+                self.assertFalse(self.service._verify_ipv6_leak_protection())
+
+    def test_ipv6_verifier_rejects_unexpected_kernel_route_error(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "ipv6-leak-route"
+            marker.touch()
+            with patch.object(
+                SERVICE_MODULE,
+                "IPV6_LEAK_ROUTE_MARKER",
+                marker,
+            ), patch.object(
+                self.service,
+                "_ipv6_leak_marker_matches_current",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_ipv6_leak_route_present",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_verify_ipv6_firewall",
+                return_value=True,
+            ), patch.object(
+                self.service,
+                "_ipv6_route_probe_error",
+                return_value=errno.EPERM,
+            ), patch.object(SERVICE_MODULE.subprocess, "run") as run:
+                self.assertFalse(self.service._verify_ipv6_leak_protection())
+                run.assert_not_called()
 
     def test_cleanup_only_mutates_generation_owned_tunnels(self):
         commands = []
@@ -924,6 +2463,28 @@ class NetworkRecoveryTests(unittest.TestCase):
         self.assertFalse(any("tun-foreign" in command for command in commands))
         self.assertIsNone(self.service.current_tun_device)
         self.assertEqual(self.service.owned_tun_devices, set())
+
+    def test_in_activation_retry_cleanup_preserves_pinned_dns_policy(self):
+        self.service.state = SERVICE_MODULE.NM_VPN_SERVICE_STATE_STARTING
+        self.service.configured_dns_servers = ["10.0.0.53"]
+        self.service.vpn_dns_backend = "networkmanager"
+        self.service.dns_profile_policy_ready = True
+        self.service.dns_activation_policy_ready = True
+        self.service.vpn_dns_servers = ["10.0.0.53"]
+        self.service.dns_leak_protection_ready = True
+        self.service.vpn_domains = ["~."]
+        self.service._remove_ipv6_leak_protection = lambda: None
+        self.service._cleanup_leaked_vpn_dns_links = lambda: None
+
+        self.assertTrue(self.service._cleanup_dns())
+
+        self.assertEqual(self.service.configured_dns_servers, ["10.0.0.53"])
+        self.assertEqual(self.service.vpn_dns_backend, "networkmanager")
+        self.assertTrue(self.service.dns_profile_policy_ready)
+        self.assertTrue(self.service.dns_activation_policy_ready)
+        self.assertEqual(self.service.vpn_dns_servers, [])
+        self.assertFalse(self.service.dns_leak_protection_ready)
+        self.assertEqual(self.service.vpn_domains, [])
 
     def test_cleanup_falls_back_when_resolvectl_returns_nonzero(self):
         commands = []

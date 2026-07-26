@@ -37,6 +37,8 @@ MICROSOFT_TOTP_DIRECT_SELECTORS = (
 MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS = 25.0
 MICROSOFT_METHOD_PICKER_SETTLE_SECONDS = 1.5
 MICROSOFT_PASSWORD_STABILITY_SECONDS = 0.5
+GP_INITIAL_MICROSOFT_PASSWORD_OBSERVATION_SECONDS = 15.0
+GP_INITIAL_MICROSOFT_PASSWORD_NAVIGATION_MAX_SECONDS = 30.0
 MICROSOFT_CREDENTIAL_LOOKUP_TIMEOUT_SECONDS = 15.0
 MICROSOFT_CREDENTIAL_LOOKUP_MAX_SECONDS = 30.0
 MICROSOFT_CREDENTIAL_LOOKUP_EXTENSION_SECONDS = 5.0
@@ -269,7 +271,7 @@ class _PasswordControlSecurityEvidence:
 class _GpClientPasswordStageAuthorization:
     route: str
     main_navigation_generation: int
-    write_generation: int
+    unsafe_write_generation: int
     taint_generation: int
     document_generation: int
     federated_navigation_generation: int
@@ -281,6 +283,17 @@ class _GpClientPasswordStageAuthorization:
     form_signature: str
     form_action_origin: str
     form_method: str
+
+
+@dataclass(frozen=True)
+class _AnyConnectRetainedPasswordStageAuthorization:
+    """Bind a retained password click to DOM and asynchronous evidence."""
+
+    password_stage: _GpClientPasswordStageAuthorization
+    lookup_generation: int
+    lookup_pending_count: int
+    safe_navigation_generation: int
+    unsafe_write_generation: int
 
 
 _AUTH_UI_SNAPSHOT_SCRIPT = r"""
@@ -1642,6 +1655,233 @@ def _password_transition_blocks_alternate_dispatch(
     )
 
 
+def _prime_gp_microsoft_federation_render(
+    page,
+    protocol: Optional[str],
+    page_host: Optional[str],
+) -> bool:
+    """Force one headless compositor paint without persisting auth pixels."""
+    if (
+        str(protocol or "").casefold() != "gp"
+        or str(page_host or "").strip(".").casefold()
+        != "login.microsoftonline.com"
+    ):
+        return False
+    try:
+        page.evaluate(
+            "() => document.documentElement.getBoundingClientRect().width"
+        )
+        # UniBas's Microsoft page can defer its credential-free federation
+        # navigation until Chromium performs a compositor paint.  A 1x1
+        # in-memory capture exercises that lifecycle without writing the
+        # authentication page to disk.
+        page.screenshot(
+            type="png",
+            clip={"x": 0, "y": 0, "width": 1, "height": 1},
+            timeout=2000,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _gp_initial_password_observation_required(
+    protocol: Optional[str],
+    discovery_completed: bool,
+    recovery_attempts: int,
+    password_action_attempts: int,
+    password_dispatched: bool,
+    observation_started: bool,
+    password_stage_authorized: bool,
+    password_control_visible: bool,
+    credential_error_visible: bool,
+    elapsed_seconds: float,
+    navigation_pending: bool,
+    observation_seconds: float = (
+        GP_INITIAL_MICROSOFT_PASSWORD_OBSERVATION_SECONDS
+    ),
+    navigation_max_seconds: float = (
+        GP_INITIAL_MICROSOFT_PASSWORD_NAVIGATION_MAX_SECONDS
+    ),
+) -> bool:
+    """Let an initial GP Microsoft page reveal a late federation redirect."""
+    observation_limit = max(0.0, observation_seconds)
+    navigation_limit = max(observation_limit, navigation_max_seconds)
+    return bool(
+        str(protocol or "").casefold() == "gp"
+        and not discovery_completed
+        and recovery_attempts == 0
+        and password_action_attempts == 0
+        and not password_dispatched
+        and observation_started
+        and (
+            (
+                password_stage_authorized
+                and password_control_visible
+                and not credential_error_visible
+                and elapsed_seconds < observation_limit
+            )
+            or (
+                navigation_pending
+                and elapsed_seconds < navigation_limit
+            )
+        )
+    )
+
+
+def _gp_password_navigation_hard_cap_reached(
+    protocol: Optional[str],
+    discovery_completed: bool,
+    password_action_attempts: int,
+    password_dispatched: bool,
+    navigation_pending: bool,
+    elapsed_seconds: float,
+    max_seconds: float = (
+        GP_INITIAL_MICROSOFT_PASSWORD_NAVIGATION_MAX_SECONDS
+    ),
+) -> bool:
+    """Bound a pre-credential GP main-frame navigation independently of UI churn."""
+    return bool(
+        str(protocol or "").casefold() == "gp"
+        and not discovery_completed
+        and password_action_attempts == 0
+        and not password_dispatched
+        and navigation_pending
+        and elapsed_seconds >= max(0.0, max_seconds)
+    )
+
+
+def _anyconnect_retained_password_continuation_ready(
+    protocol: Optional[str],
+    submission_kind: Optional[str],
+    attempts: int,
+    elapsed_seconds: float,
+    *,
+    lookup_observed: bool,
+    dispatch_observed: bool,
+    safe_navigation_observed: bool,
+    credential_tainted: bool,
+    document_replaced: bool,
+    main_navigation_request_observed: bool,
+    write_request_observed: bool,
+    unsafe_write_request_observed: bool,
+    navigation_pending_at_baseline: bool,
+    navigation_pending_now: bool,
+    strong_owning_form: bool,
+    strong_password_input: bool,
+    current_identity: Optional[str],
+    submitted_identity: Optional[str],
+    value_retained: bool,
+    original_control_origin: Optional[str],
+    original_top_origin: Optional[str],
+    original_form_action_origin: Optional[str],
+    original_form_signature: Optional[str],
+    original_form_method: Optional[str],
+    current_control_origin: Optional[str],
+    current_top_origin: Optional[str],
+    current_form_action_origin: Optional[str],
+    current_form_signature: Optional[str],
+    current_form_method: Optional[str],
+    credential_error_visible: bool,
+    confirm_seconds: float = MICROSOFT_PASSWORD_DISPATCH_CONFIRM_SECONDS,
+) -> bool:
+    """Authorize one retained-form gesture after a credential-free DOM swap.
+
+    FHNW's Microsoft page can commit an already-started document hydration just
+    after the owning submit control is clicked.  That replaces the DOM node but
+    retains its filled value without issuing a credential request.  Only this
+    fully transport- and origin-bound AnyConnect state may continue once, using
+    the retained value rather than entering the password again.
+    """
+    # Microsoft telemetry is a recognized credential-free write.  It may occur
+    # while the retained form is stable, so only the separately tracked unsafe
+    # write generation is a blocker.
+    _ = write_request_observed
+    return bool(
+        str(protocol or "").casefold() == "anyconnect"
+        and submission_kind == "password-unknown"
+        and attempts == 1
+        and elapsed_seconds >= max(0.0, confirm_seconds)
+        and not lookup_observed
+        and dispatch_observed
+        and not safe_navigation_observed
+        and not credential_tainted
+        and document_replaced
+        and not main_navigation_request_observed
+        and not unsafe_write_request_observed
+        and not navigation_pending_at_baseline
+        and not navigation_pending_now
+        and strong_owning_form
+        and strong_password_input
+        and current_identity
+        and submitted_identity
+        and not current_identity.startswith("fallback:")
+        and not submitted_identity.startswith("fallback:")
+        and current_identity != submitted_identity
+        and value_retained
+        and original_control_origin
+        == "https://login.microsoftonline.com"
+        and original_top_origin
+        == "https://login.microsoftonline.com"
+        and original_form_action_origin
+        == "https://login.microsoftonline.com"
+        and original_form_signature
+        and original_form_signature == current_form_signature
+        and original_form_method == "post"
+        and current_control_origin
+        == "https://login.microsoftonline.com"
+        and current_top_origin
+        == "https://login.microsoftonline.com"
+        and current_form_action_origin
+        == "https://login.microsoftonline.com"
+        and current_form_method == "post"
+        and not credential_error_visible
+    )
+
+
+def _anyconnect_retained_password_guard_unchanged(
+    *,
+    expected_lookup_generation: int,
+    expected_lookup_pending_count: int,
+    expected_safe_navigation_generation: int,
+    expected_unsafe_write_generation: int,
+    current_lookup_generation: int,
+    current_lookup_pending_count: int,
+    current_safe_navigation_generation: int,
+    current_unsafe_write_generation: int,
+) -> bool:
+    """Reject a retained click when asynchronous discovery evidence changed."""
+    return bool(
+        expected_lookup_pending_count == 0
+        and current_lookup_pending_count == 0
+        and current_lookup_generation == expected_lookup_generation
+        and current_safe_navigation_generation
+        == expected_safe_navigation_generation
+        and current_unsafe_write_generation
+        == expected_unsafe_write_generation
+    )
+
+
+def _anyconnect_password_dispatch_is_ambiguous(
+    protocol: Optional[str],
+    submission_kind: Optional[str],
+    *,
+    dispatch_observed: bool,
+    credential_tainted: bool,
+    unsafe_write_request_observed: bool,
+    main_navigation_request_observed: bool,
+) -> bool:
+    """Keep hydration-only AnyConnect evidence from proving a password POST."""
+    return bool(
+        str(protocol or "").casefold() == "anyconnect"
+        and submission_kind == "password-unknown"
+        and dispatch_observed
+        and not credential_tainted
+        and not unsafe_write_request_observed
+        and not main_navigation_request_observed
+    )
+
+
 def _password_entry_uses_key_events(protocol: Optional[str]) -> bool:
     """Drive Microsoft-backed VPN password fields through reactive handlers."""
     return str(protocol or "").casefold() in {"anyconnect", "gp"}
@@ -1981,7 +2221,7 @@ def _password_submission_classification_delay(
     """Allow delayed GetCredentialType without delaying a real second stage."""
     normalized_protocol = str(protocol or "").casefold()
     if normalized_protocol == "anyconnect" and not discovery_completed:
-        return MICROSOFT_CREDENTIAL_LOOKUP_TIMEOUT_SECONDS
+        return MICROSOFT_CREDENTIAL_LOOKUP_MAX_SECONDS
     return 1.0
 
 
@@ -3838,7 +4078,12 @@ def do_saml_auth(
                 action_name="Microsoft verification-code submission",
             )
 
-        def _submit_password(password_loc) -> bool:
+        def _submit_password(
+            password_loc,
+            authorization: Optional[
+                _GpClientPasswordStageAuthorization
+            ] = None,
+        ) -> bool:
             """Submit the password form without matching alternate-login links."""
             if (
                 sensitive_action_ledger.dispatched("password")
@@ -3853,20 +4098,20 @@ def do_saml_auth(
                 "Continue",
                 "Next",
             ]
-            if password_discovery_authorized_client_stage is not None:
+            if authorization is not None:
                 submitted = _submit_owned_form(
                     password_loc,
                     labels,
                     [],
-                    allow_unlabelled_submit=False,
+                    allow_unlabelled_submit=True,
                     allow_known_ids=False,
-                    allow_enter=False,
+                    allow_enter=True,
                     sensitive=True,
                     action_name="client-side password submission",
                     pre_sensitive_action_guard=lambda action_loc: (
                         _validate_gp_client_password_stage(
                             password_loc,
-                            password_discovery_authorized_client_stage,
+                            authorization,
                             require_empty=False,
                             submitter_loc=action_loc,
                         )
@@ -4275,8 +4520,8 @@ def do_saml_auth(
             if (
                 sensitive_dispatch_evidence.main_frame_navigation_request_generation
                 != authorization.main_navigation_generation
-                or sensitive_dispatch_evidence.write_request_generation
-                != authorization.write_generation
+                or sensitive_dispatch_evidence.unsafe_write_request_generation
+                != authorization.unsafe_write_generation
                 or sensitive_dispatch_evidence.credential_taint_generation
                 != authorization.taint_generation
                 or sensitive_dispatch_evidence.main_document_generation
@@ -4328,6 +4573,48 @@ def do_saml_auth(
                 raise _SensitiveActionUncertainError(
                     "The authorized password stage changed; "
                     "refusing to enter or submit credentials"
+                )
+
+        def _validate_anyconnect_retained_password_stage(
+            control_loc,
+            authorization: _AnyConnectRetainedPasswordStageAuthorization,
+            *,
+            submitter_loc,
+        ) -> None:
+            """Run the retained-form late guard immediately before its click."""
+            _validate_gp_client_password_stage(
+                control_loc,
+                authorization.password_stage,
+                require_empty=False,
+                submitter_loc=submitter_loc,
+            )
+            if not _anyconnect_retained_password_guard_unchanged(
+                expected_lookup_generation=authorization.lookup_generation,
+                expected_lookup_pending_count=(
+                    authorization.lookup_pending_count
+                ),
+                expected_safe_navigation_generation=(
+                    authorization.safe_navigation_generation
+                ),
+                expected_unsafe_write_generation=(
+                    authorization.unsafe_write_generation
+                ),
+                current_lookup_generation=(
+                    microsoft_credential_lookup.generation
+                ),
+                current_lookup_pending_count=(
+                    microsoft_credential_lookup.pending_count
+                ),
+                current_safe_navigation_generation=(
+                    sensitive_dispatch_evidence.safe_navigation_generation
+                ),
+                current_unsafe_write_generation=(
+                    sensitive_dispatch_evidence.unsafe_write_request_generation
+                ),
+            ):
+                raise _SensitiveActionUncertainError(
+                    "Microsoft discovery evidence changed before the retained "
+                    "password submit; refusing the click"
                 )
 
         def _credential_error_visible() -> bool:
@@ -4774,6 +5061,13 @@ def do_saml_auth(
             _goto_with_retries(start_url, deadline)
             _report_progress(f"portal-ready host={_page_host()}")
 
+            if _prime_gp_microsoft_federation_render(
+                page,
+                protocol,
+                _page_host(),
+            ):
+                _report_progress("gp-federation-render-primed")
+
             if debug:
                 try:
                     _secure_screenshot("/tmp/vpn-step1-portal.png")
@@ -4829,6 +5123,8 @@ def do_saml_auth(
             primary_credential_picker_pending_until = 0.0
             password_bridge_pending_until = 0.0
             password_bridge_attempts = 0
+            gp_initial_password_observation_started_at = None
+            gp_password_navigation_pending_started_at = None
             password_input_ready_since = 0.0
             password_input_identity = None
             password_action_attempts = 0
@@ -4847,6 +5143,8 @@ def do_saml_auth(
             password_action_control_origin = None
             password_action_top_origin = None
             password_action_form_action_origin = None
+            password_action_form_signature = None
+            password_action_form_method = None
             password_action_ui_fingerprint = None
             last_password_transition_evidence = None
             password_discovery_completed = False
@@ -4893,6 +5191,8 @@ def do_saml_auth(
                 nonlocal number_match_detected_reported
                 nonlocal primary_credential_picker_pending_until
                 nonlocal password_bridge_pending_until
+                nonlocal gp_initial_password_observation_started_at
+                nonlocal gp_password_navigation_pending_started_at
                 nonlocal password_input_ready_since
                 nonlocal password_input_identity
                 nonlocal password_control_submitted
@@ -4913,6 +5213,8 @@ def do_saml_auth(
                 nonlocal password_action_control_origin
                 nonlocal password_action_top_origin
                 nonlocal password_action_form_action_origin
+                nonlocal password_action_form_signature
+                nonlocal password_action_form_method
                 nonlocal password_discovery_authorized_taint_generation
                 nonlocal password_discovery_authorized_client_stage
                 nonlocal last_number_match
@@ -4973,6 +5275,8 @@ def do_saml_auth(
                 number_match_detected_reported = False
                 primary_credential_picker_pending_until = 0.0
                 password_bridge_pending_until = 0.0
+                gp_initial_password_observation_started_at = None
+                gp_password_navigation_pending_started_at = None
                 password_input_ready_since = 0.0
                 password_input_identity = None
                 password_control_submitted = False
@@ -4993,6 +5297,8 @@ def do_saml_auth(
                 password_action_control_origin = None
                 password_action_top_origin = None
                 password_action_form_action_origin = None
+                password_action_form_signature = None
+                password_action_form_method = None
                 password_discovery_authorized_taint_generation = None
                 password_discovery_authorized_client_stage = None
                 post_submit_grace_until = 0.0
@@ -5225,19 +5531,6 @@ def do_saml_auth(
                         processing_visible=processing_visible,
                     )
                 )
-                password_lookup_observed = bool(
-                    form_submission_kind == "password-unknown"
-                    and (
-                        microsoft_credential_lookup.generation
-                        > password_submission_lookup_generation
-                        or microsoft_credential_lookup.pending_count > 0
-                    )
-                )
-                password_lookup_transition_pending = bool(
-                    _password_discovery_supported(protocol)
-                    and not password_discovery_completed
-                    and password_lookup_observed
-                )
                 password_discovery_classification_deferred = (
                     _password_discovery_classification_deferred(
                         protocol,
@@ -5321,6 +5614,12 @@ def do_saml_auth(
                 # Freeze transport generations only after every Playwright UI
                 # read above. No browser call may occur before the client-stage
                 # predicate is consumed or the next late guard runs.
+                password_lookup_generation_snapshot = (
+                    microsoft_credential_lookup.generation
+                )
+                password_lookup_pending_count_snapshot = (
+                    microsoft_credential_lookup.pending_count
+                )
                 password_transition_snapshot = (
                     sensitive_dispatch_evidence.generation,
                     sensitive_dispatch_evidence.safe_navigation_generation,
@@ -5334,6 +5633,19 @@ def do_saml_auth(
                     sensitive_dispatch_evidence.federated_safe_navigation_generation,
                     sensitive_dispatch_evidence.federated_safe_navigation_request_generation,
                     sensitive_dispatch_evidence.unsafe_write_request_generation,
+                )
+                password_lookup_observed = bool(
+                    form_submission_kind == "password-unknown"
+                    and (
+                        password_lookup_generation_snapshot
+                        > password_submission_lookup_generation
+                        or password_lookup_pending_count_snapshot > 0
+                    )
+                )
+                password_lookup_transition_pending = bool(
+                    _password_discovery_supported(protocol)
+                    and not password_discovery_completed
+                    and password_lookup_observed
                 )
                 password_federated_navigation_origin = (
                     sensitive_dispatch_evidence.federated_safe_navigation_origin
@@ -5474,6 +5786,185 @@ def do_saml_auth(
                         vpn_hostname=vpn_server_host,
                     )
                 )
+                anyconnect_retained_password_continuation = (
+                    _anyconnect_retained_password_continuation_ready(
+                        protocol,
+                        form_submission_kind,
+                        password_action_attempts,
+                        now - password_action_pending_since,
+                        lookup_observed=password_lookup_observed,
+                        dispatch_observed=password_dispatch_observed,
+                        safe_navigation_observed=(
+                            password_safe_navigation_observed
+                        ),
+                        credential_tainted=password_credential_tainted,
+                        document_replaced=password_document_replaced,
+                        main_navigation_request_observed=(
+                            password_main_navigation_request_observed
+                        ),
+                        write_request_observed=(
+                            password_write_request_observed
+                        ),
+                        unsafe_write_request_observed=(
+                            password_unsafe_write_request_observed
+                        ),
+                        navigation_pending_at_baseline=(
+                            password_navigation_pending_at_baseline
+                        ),
+                        navigation_pending_now=bool(
+                            password_transition_snapshot[7]
+                        ),
+                        strong_owning_form=password_has_strong_owning_form,
+                        strong_password_input=password_has_strong_input,
+                        current_identity=password_security.identity,
+                        submitted_identity=(
+                            submitted_password_control_identity
+                        ),
+                        value_retained=password_value_retained,
+                        original_control_origin=(
+                            password_action_control_origin
+                        ),
+                        original_top_origin=password_action_top_origin,
+                        original_form_action_origin=(
+                            password_action_form_action_origin
+                        ),
+                        original_form_signature=(
+                            password_action_form_signature
+                        ),
+                        original_form_method=password_action_form_method,
+                        current_control_origin=password_security.https_origin,
+                        current_top_origin=current_top_origin,
+                        current_form_action_origin=(
+                            password_security.form_action_origin
+                        ),
+                        current_form_signature=(
+                            password_security.form_signature
+                        ),
+                        current_form_method=password_security.form_method,
+                        credential_error_visible=credential_error_visible,
+                    )
+                )
+                password_already_dispatched = (
+                    sensitive_action_ledger.dispatched("password")
+                )
+                gp_current_password_stage_authorization = None
+                if (
+                    str(protocol or "").casefold() == "gp"
+                    and not password_discovery_completed
+                    and password_action_attempts == 0
+                    and not password_already_dispatched
+                    and gp_microsoft_password_stage_authorized
+                    and usable_password_input is not None
+                    and password_security.value_known
+                    and password_security.value_empty
+                    and not credential_error_visible
+                    and not password_transition_snapshot[7]
+                ):
+                    gp_current_password_stage_authorization = (
+                        _GpClientPasswordStageAuthorization(
+                            route="client",
+                            main_navigation_generation=(
+                                password_transition_snapshot[4]
+                            ),
+                            unsafe_write_generation=(
+                                password_transition_snapshot[11]
+                            ),
+                            taint_generation=password_transition_snapshot[2],
+                            document_generation=password_transition_snapshot[3],
+                            federated_navigation_generation=(
+                                password_transition_snapshot[9]
+                            ),
+                            authorized_origin=(
+                                "https://login.microsoftonline.com"
+                            ),
+                            control_identity=str(password_security.identity),
+                            control_origin=str(password_security.https_origin),
+                            top_origin=str(current_top_origin),
+                            form_identity=str(password_security.form_identity),
+                            form_signature=str(
+                                password_security.form_signature
+                            ),
+                            form_action_origin=str(
+                                password_security.form_action_origin
+                            ),
+                            form_method=str(password_security.form_method),
+                        )
+                    )
+                    if (
+                        ui_recovery_attempts == 0
+                        and gp_initial_password_observation_started_at is None
+                    ):
+                        gp_initial_password_observation_started_at = now
+
+                gp_password_navigation_pending = bool(
+                    str(protocol or "").casefold() == "gp"
+                    and not password_discovery_completed
+                    and password_action_attempts == 0
+                    and not password_already_dispatched
+                    and password_transition_snapshot[7]
+                )
+                if gp_password_navigation_pending:
+                    if gp_password_navigation_pending_started_at is None:
+                        gp_password_navigation_pending_started_at = now
+                else:
+                    gp_password_navigation_pending_started_at = None
+
+                gp_initial_password_observation_elapsed = (
+                    0.0
+                    if gp_initial_password_observation_started_at is None
+                    else max(
+                        0.0,
+                        now - gp_initial_password_observation_started_at,
+                    )
+                )
+                gp_initial_password_observation_pending = (
+                    _gp_initial_password_observation_required(
+                        protocol,
+                        password_discovery_completed,
+                        ui_recovery_attempts,
+                        password_action_attempts,
+                        password_already_dispatched,
+                        (
+                            gp_initial_password_observation_started_at
+                            is not None
+                        ),
+                        gp_microsoft_password_stage_authorized,
+                        usable_password_input is not None,
+                        credential_error_visible,
+                        gp_initial_password_observation_elapsed,
+                        gp_password_navigation_pending,
+                    )
+                )
+                gp_navigation_cap_anchor = (
+                    gp_password_navigation_pending_started_at
+                )
+                if (
+                    gp_navigation_cap_anchor is not None
+                    and ui_recovery_attempts == 0
+                    and gp_initial_password_observation_started_at is not None
+                ):
+                    gp_navigation_cap_anchor = min(
+                        gp_navigation_cap_anchor,
+                        gp_initial_password_observation_started_at,
+                    )
+                gp_password_navigation_hard_cap = (
+                    _gp_password_navigation_hard_cap_reached(
+                        protocol,
+                        password_discovery_completed,
+                        password_action_attempts,
+                        password_already_dispatched,
+                        gp_password_navigation_pending,
+                        (
+                            0.0
+                            if gp_navigation_cap_anchor is None
+                            else max(0.0, now - gp_navigation_cap_anchor)
+                        ),
+                    )
+                )
+                if gp_password_navigation_hard_cap:
+                    _report_progress("gp-password-navigation-timeout")
+                    if _recover_stale_browser_ui(now, force=True):
+                        continue
                 if (
                     password_action_attempts > 0
                     and not sensitive_action_ledger.dispatched("password")
@@ -5609,6 +6100,175 @@ def do_saml_auth(
                         # used by FHNW.  Wait for its replacement control before
                         # authorizing the one real password submission.
                         pass
+                    elif anyconnect_retained_password_continuation:
+                        # A document hydration replaced the password DOM node
+                        # without issuing a credential or unsafe write request.
+                        # Submit its retained value once; never type the secret
+                        # again and bind the click to the exact replacement form.
+                        retained_authorization = (
+                            _AnyConnectRetainedPasswordStageAuthorization(
+                                password_stage=(
+                                    _GpClientPasswordStageAuthorization(
+                                        route="client",
+                                        main_navigation_generation=(
+                                            password_transition_snapshot[4]
+                                        ),
+                                        unsafe_write_generation=(
+                                            password_transition_snapshot[11]
+                                        ),
+                                        taint_generation=(
+                                            password_transition_snapshot[2]
+                                        ),
+                                        document_generation=(
+                                            password_transition_snapshot[3]
+                                        ),
+                                        federated_navigation_generation=(
+                                            password_transition_snapshot[9]
+                                        ),
+                                        authorized_origin=(
+                                            "https://login.microsoftonline.com"
+                                        ),
+                                        control_identity=str(
+                                            password_security.identity
+                                        ),
+                                        control_origin=str(
+                                            password_security.https_origin
+                                        ),
+                                        top_origin=str(current_top_origin),
+                                        form_identity=str(
+                                            password_security.form_identity
+                                        ),
+                                        form_signature=str(
+                                            password_security.form_signature
+                                        ),
+                                        form_action_origin=str(
+                                            password_security.form_action_origin
+                                        ),
+                                        form_method=str(
+                                            password_security.form_method
+                                        ),
+                                    )
+                                ),
+                                lookup_generation=(
+                                    password_lookup_generation_snapshot
+                                ),
+                                lookup_pending_count=(
+                                    password_lookup_pending_count_snapshot
+                                ),
+                                safe_navigation_generation=(
+                                    password_transition_snapshot[1]
+                                ),
+                                unsafe_write_generation=(
+                                    password_transition_snapshot[11]
+                                ),
+                            )
+                        )
+                        retained_submitted = _submit_owned_form(
+                            usable_password_input,
+                            [
+                                "Anmelden",
+                                "Sign in",
+                                "Connexion",
+                                "Accedi",
+                                "Continue",
+                                "Next",
+                            ],
+                            [],
+                            allow_unlabelled_submit=True,
+                            allow_known_ids=False,
+                            allow_enter=True,
+                            sensitive=True,
+                            action_name=(
+                                "retained AnyConnect password form submission"
+                            ),
+                            pre_sensitive_action_guard=lambda action_loc: (
+                                _validate_anyconnect_retained_password_stage(
+                                    usable_password_input,
+                                    retained_authorization,
+                                    submitter_loc=action_loc,
+                                )
+                            ),
+                        )
+                        if not retained_submitted:
+                            raise RuntimeError(
+                                "The retained Microsoft password form has no "
+                                "validated owning submit control"
+                            )
+                        password_action_attempts = 2
+                        password_action_pending_since = time.monotonic()
+                        password_action_dispatch_generation = (
+                            password_transition_snapshot[0]
+                        )
+                        password_action_safe_navigation_generation = (
+                            password_transition_snapshot[1]
+                        )
+                        password_action_federated_safe_navigation_generation = (
+                            password_transition_snapshot[9]
+                        )
+                        password_action_credential_taint_generation = (
+                            password_transition_snapshot[2]
+                        )
+                        password_action_document_generation = (
+                            password_transition_snapshot[3]
+                        )
+                        password_action_main_navigation_request_generation = (
+                            password_transition_snapshot[4]
+                        )
+                        password_action_write_request_generation = (
+                            password_transition_snapshot[5]
+                        )
+                        password_action_unsafe_write_request_generation = (
+                            password_transition_snapshot[11]
+                        )
+                        password_action_outbound_request_generation = (
+                            password_transition_snapshot[6]
+                        )
+                        password_action_navigation_pending_count = (
+                            password_transition_snapshot[7]
+                        )
+                        password_action_control_identity = (
+                            password_security.identity
+                        )
+                        password_action_control_origin = (
+                            password_security.https_origin
+                        )
+                        password_action_top_origin = current_top_origin
+                        password_action_form_action_origin = (
+                            password_security.form_action_origin
+                        )
+                        password_action_form_signature = (
+                            password_security.form_signature
+                        )
+                        password_action_form_method = (
+                            password_security.form_method
+                        )
+                        password_submission_lookup_generation = (
+                            microsoft_credential_lookup.generation
+                        )
+                        password_submission_classify_until = (
+                            _password_submission_classification_deadline(
+                                protocol,
+                                password_discovery_completed,
+                                password_action_pending_since,
+                                deadline,
+                            )
+                        )
+                        _interruptible_pause(0.25)
+                        _refresh_rendered_ui_snapshot()
+                        password_action_ui_fingerprint = (
+                            _auth_ui_fingerprint()
+                        )
+                        _report_progress(
+                            "password-retained-form-submitted"
+                        )
+                        _arm_submission_wait(
+                            "password-unknown",
+                            password_action_pending_since,
+                            submitted_password_identity=(
+                                password_security.identity
+                            ),
+                        )
+                        continue
                     elif (
                         password_discovery_classification_deferred
                         and (
@@ -5622,6 +6282,24 @@ def do_saml_auth(
                         # It suppresses the Enter fallback but must not consume
                         # the one real password submission yet.
                         pass
+                    elif _anyconnect_password_dispatch_is_ambiguous(
+                        protocol,
+                        form_submission_kind,
+                        dispatch_observed=password_dispatch_observed,
+                        credential_tainted=password_credential_tainted,
+                        unsafe_write_request_observed=(
+                            password_unsafe_write_request_observed
+                        ),
+                        main_navigation_request_observed=(
+                            password_main_navigation_request_observed
+                        ),
+                    ):
+                        # A document commit or safe telemetry can change the UI
+                        # without carrying the password. At classification expiry
+                        # consume the epoch fail-closed, but never report that
+                        # ambiguous evidence as a confirmed credential dispatch.
+                        sensitive_action_ledger.record("password")
+                        _report_progress("password-dispatch-uncertain")
                     elif password_dispatch_observed:
                         sensitive_action_ledger.record("password")
                         _report_progress("password-dispatch-confirmed")
@@ -5757,7 +6435,9 @@ def do_saml_auth(
                                 main_navigation_generation=(
                                     password_transition_snapshot[4]
                                 ),
-                                write_generation=password_transition_snapshot[5],
+                                unsafe_write_generation=(
+                                    password_transition_snapshot[11]
+                                ),
                                 taint_generation=password_transition_snapshot[2],
                                 document_generation=password_transition_snapshot[3],
                                 federated_navigation_generation=(
@@ -5818,6 +6498,8 @@ def do_saml_auth(
                         password_action_control_origin = None
                         password_action_top_origin = None
                         password_action_form_action_origin = None
+                        password_action_form_signature = None
+                        password_action_form_method = None
                         password_action_ui_fingerprint = None
                         password_input_ready_since = 0.0
                         password_input_identity = None
@@ -5998,6 +6680,7 @@ def do_saml_auth(
                     or now < primary_credential_picker_pending_until
                     or now < password_bridge_pending_until
                     or credential_lookup_waiting
+                    or gp_initial_password_observation_pending
                 )
                 if (
                     not intentional_transition_pending
@@ -6496,6 +7179,16 @@ def do_saml_auth(
                 ):
                     pass_loc = usable_password_input
                     if pass_loc:
+                        if gp_initial_password_observation_pending:
+                            _report_progress(
+                                "gp-initial-password-observation"
+                            )
+                            _interruptible_pause(0.1)
+                            continue
+                        if gp_password_navigation_pending:
+                            _report_progress("gp-password-navigation-pending")
+                            _interruptible_pause(0.1)
+                            continue
                         password_now = time.monotonic()
                         current_password_identity = _form_control_identity(pass_loc)
                         password_control_identity_this_loop = (
@@ -6519,6 +7212,14 @@ def do_saml_auth(
                         ):
                             _interruptible_pause(0.1)
                             continue
+                        gp_password_stage_authorization = (
+                            password_discovery_authorized_client_stage
+                            or gp_current_password_stage_authorization
+                        )
+                        if gp_password_stage_authorization is not None:
+                            password_control_identity_this_loop = (
+                                gp_password_stage_authorization.control_identity
+                            )
                         password_entry_started = False
                         try:
                             if (
@@ -6535,15 +7236,25 @@ def do_saml_auth(
                                         "A credential request appeared after password "
                                         "discovery; refusing another password action"
                                     )
-                            if (
-                                password_discovery_authorized_client_stage
-                                is not None
-                            ):
-                                _validate_gp_client_password_stage(
-                                    pass_loc,
-                                    password_discovery_authorized_client_stage,
-                                    require_empty=True,
-                                )
+                            if gp_password_stage_authorization is not None:
+                                try:
+                                    _validate_gp_client_password_stage(
+                                        pass_loc,
+                                        gp_password_stage_authorization,
+                                        require_empty=True,
+                                    )
+                                except _SensitiveActionUncertainError:
+                                    # No credential has been entered yet. A
+                                    # late telemetry/navigation/DOM change is
+                                    # safe to observe again from a new frozen
+                                    # stage instead of failing the activation.
+                                    password_input_ready_since = 0.0
+                                    password_input_identity = None
+                                    _report_progress(
+                                        "gp-password-stage-revalidating"
+                                    )
+                                    _interruptible_pause(0.1)
+                                    continue
                             lookup_generation_before = (
                                 microsoft_credential_lookup.generation
                             )
@@ -6582,13 +7293,10 @@ def do_saml_auth(
                             elif adfs_mode or _input_value_empty(pass_loc):
                                 password_entry_started = True
                                 _enter_password_value(pass_loc, password, protocol)
-                            if (
-                                password_discovery_authorized_client_stage
-                                is not None
-                            ):
+                            if gp_password_stage_authorization is not None:
                                 _validate_gp_client_password_stage(
                                     pass_loc,
-                                    password_discovery_authorized_client_stage,
+                                    gp_password_stage_authorization,
                                     require_empty=False,
                                 )
                             if (
@@ -6609,7 +7317,12 @@ def do_saml_auth(
                                 password_discovery_authorized_taint_generation = None
                             password_entered_this_loop = True
                             progressed = True
-                            form_submitted = _submit_password(pass_loc)
+                            form_submitted = _submit_password(
+                                pass_loc,
+                                authorization=(
+                                    gp_password_stage_authorization
+                                ),
+                            )
                             if form_submitted:
                                 password_discovery_authorized_taint_generation = None
                                 password_discovery_authorized_client_stage = None
@@ -6645,16 +7358,44 @@ def do_saml_auth(
                                 password_action_navigation_pending_count = (
                                     navigation_pending_count_before
                                 )
-                                password_action_control_identity = (
-                                    current_password_identity
-                                )
-                                password_action_control_origin = (
-                                    password_security.https_origin
-                                )
-                                password_action_top_origin = current_top_origin
-                                password_action_form_action_origin = (
-                                    password_security.form_action_origin
-                                )
+                                if gp_password_stage_authorization is not None:
+                                    password_action_control_identity = (
+                                        gp_password_stage_authorization.control_identity
+                                    )
+                                    password_action_control_origin = (
+                                        gp_password_stage_authorization.control_origin
+                                    )
+                                    password_action_top_origin = (
+                                        gp_password_stage_authorization.top_origin
+                                    )
+                                    password_action_form_action_origin = (
+                                        gp_password_stage_authorization.form_action_origin
+                                    )
+                                    password_action_form_signature = (
+                                        gp_password_stage_authorization.form_signature
+                                    )
+                                    password_action_form_method = (
+                                        gp_password_stage_authorization.form_method
+                                    )
+                                else:
+                                    password_action_control_identity = (
+                                        current_password_identity
+                                    )
+                                    password_action_control_origin = (
+                                        password_security.https_origin
+                                    )
+                                    password_action_top_origin = (
+                                        current_top_origin
+                                    )
+                                    password_action_form_action_origin = (
+                                        password_security.form_action_origin
+                                    )
+                                    password_action_form_signature = (
+                                        password_security.form_signature
+                                    )
+                                    password_action_form_method = (
+                                        password_security.form_method
+                                    )
                                 password_input_ready_since = 0.0
                                 password_input_identity = None
                                 filled_password = True
@@ -7026,6 +7767,12 @@ def do_saml_auth(
                         password_action_top_origin = current_top_origin
                         password_action_form_action_origin = (
                             password_security.form_action_origin
+                        )
+                        password_action_form_signature = (
+                            password_security.form_signature
+                        )
+                        password_action_form_method = (
+                            password_security.form_method
                         )
                         _interruptible_pause(0.25)
                         _refresh_rendered_ui_snapshot()

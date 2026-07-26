@@ -13,6 +13,7 @@
 , vpnc-scripts
 , writeShellScriptBin
 , iproute2
+, nftables
 , procps
 , systemd
 , openresolv
@@ -44,7 +45,7 @@ let
 in
 python3Packages.buildPythonApplication rec {
   pname = "networkmanager-ms-sso";
-  version = "2.0.5";
+  version = "2.0.6";
   format = "other";
 
   src = lib.cleanSource ../.;
@@ -80,6 +81,7 @@ python3Packages.buildPythonApplication rec {
       openconnect
       networkmanager
       iproute2
+      nftables
       procps
       systemd
       openresolv
@@ -124,6 +126,7 @@ python3Packages.buildPythonApplication rec {
       openconnect
       vpnc-scripts
       iproute2
+      nftables
       procps
       util-linux
     ];

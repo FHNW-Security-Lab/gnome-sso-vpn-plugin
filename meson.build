@@ -1,5 +1,5 @@
 project('network-manager-ms-sso', 'c',
-  version: '2.0.5',
+  version: '2.0.6',
   meson_version: '>= 0.56.0',
   license: 'GPL-2.0-or-later',
   default_options: [
@@ -81,10 +81,21 @@ install_data('src/nm-ms-sso-recover-network',
   install_mode: 'rwxr-xr-x',
 )
 
+install_data('src/nm-ms-sso-migrate-dns-policy',
+  rename: 'nm-ms-sso-migrate-dns-policy',
+  install_dir: libexecdir,
+  install_mode: 'rwxr-xr-x',
+)
+
 install_data('src/nm-ms-sso-recover-network',
   rename: '90-nm-ms-sso-recover-network',
   install_dir: join_paths(sysconfdir, 'NetworkManager', 'dispatcher.d'),
   install_mode: 'rwxr-xr-x',
+)
+
+install_data('data/networkmanager-ms-sso.tmpfiles',
+  rename: ['networkmanager-ms-sso.conf'],
+  install_dir: join_paths(prefix, 'lib', 'tmpfiles.d'),
 )
 
 # Install plugin registration file

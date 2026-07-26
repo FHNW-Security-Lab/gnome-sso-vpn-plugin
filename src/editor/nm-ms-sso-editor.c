@@ -214,6 +214,8 @@ update_connection(NMVpnEditor *editor, NMConnection *connection, GError **error)
     MsSsoEditorPrivate *priv = self->priv;
     NMSettingVpn *s_vpn;
     NMSettingConnection *s_con;
+    NMSettingIPConfig *s_ip4;
+    NMSettingIPConfig *s_ip6;
     const char *gateway;
     const char *username;
     const char *gp_os_version;
@@ -280,6 +282,29 @@ update_connection(NMVpnEditor *editor, NMConnection *connection, GError **error)
         if (timeout != current_timeout)
             g_object_set(s_vpn, NM_SETTING_VPN_TIMEOUT, timeout, NULL);
     }
+
+    /* Give VPN DNS an exclusive negative priority and route the DNS root
+     * through the plugin-provided resolvers.  Negative priority prevents
+     * NetworkManager from retaining physical-link resolvers as fallbacks. */
+    s_ip4 = nm_connection_get_setting_ip4_config(connection);
+    if (!s_ip4) {
+        s_ip4 = NM_SETTING_IP_CONFIG(nm_setting_ip4_config_new());
+        g_object_set(s_ip4,
+                     NM_SETTING_IP_CONFIG_METHOD, NM_SETTING_IP4_CONFIG_METHOD_AUTO,
+                     NULL);
+        nm_connection_add_setting(connection, NM_SETTING(s_ip4));
+    }
+    g_object_set(s_ip4,
+                 NM_SETTING_IP_CONFIG_DNS_PRIORITY, -100,
+                 NM_SETTING_IP_CONFIG_IGNORE_AUTO_DNS, FALSE,
+                 NULL);
+    nm_setting_ip_config_add_dns_search(s_ip4, "~.");
+
+    /* Do not create or alter the IPv6 method: some profiles deliberately use
+     * "disabled".  An existing setting can still carry the exclusive priority. */
+    s_ip6 = nm_connection_get_setting_ip6_config(connection);
+    if (s_ip6)
+        g_object_set(s_ip6, NM_SETTING_IP_CONFIG_DNS_PRIORITY, -100, NULL);
 
     /* Set secrets in NM connection (for NM's internal handling) */
     if (password && *password) {

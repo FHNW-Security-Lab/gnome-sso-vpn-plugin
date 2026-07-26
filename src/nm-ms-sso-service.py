@@ -13,6 +13,8 @@ It uses the unified core module for:
 """
 
 import fcntl
+import errno
+import json
 import os
 import re
 import sys
@@ -25,6 +27,7 @@ import socket
 import ipaddress
 import shutil
 import stat
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -147,11 +150,38 @@ NETWORK_RECOVERY_INITIAL_DELAY_MS = 750
 NETWORK_RECOVERY_TIMEOUT_SECONDS = 15
 GP_GATEWAY_ROUTE_STABILIZATION_DELAYS = (0.0, 0.2, 0.5, 1.0, 1.5)
 ANYCONNECT_STRUCTURAL_READY_GRACE_SECONDS = 1.0
-IPV6_LEAK_ROUTE_METRIC = "42760"
-IPV6_LEAK_ROUTE_PROTOCOL = "186"
+IPV6_LEAK_ROUTE_METRIC = "1"
+IPV6_LEAK_ROUTE_PROTOCOL = "99"
 IPV6_LEAK_ROUTE_MARKER = Path(
     "/run/network-manager-ms-sso/ipv6-leak-route"
 )
+IPV6_FIREWALL_FAMILY = "inet"
+IPV6_FIREWALL_TABLE = "nm_ms_sso_ipv6"
+IPV6_FIREWALL_CHAIN = "output"
+IPV6_FIREWALL_COMMENT = "nm-ms-sso direct IPv6 kill switch"
+DNS_UDP_FIREWALL_COMMENT = "nm-ms-sso direct UDP DNS kill switch"
+DNS_TCP_FIREWALL_COMMENT = "nm-ms-sso direct TCP DNS kill switch"
+IPV6_FIREWALL_MARKER = Path(
+    "/run/network-manager-ms-sso/ipv6-firewall"
+)
+RECOVERY_LOCK_FILE = Path(
+    "/run/network-manager-ms-sso/recovery.lock"
+)
+LEGACY_IPV6_LEAK_ROUTES = (
+    ("42760", "186"),
+    ("50", None),
+)
+LEAK_PROTECTION_ERROR_PREFIX = "Leak protection failed:"
+FULL_DNS_ROUTE_DOMAIN = "~."
+# OpenConnect's vpnc-script assigns the tunnel address before it installs the
+# tunnel routes, and it repeats the split-exclude work once per physical
+# uplink.  Multi-homed hosts therefore expose a window in which the tunnel is
+# addressed but VPN DNS still resolves through an uplink.
+DNS_TUNNEL_ROUTE_TIMEOUT_SECONDS = 20
+DNS_TUNNEL_ROUTE_POLL_SECONDS = 0.25
+KNOWN_VPN_DNS_SERVERS = {
+    "vpn.unibas.ch": ("131.152.1.1", "131.152.1.5"),
+}
 OPENCONNECT_STATE_FILE = Path(
     "/run/network-manager-ms-sso/openconnect.state"
 )
@@ -187,7 +217,12 @@ class VPNPluginService(dbus.service.Object):
         self.current_gateway_host = None
         self.current_gateway_port = 443
         self.current_dns_server_limit = 3
+        self.pending_tun_device = None
+        self.configured_dns_servers = []
         self.vpn_dns_servers = []
+        self.vpn_dns_backend = None
+        self.dns_profile_policy_ready = False
+        self.dns_activation_policy_ready = False
         self.vpn_domains = []
         self.vpn_tunnel_all_dns = None
         self.vpn_split_excludes = []
@@ -196,6 +231,7 @@ class VPNPluginService(dbus.service.Object):
         self.owned_tun_ifindices = {}
         self.preexisting_tun_devices = set()
         self.ipv6_leak_protection_enabled = False
+        self.dns_leak_protection_ready = False
         # NetworkManager-owned uplinks captured before the VPN changes routing
         # or DNS.  They are reapplied only when post-disconnect health checks
         # show that the base network did not recover on its own.
@@ -307,6 +343,7 @@ class VPNPluginService(dbus.service.Object):
         secrets['reconnect_max_delay_seconds'] = vpn_data.get('reconnect-max-delay-seconds', '')
         secrets['reconnect_max_attempts'] = vpn_data.get('reconnect-max-attempts', '')
         secrets['dns_server_limit'] = vpn_data.get('dns-server-limit', '')
+        secrets['dns_servers'] = vpn_data.get('dns-servers', '')
         secrets['mfa_preference'] = vpn_data.get('mfa-preference', '')
         secrets['debug_auth'] = vpn_data.get('debug-auth', '')
 
@@ -1577,16 +1614,134 @@ class VPNPluginService(dbus.service.Object):
         header = transaction_id + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
         return transaction_id, header + question
 
-    def _probe_dns_server(self, server: str, timeout_seconds: float = 2.0) -> bool:
-        """Return True if a VPN DNS server responds to a basic UDP query."""
-        query_name = self.current_gateway_host or self.current_gateway or "example.com"
+    @staticmethod
+    def _parse_dns_server_values(values) -> list[str]:
+        """Return unique IPv4 resolver addresses from profile/server data."""
+        if values is None:
+            return []
+        if isinstance(values, (str, bytes)):
+            if isinstance(values, bytes):
+                values = values.decode("utf-8", errors="ignore")
+            values = re.split(r"[\s,;]+", values)
+
+        normalized = []
+        seen = set()
+        for value in values:
+            text = str(value).strip()
+            if not text or text in seen:
+                continue
+            try:
+                if ipaddress.ip_address(text).version != 4:
+                    continue
+            except ValueError:
+                continue
+            normalized.append(text)
+            seen.add(text)
+        return normalized
+
+    def _dns_candidates_for_vpn(self, protocol: str) -> list[str]:
+        """Return configured, pushed, or known-safe VPN DNS candidates."""
+        configured = self._parse_dns_server_values(
+            getattr(self, "configured_dns_servers", [])
+        )
+        if configured:
+            log.info(f"Using {len(configured)} explicitly configured VPN DNS server(s)")
+            return configured
+
+        pushed = self._parse_dns_server_values(
+            getattr(self, "vpn_dns_servers", [])
+        )
+        if pushed:
+            return pushed
+
+        gateway_host = str(
+            getattr(self, "current_gateway_host", "") or ""
+        ).strip().rstrip(".").casefold()
+        if protocol == "gp" and gateway_host in KNOWN_VPN_DNS_SERVERS:
+            fallback = list(KNOWN_VPN_DNS_SERVERS[gateway_host])
+            log.info(
+                "Using the gateway-specific VPN DNS fallback for "
+                f"{gateway_host}: {len(fallback)} server(s)"
+            )
+            return fallback
+        return []
+
+    @staticmethod
+    def _route_device(route_output: str) -> Optional[str]:
+        parts = str(route_output or "").split()
+        try:
+            return parts[parts.index("dev") + 1]
+        except (ValueError, IndexError):
+            return None
+
+    def _dns_route_uses_tunnel(
+            self,
+            server: str,
+            tun_device: str,
+            log_mismatch: bool = True,
+    ) -> bool:
+        """Require a resolver's IPv4 route to use the exact owned tunnel."""
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "route", "get", server],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except Exception as e:
+            log.warning(f"Could not inspect the VPN DNS route for {server}: {e}")
+            return False
+        if result.returncode != 0:
+            return False
+        actual_device = self._route_device(result.stdout)
+        if actual_device != tun_device:
+            if log_mismatch:
+                log.warning(
+                    f"VPN DNS server {server} would use {actual_device or 'no device'}, "
+                    f"not the owned tunnel {tun_device}"
+                )
+            return False
+        return True
+
+    def _probe_dns_server(
+            self,
+            server: str,
+            timeout_seconds: float = 2.0,
+            tun_device: Optional[str] = None,
+            require_answer: bool = False,
+    ) -> bool:
+        """Return True only for a valid DNS response, optionally tunnel-bound."""
+        query_name = "example.com"
         try:
             transaction_id, packet = self._build_dns_probe_query(query_name)
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                if tun_device:
+                    bind_option = getattr(socket, "SO_BINDTODEVICE", None)
+                    if bind_option is None:
+                        log.warning("SO_BINDTODEVICE is unavailable for the VPN DNS probe")
+                        return False
+                    sock.setsockopt(
+                        socket.SOL_SOCKET,
+                        bind_option,
+                        tun_device.encode("utf-8") + b"\0",
+                    )
                 sock.settimeout(timeout_seconds)
                 sock.sendto(packet, (server, 53))
                 response, _addr = sock.recvfrom(512)
-            return len(response) >= 12 and response[:2] == transaction_id
+            if len(response) < 12 or response[:2] != transaction_id:
+                return False
+            flags = int.from_bytes(response[2:4], "big")
+            question_count = int.from_bytes(response[4:6], "big")
+            answer_count = int.from_bytes(response[6:8], "big")
+            is_response = bool(flags & 0x8000)
+            response_code = flags & 0x000f
+            return bool(
+                is_response
+                and response_code == 0
+                and question_count >= 1
+                and (not require_answer or answer_count >= 1)
+            )
         except Exception as e:
             log.debug(f"DNS probe failed for {server}: {e}")
             return False
@@ -1597,7 +1752,11 @@ class VPNPluginService(dbus.service.Object):
         if not dns_servers:
             return False
         for server in dns_servers:
-            if self._probe_dns_server(server):
+            if self._probe_dns_server(
+                server,
+                tun_device=getattr(self, "current_tun_device", None),
+                require_answer=True,
+            ):
                 log.info(f"VPN DNS probe succeeded via {server}")
                 return True
         log.warning(f"VPN DNS probe failed for all servers: {dns_servers}")
@@ -1612,7 +1771,7 @@ class VPNPluginService(dbus.service.Object):
         """Wait until pushed VPN DNS responds after NetworkManager config is emitted."""
         dns_servers = self._normalize_dns_servers(getattr(self, "vpn_dns_servers", []))
         if not dns_servers:
-            return True
+            return False
 
         deadline = time.monotonic() + max(1, timeout_seconds)
         while time.monotonic() < deadline:
@@ -1625,6 +1784,510 @@ class VPNPluginService(dbus.service.Object):
                 return True
             time.sleep(1)
         return False
+
+    def _resolved_dns_protection_matches(
+            self,
+            tun_device: str,
+            dns_servers: list[str],
+    ) -> bool:
+        """Verify systemd-resolved has the tunnel DNS and root route domain."""
+        expected_ifindex = getattr(self, "owned_tun_ifindices", {}).get(tun_device)
+        live_ifindex = self._link_ifindex(tun_device)
+        if (
+            tun_device != getattr(self, "current_tun_device", None)
+            or tun_device not in getattr(self, "owned_tun_devices", set())
+            or expected_ifindex is None
+            or live_ifindex != expected_ifindex
+        ):
+            return False
+        checks = (
+            (["resolvectl", "dns", tun_device, "--json=short"], "dns"),
+            (["resolvectl", "domain", tun_device, "--json=short"], "domain"),
+            (["resolvectl", "default-route", tun_device, "--json=short"], "default"),
+        )
+        payloads = {}
+        json_available = True
+        for command, label in checks:
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                if result.returncode != 0:
+                    json_available = False
+                    break
+                payloads[label] = json.loads(result.stdout)
+            except Exception as e:
+                # JSON output was added after the stable text interface.  Keep
+                # strict verification on older systemd releases by parsing the
+                # locale-pinned per-link text output below.
+                log.debug(f"Resolved JSON verification unavailable for {label}: {e}")
+                json_available = False
+                break
+
+        if json_available:
+            try:
+                dns_entry = payloads["dns"][0]
+                domain_entry = payloads["domain"][0]
+                default_entry = payloads["default"][0]
+                if any(
+                    int(entry.get("ifindex", -1)) != expected_ifindex
+                    for entry in (dns_entry, domain_entry, default_entry)
+                ):
+                    return False
+                actual_dns = {
+                    server.get("addressString")
+                    for server in (dns_entry.get("servers") or [])
+                    if isinstance(server, dict)
+                }
+                domains = domain_entry.get("searchDomains") or []
+                has_root_route = any(
+                    domain.get("name") == "." and domain.get("routeOnly") is True
+                    for domain in domains
+                    if isinstance(domain, dict)
+                )
+                return bool(
+                    set(dns_servers) == actual_dns
+                    and has_root_route
+                    and default_entry.get("defaultRoute") is True
+                    and self._link_ifindex(tun_device) == expected_ifindex
+                )
+            except (IndexError, KeyError, TypeError, ValueError, AttributeError):
+                return False
+
+        text_checks = (
+            (["resolvectl", "dns", tun_device], "dns"),
+            (["resolvectl", "domain", tun_device], "domain"),
+            (["resolvectl", "default-route", tun_device], "default"),
+        )
+        text_values = {}
+        text_environment = os.environ.copy()
+        text_environment["LC_ALL"] = "C"
+        for command, label in text_checks:
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                    env=text_environment,
+                )
+            except Exception as e:
+                log.warning(f"Could not verify resolved {label} state: {e}")
+                return False
+            if result.returncode != 0:
+                return False
+            parsed = self._parse_resolvectl_link_text(
+                result.stdout,
+                expected_ifindex,
+            )
+            if parsed is None:
+                return False
+            text_values[label] = parsed
+
+        return bool(
+            set(text_values["dns"].split()) == set(dns_servers)
+            and FULL_DNS_ROUTE_DOMAIN in text_values["domain"].split()
+            and text_values["default"].strip().casefold() == "yes"
+            and self._link_ifindex(tun_device) == expected_ifindex
+        )
+
+    @staticmethod
+    def _parse_resolvectl_link_text(
+            output: str,
+            expected_ifindex: int,
+    ) -> Optional[str]:
+        """Return one exact link's value from locale-pinned resolvectl text."""
+        lines = [line.rstrip() for line in str(output or "").splitlines() if line.strip()]
+        if not lines:
+            return None
+        match = re.match(
+            r"^\s*Link\s+(\d+)(?:\s+\([^)]*\))?\s*:\s*(.*)$",
+            lines[0],
+        )
+        if not match or int(match.group(1)) != int(expected_ifindex):
+            return None
+        continuation = []
+        for line in lines[1:]:
+            if re.match(r"^\s*Link\s+\d+", line):
+                return None
+            continuation.append(line.strip())
+        return " ".join([match.group(2).strip(), *continuation]).strip()
+
+    @staticmethod
+    def _systemd_resolved_is_active() -> bool:
+        """Use resolvectl only when resolved is the host's effective resolver."""
+        if not shutil.which("resolvectl"):
+            return False
+        try:
+            resolv_conf = Path("/etc/resolv.conf").resolve()
+            resolved_paths = {
+                Path("/run/systemd/resolve/stub-resolv.conf"),
+                Path("/run/systemd/resolve/resolv.conf"),
+            }
+            if resolv_conf not in resolved_paths:
+                return False
+            result = subprocess.run(
+                ["resolvectl", "status"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _apply_full_dns_resolved(
+            self,
+            tun_device: str,
+            dns_servers,
+            connect_generation: Optional[int] = None,
+    ) -> bool:
+        """Apply and verify all-DNS routing on an exact generation-owned link."""
+        expected_ifindex = getattr(self, "owned_tun_ifindices", {}).get(tun_device)
+        if (
+            (connect_generation is not None and self._is_connect_cancelled(connect_generation))
+            or tun_device != getattr(self, "current_tun_device", None)
+            or tun_device not in getattr(self, "owned_tun_devices", set())
+            or expected_ifindex is None
+            or self._link_ifindex(tun_device) != expected_ifindex
+        ):
+            log.warning(
+                f"Refusing stale DNS protection for {tun_device} "
+                f"(generation {connect_generation})"
+            )
+            return False
+
+        normalized_dns = self._parse_dns_server_values(dns_servers)
+        if not normalized_dns:
+            return False
+        dns_backend = getattr(self, "vpn_dns_backend", None)
+        if dns_backend is None:
+            dns_backend = (
+                "resolved" if self._systemd_resolved_is_active()
+                else "networkmanager"
+            )
+            self.vpn_dns_backend = dns_backend
+        if dns_backend == "networkmanager":
+            # NetworkManager's Ip4Config is authoritative for dnsmasq,
+            # openresolv, and other non-systemd-resolved backends.  The
+            # persistent profile and this activation's immutable settings
+            # snapshot must both carry exclusive priority; changing only the
+            # saved profile after Connect() is too late for the live activation.
+            if not (
+                getattr(self, "dns_profile_policy_ready", False)
+                and getattr(self, "dns_activation_policy_ready", False)
+            ):
+                log.error(
+                    "NetworkManager DNS policy is not active for this VPN activation"
+                )
+                return False
+            return True
+        if dns_backend != "resolved" or not self._systemd_resolved_is_active():
+            log.error("The systemd-resolved backend disappeared during VPN activation")
+            return False
+
+        commands = (
+            ["resolvectl", "dns", tun_device, *normalized_dns],
+            ["resolvectl", "domain", tun_device, FULL_DNS_ROUTE_DOMAIN],
+            ["resolvectl", "default-route", tun_device, "true"],
+            ["resolvectl", "flush-caches"],
+        )
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+            except Exception as e:
+                log.warning(f"Could not apply VPN DNS protection: {e}")
+                return False
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()
+                log.warning(
+                    f"VPN DNS protection command failed ({command[1]}): {detail}"
+                )
+                return False
+
+        if not self._resolved_dns_protection_matches(tun_device, normalized_dns):
+            log.warning(f"systemd-resolved did not retain all-DNS routing on {tun_device}")
+            return False
+        return True
+
+    def _reapply_full_dns_resolved(
+            self,
+            tun_device: str,
+            dns_servers,
+            connect_generation: Optional[int] = None,
+    ) -> bool:
+        """One-shot GLib callback that repairs NetworkManager ordering races."""
+        if not self._apply_full_dns_resolved(
+            tun_device,
+            dns_servers,
+            connect_generation,
+        ):
+            log.error(f"Could not reapply all-DNS routing on {tun_device}")
+        return False
+
+    def _collect_tunnel_dns_servers(
+            self,
+            candidates,
+            tun_device: str,
+            limit: int,
+            connect_generation: Optional[int] = None,
+            process=None,
+            timeout_seconds: Optional[int] = None,
+    ) -> list[str]:
+        """Return resolvers that answer only through the owned tunnel.
+
+        vpnc-script assigns the tunnel address, then installs the split-exclude
+        routes once per physical uplink, and only then replaces the default
+        route with the tunnel.  A single `ip route get` issued as soon as the
+        interface gains an address therefore still resolves through a physical
+        uplink on multi-homed hosts.  Poll until routing converges rather than
+        failing that race, while still failing closed when it never does.
+        """
+        if timeout_seconds is None:
+            timeout_seconds = self._parse_positive_int(
+                os.environ.get("MS_SSO_NM_DNS_TUNNEL_ROUTE_TIMEOUT_SECONDS"),
+                DNS_TUNNEL_ROUTE_TIMEOUT_SECONDS,
+            )
+        deadline = time.monotonic() + max(1, int(timeout_seconds))
+        waited = False
+
+        while True:
+            if self._is_connect_cancelled(connect_generation):
+                return []
+            if process is not None and process is not getattr(self, "vpn_process", None):
+                return []
+            poll = getattr(process, "poll", None)
+            if callable(poll) and poll() is not None:
+                log.warning(
+                    "OpenConnect exited while waiting for tunnel DNS routing"
+                )
+                return []
+
+            # Report the reason for giving up only on the final pass, so a
+            # transient pre-convergence mismatch does not spam the journal.
+            final_pass = time.monotonic() >= deadline
+            working = []
+            for server in candidates:
+                if not self._dns_route_uses_tunnel(
+                    server,
+                    tun_device,
+                    log_mismatch=final_pass,
+                ):
+                    continue
+                if not self._probe_dns_server(
+                    server,
+                    tun_device=tun_device,
+                    require_answer=True,
+                ):
+                    if final_pass:
+                        log.warning(
+                            f"VPN DNS server {server} did not answer through {tun_device}"
+                        )
+                    continue
+                working.append(server)
+                if len(working) >= limit:
+                    break
+
+            if working:
+                if waited:
+                    log.info(
+                        f"Tunnel DNS routing converged on {tun_device}"
+                    )
+                return working
+            if final_pass:
+                return []
+
+            waited = True
+            time.sleep(DNS_TUNNEL_ROUTE_POLL_SECONDS)
+
+    def _prepare_vpn_dns_protection(
+            self,
+            protocol: str,
+            tun_device: str,
+            connect_generation: Optional[int],
+            process=None,
+    ) -> bool:
+        """Select and validate tunnel-only recursive DNS before Config/STARTED."""
+        self.dns_leak_protection_ready = False
+        if self._is_connect_cancelled(connect_generation):
+            return False
+        if process is not None and process is not getattr(self, "vpn_process", None):
+            return False
+
+        candidates = self._dns_candidates_for_vpn(protocol)
+        if not candidates:
+            log.error("The VPN supplied no usable DNS candidates")
+            return False
+
+        limit = max(0, int(getattr(self, "current_dns_server_limit", 3)))
+        if limit == 0:
+            log.error("A zero DNS server limit is incompatible with leak protection")
+            return False
+
+        working = self._collect_tunnel_dns_servers(
+            candidates,
+            tun_device,
+            limit,
+            connect_generation,
+            process=process,
+        )
+
+        if not working:
+            log.error("No VPN DNS server answered through the owned tunnel")
+            return False
+
+        self.vpn_dns_servers = working
+        if not self._apply_full_dns_resolved(
+            tun_device,
+            working,
+            connect_generation,
+        ):
+            return False
+        self.dns_leak_protection_ready = True
+        log.info(
+            f"Validated {len(working)} tunnel-only DNS server(s) on {tun_device}"
+        )
+        return True
+
+    @staticmethod
+    def _connection_snapshot_has_dns_policy(settings) -> bool:
+        """Require exclusive DNS policy in NetworkManager's Connect snapshot."""
+        ipv4_settings = settings.get("ipv4", {}) if settings else {}
+        ipv6_settings = settings.get("ipv6", {}) if settings else {}
+        try:
+            ipv4_priority = int(ipv4_settings.get("dns-priority", 0))
+            ipv6_priority = int(ipv6_settings.get("dns-priority", 0))
+        except (TypeError, ValueError):
+            return False
+        raw_domains = ipv4_settings.get("dns-search", [])
+        if isinstance(raw_domains, (str, bytes)):
+            if isinstance(raw_domains, bytes):
+                raw_domains = raw_domains.decode("utf-8", errors="ignore")
+            domains = re.split(r"[\s,;]+", raw_domains)
+        else:
+            domains = [str(domain) for domain in (raw_domains or [])]
+        return bool(
+            ipv4_priority < 0
+            and ipv6_priority < 0
+            and FULL_DNS_ROUTE_DOMAIN in domains
+        )
+
+    def _ensure_dns_profile_policy(self) -> bool:
+        """Persist exclusive VPN DNS priority for this exact plugin profile."""
+        self.dns_profile_policy_ready = False
+        connection_uuid = str(
+            getattr(self, "current_connection_uuid", "") or ""
+        ).strip()
+        if not connection_uuid or not shutil.which("nmcli"):
+            log.error("Cannot enforce exclusive VPN DNS priority without nmcli and a UUID")
+            return False
+
+        def read_property(property_name: str) -> Optional[str]:
+            try:
+                result = subprocess.run(
+                    [
+                        "nmcli",
+                        "--get-values",
+                        property_name,
+                        "connection",
+                        "show",
+                        "uuid",
+                        connection_uuid,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+            except Exception as e:
+                log.warning(f"Could not read {property_name} for DNS policy: {e}")
+                return None
+            if result.returncode != 0:
+                return None
+            return result.stdout.strip()
+
+        service_type = read_property("vpn.service-type")
+        if service_type != "org.freedesktop.NetworkManager.ms-sso":
+            log.error("Refusing to alter DNS policy for a non-MS-SSO connection")
+            return False
+
+        priority = read_property("ipv4.dns-priority")
+        search_domains = read_property("ipv4.dns-search")
+        ipv6_priority = read_property("ipv6.dns-priority")
+        if priority is None or search_domains is None or ipv6_priority is None:
+            return False
+        has_root_route = FULL_DNS_ROUTE_DOMAIN in re.split(
+            r"[\s,;]+",
+            search_domains,
+        )
+        if priority == "-100" and ipv6_priority == "-100" and has_root_route:
+            self.dns_profile_policy_ready = True
+            return True
+
+        command = [
+            "nmcli",
+            "connection",
+            "modify",
+            "uuid",
+            connection_uuid,
+            "ipv4.dns-priority",
+            "-100",
+            "ipv4.ignore-auto-dns",
+            "no",
+            "ipv6.dns-priority",
+            "-100",
+        ]
+        if not has_root_route:
+            command.extend(["+ipv4.dns-search", FULL_DNS_ROUTE_DOMAIN])
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except Exception as e:
+            log.error(f"Could not persist exclusive VPN DNS policy: {e}")
+            return False
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            log.error(f"Could not persist exclusive VPN DNS policy: {detail}")
+            return False
+
+        priority = read_property("ipv4.dns-priority")
+        search_domains = read_property("ipv4.dns-search")
+        ipv6_priority = read_property("ipv6.dns-priority")
+        if (
+            priority != "-100"
+            or ipv6_priority != "-100"
+            or search_domains is None
+            or FULL_DNS_ROUTE_DOMAIN not in re.split(
+                r"[\s,;]+",
+                search_domains,
+            )
+        ):
+            log.error("NetworkManager did not retain the exclusive VPN DNS policy")
+            return False
+        self.dns_profile_policy_ready = True
+        log.info("Persisted exclusive VPN DNS priority and root route domain")
+        return True
+
+    @staticmethod
+    def _is_leak_protection_failure(error_message) -> bool:
+        return str(error_message or "").startswith(LEAK_PROTECTION_ERROR_PREFIX)
 
     def _wait_for_usable_tunnel(
             self,
@@ -1876,7 +2539,7 @@ class VPNPluginService(dbus.service.Object):
             env_candidates.append("MS_SSO_NM_ANYCONNECT_DNS_SERVER_LIMIT")
         env_candidates.append("MS_SSO_NM_DNS_SERVER_LIMIT")
 
-        default = 1 if protocol == 'gp' else 3
+        default = 2 if protocol == 'gp' else 3
         limit = self._parse_positive_int(configured_value, -1)
         if limit >= 0:
             return limit
@@ -1918,9 +2581,9 @@ class VPNPluginService(dbus.service.Object):
         return normalized[:limit]
 
     def _normalize_vpn_domains(self):
-        """Return DNS domains to emit to NetworkManager."""
-        domains = []
-        seen = set()
+        """Return VPN domains with a route-only root to prevent DNS fallback."""
+        domains = [FULL_DNS_ROUTE_DOMAIN]
+        seen = {FULL_DNS_ROUTE_DOMAIN}
         for domain in getattr(self, "vpn_domains", []):
             text = str(domain).strip().strip('.')
             if not text:
@@ -1929,7 +2592,9 @@ class VPNPluginService(dbus.service.Object):
             bare = text[1:] if route_only else text
             if not re.fullmatch(r'[A-Za-z0-9_.-]+', bare):
                 continue
-            if self.current_protocol == 'anyconnect' and not self.vpn_tunnel_all_dns:
+            if bare == "":
+                text = FULL_DNS_ROUTE_DOMAIN
+            elif self.current_protocol == 'anyconnect' and not self.vpn_tunnel_all_dns:
                 text = f"~{bare}"
             elif route_only:
                 text = f"~{bare}"
@@ -1995,56 +2660,13 @@ class VPNPluginService(dbus.service.Object):
             domains,
             connect_generation: Optional[int] = None,
     ):
-        """Force route-only DNS after NetworkManager has processed Ip4Config."""
-        expected_ifindex = getattr(self, "owned_tun_ifindices", {}).get(tun_dev)
-        if (
-            (connect_generation is not None and self._is_connect_cancelled(connect_generation))
-            or tun_dev != self.current_tun_device
-            or tun_dev not in self.owned_tun_devices
-            or expected_ifindex is None
-            or self._link_ifindex(tun_dev) != expected_ifindex
-        ):
-            log.info(
-                f"Skipping stale split-DNS callback for {tun_dev} "
-                f"(generation {connect_generation})"
-            )
-            return False
-        if not tun_dev or self.current_protocol != 'anyconnect' or self.vpn_tunnel_all_dns:
-            return False
-        if self._anyconnect_preserve_default_route():
-            log.info(
-                "Keeping VPN DNS as a default resolver on full-tunnel/split-exclude "
-                f"AnyConnect link {tun_dev}"
-            )
-            return False
-        if not shutil.which("resolvectl"):
-            return False
-
-        route_domains = [domain for domain in domains if str(domain).startswith('~')]
-        try:
-            if route_domains:
-                subprocess.run(
-                    ["resolvectl", "domain", tun_dev, *route_domains],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=5,
-                )
-                log.info(f"Applied route-only VPN DNS domains on {tun_dev}: {route_domains}")
-            subprocess.run(
-                ["resolvectl", "default-route", tun_dev, "false"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,
-            )
-            log.info(f"Disabled DNS default route on {tun_dev}")
-        except Exception as e:
-            log.info(f"Split DNS adjustment failed for {tun_dev}: {e}")
-
-        if not self._anyconnect_preserve_default_route():
-            self._remove_tun_default_routes(tun_dev)
-        return False
+        """Compatibility callback: all VPN DNS is now routed through the tunnel."""
+        del domains
+        return self._reapply_full_dns_resolved(
+            tun_dev,
+            getattr(self, "vpn_dns_servers", []),
+            connect_generation,
+        )
 
     def _is_connect_cancelled(self, connect_generation: Optional[int] = None) -> bool:
         """Return True when the active connect flow should abort."""
@@ -2176,7 +2798,31 @@ class VPNPluginService(dbus.service.Object):
                 protocol,
                 secrets.get('dns_server_limit', ''),
             )
+            self.configured_dns_servers = self._parse_dns_server_values(
+                secrets.get('dns_servers', '')
+            )
+            self.vpn_dns_backend = (
+                "resolved" if self._systemd_resolved_is_active()
+                else "networkmanager"
+            )
+            self.dns_activation_policy_ready = (
+                self._connection_snapshot_has_dns_policy(settings)
+            )
+            self.dns_leak_protection_ready = False
+            log.info(f"Pinned VPN DNS backend: {self.vpn_dns_backend}")
             log.info(f"VPN DNS server limit: {self.current_dns_server_limit}")
+            if not self._ensure_dns_profile_policy():
+                raise Exception(
+                    f"{LEAK_PROTECTION_ERROR_PREFIX} could not enforce exclusive VPN DNS priority"
+                )
+            if (
+                self.vpn_dns_backend == "networkmanager"
+                and not self.dns_activation_policy_ready
+            ):
+                raise Exception(
+                    f"{LEAK_PROTECTION_ERROR_PREFIX} the DNS policy was upgraded; "
+                    "activate the VPN again so NetworkManager uses it"
+                )
 
             # IMPORTANT: Resolve gateway IP NOW, before VPN connects
             # After VPN connects, DNS switches to VPN DNS servers which can't resolve external hostnames
@@ -2589,6 +3235,20 @@ class VPNPluginService(dbus.service.Object):
                         log.info("Connect cancelled after OpenConnect attempt; preserving cookie cache")
                         return
 
+                    if not success:
+                        # The pre-spawn leak firewall intentionally blocks
+                        # physical DNS.  Remove every attempt-owned tunnel,
+                        # resolver, route, and firewall before cached-cookie or
+                        # fresh-auth retries need the base network again.
+                        self._cleanup_dns()
+
+                    if self._is_leak_protection_failure(error_msg):
+                        # Retrying authentication cannot repair a local DNS or
+                        # IPv6 kill-switch failure and could needlessly repeat MFA.
+                        final_error = error_msg
+                        terminal_auth_failure = True
+                        break
+
                     cookie_rejected = self._is_cookie_rejection(error_msg)
                     if success:
                         connection_ended = True
@@ -2769,6 +3429,7 @@ class VPNPluginService(dbus.service.Object):
             requested_tun_device = self._tunnel_name_for_generation(
                 connect_generation
             )
+            self.pending_tun_device = requested_tun_device
             if requested_tun_device in baseline_tun_devs:
                 return (
                     False,
@@ -2823,6 +3484,15 @@ class VPNPluginService(dbus.service.Object):
                 }
                 if gp_cookie_uses_stdin:
                     popen_kwargs["stdin"] = subprocess.PIPE
+                # OpenConnect can install IPv4 routes as soon as it starts.
+                # Block direct public IPv6 first so there is no half-up window
+                # while the tunnel and DNS state are still stabilizing.
+                if not self._apply_ipv6_leak_protection():
+                    return (
+                        False,
+                        f"{LEAK_PROTECTION_ERROR_PREFIX} could not enforce the IPv6 kill route",
+                        0,
+                    )
                 self.vpn_process = subprocess.Popen(cmd, **popen_kwargs)
                 vpn_process = self.vpn_process
                 self.vpn_process_generation = connect_generation
@@ -2858,6 +3528,12 @@ class VPNPluginService(dbus.service.Object):
                         f"--protocol={proto_flag} --config=/proc/self/fd/[redacted] "
                         f"{gateway}"
                     )
+                    if not self._apply_ipv6_leak_protection():
+                        return (
+                            False,
+                            f"{LEAK_PROTECTION_ERROR_PREFIX} could not enforce the IPv6 kill route",
+                            0,
+                        )
                     self.vpn_process = subprocess.Popen(
                         cmd,
                         **self._build_anyconnect_popen_kwargs(cookie_config_fd),
@@ -2879,6 +3555,7 @@ class VPNPluginService(dbus.service.Object):
 
             # Initialize DNS server list
             self.vpn_dns_servers = []
+            self.dns_leak_protection_ready = False
             self.vpn_domains = []
             self.vpn_tunnel_all_dns = None
             self.vpn_split_excludes = []
@@ -3038,7 +3715,7 @@ class VPNPluginService(dbus.service.Object):
                 protocol,
                 self.current_tun_device,
                 connect_generation,
-                min_stable_seconds=stable_seconds,
+                min_stable_seconds=0,
                 process=vpn_process,
             )
             if not usable:
@@ -3058,10 +3735,67 @@ class VPNPluginService(dbus.service.Object):
                     return (False, "Cached cookie produced an unusable tunnel", 0)
                 return (False, unusable_reason or "VPN tunnel is not usable", 0)
 
-            log.info(f"Validated tunnel {self.current_tun_device}: {ip_addr}/{prefix}")
-            tunnel_was_established = True
-
+            log.info(f"Tunnel has IPv4 {self.current_tun_device}: {ip_addr}/{prefix}")
             log.info(f"VPN DNS servers captured: {self.vpn_dns_servers}")
+
+            leak_failure = None
+            if not self._apply_ipv6_leak_protection():
+                leak_failure = "could not enforce the IPv6 kill route"
+            elif not self._prepare_vpn_dns_protection(
+                protocol,
+                self.current_tun_device,
+                connect_generation,
+                process=vpn_process,
+            ):
+                leak_failure = "no tunnel-only DNS path could be enforced"
+
+            if leak_failure:
+                error_message = f"{LEAK_PROTECTION_ERROR_PREFIX} {leak_failure}"
+                log.error(error_message)
+                try:
+                    if vpn_process and vpn_process.poll() is None:
+                        self._stop_vpn_process(
+                            preserve_session=True,
+                            force=True,
+                            process=vpn_process,
+                            connect_generation=connect_generation,
+                        )
+                except Exception:
+                    pass
+                self._cleanup_dns()
+                return (False, error_message, 0)
+
+            # DNS now routes exclusively over the live tunnel.  Perform any
+            # cached-cookie stability wait only after protection is in place,
+            # rather than leaving a physical-DNS window during that wait.
+            if stable_seconds > 0:
+                usable, unusable_reason, ip_addr, prefix = self._wait_for_usable_tunnel(
+                    protocol,
+                    self.current_tun_device,
+                    connect_generation,
+                    min_stable_seconds=stable_seconds,
+                    process=vpn_process,
+                )
+                if not usable:
+                    log.warning(f"VPN tunnel is not stable: {unusable_reason}")
+                    try:
+                        if vpn_process and vpn_process.poll() is None:
+                            self._stop_vpn_process(
+                                preserve_session=True,
+                                force=True,
+                                process=vpn_process,
+                                connect_generation=connect_generation,
+                            )
+                    except Exception:
+                        pass
+                    self._cleanup_dns()
+                    if protocol == 'anyconnect' and used_cache:
+                        return (False, "Cached cookie produced an unusable tunnel", 0)
+                    return (False, unusable_reason or "VPN tunnel is not stable", 0)
+
+            log.info(f"Validated tunnel {self.current_tun_device}: {ip_addr}/{prefix}")
+
+            tunnel_was_established = True
 
             # Emit full IP config now that interface is up
             GLib.idle_add(
@@ -3070,20 +3804,6 @@ class VPNPluginService(dbus.service.Object):
                 vpn_process,
                 self.current_tun_device,
             )
-            if protocol == 'anyconnect' and self.vpn_dns_servers:
-                dns_probe_timeout = self._parse_positive_int(
-                    os.environ.get("MS_SSO_NM_ANYCONNECT_DNS_PROBE_AFTER_CONFIG_SECONDS"),
-                    0,
-                )
-                if dns_probe_timeout > 0 and not self._wait_for_vpn_dns_usable(
-                    connect_generation,
-                    timeout_seconds=dns_probe_timeout,
-                    process=vpn_process,
-                ):
-                    log.warning(
-                        "VPN tunnel DNS did not become usable after NetworkManager config; "
-                        "continuing with tunnel up to avoid reconnect/TOTP loop"
-                    )
 
             # Watchdog loop: keep an eye on process and tunnel device.
             connected_at = time.monotonic()
@@ -3153,6 +3873,44 @@ class VPNPluginService(dbus.service.Object):
                             break
                     else:
                         missing_tun_checks = 0
+
+                if self.state == NM_VPN_SERVICE_STATE_STARTED and tun_dev:
+                    leak_protection_ok = self._apply_ipv6_leak_protection()
+                    dns_servers = list(getattr(self, "vpn_dns_servers", []))
+                    if (
+                        leak_protection_ok
+                        and getattr(self, "vpn_dns_backend", None) == "resolved"
+                    ):
+                        if (
+                            not self._systemd_resolved_is_active()
+                            or not self._resolved_dns_protection_matches(
+                                tun_dev,
+                                dns_servers,
+                            )
+                        ):
+                            log.warning(
+                                "Watchdog: all-DNS resolver state changed; repairing it"
+                            )
+                            leak_protection_ok = self._apply_full_dns_resolved(
+                                tun_dev,
+                                dns_servers,
+                                connect_generation,
+                            )
+                    if not leak_protection_ok:
+                        log.error(
+                            "Watchdog: leak protection could not be maintained; "
+                            "ending the VPN activation"
+                        )
+                        try:
+                            self._stop_vpn_process(
+                                preserve_session=True,
+                                force=True,
+                                process=vpn_process,
+                                connect_generation=connect_generation,
+                            )
+                        except Exception:
+                            pass
+                        break
 
                 if gateway_probe_enabled:
                     if self._probe_gateway(timeout_seconds=float(gateway_probe_timeout)):
@@ -3493,18 +4251,417 @@ class VPNPluginService(dbus.service.Object):
             except Exception as e:
                 log.warning(f"Failed to delete on-link host route: {e}")
 
-    def _apply_ipv6_leak_protection(self) -> None:
-        """Block local IPv6 egress while this IPv4-only VPN is active."""
-        if self.ipv6_leak_protection_enabled:
-            return
-        # Host-wide unmanaged routes are not crash-safe, so this is now opt-in.
-        if not self._is_truthy(os.environ.get("MS_SSO_NM_BLOCK_IPV6", "0")):
-            return
+    def _ipv6_leak_protection_required(self) -> bool:
+        """IPv6 blocking is default-on; an explicit false is an admin escape."""
+        configured = self._parse_bool(os.environ.get("MS_SSO_NM_BLOCK_IPV6"))
+        return configured is not False
 
+    @staticmethod
+    @contextmanager
+    def _recovery_state_lock():
+        """Serialize host-wide kill-switch mutation with dispatcher recovery."""
+        RECOVERY_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            RECOVERY_LOCK_FILE,
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
         try:
-            # Persist ownership before creating the host-wide route.  If the
-            # service is killed at any later instruction, either the service
-            # startup recovery or the NM dispatcher can safely remove it.
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    @staticmethod
+    def _ipv6_firewall_marker_values() -> Optional[dict[str, str]]:
+        try:
+            return dict(
+                line.split("=", 1)
+                for line in IPV6_FIREWALL_MARKER.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if "=" in line
+            )
+        except Exception:
+            return None
+
+    def _ipv6_firewall_marker_matches_current(self) -> bool:
+        return self._ipv6_firewall_marker_values() == {
+            "version": "1",
+            "connection_uuid": str(self.current_connection_uuid or ""),
+            "family": IPV6_FIREWALL_FAMILY,
+            "table": IPV6_FIREWALL_TABLE,
+        }
+
+    def _write_ipv6_firewall_marker(self) -> bool:
+        """Persist exact nftables ownership before creating the global table."""
+        try:
+            IPV6_FIREWALL_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            temporary = IPV6_FIREWALL_MARKER.with_name(
+                f".{IPV6_FIREWALL_MARKER.name}.{os.getpid()}.tmp"
+            )
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as marker_file:
+                marker_file.write("version=1\n")
+                marker_file.write(
+                    f"connection_uuid={self.current_connection_uuid or ''}\n"
+                )
+                marker_file.write(f"family={IPV6_FIREWALL_FAMILY}\n")
+                marker_file.write(f"table={IPV6_FIREWALL_TABLE}\n")
+                marker_file.flush()
+                os.fsync(marker_file.fileno())
+            os.replace(temporary, IPV6_FIREWALL_MARKER)
+            return True
+        except Exception as e:
+            log.warning(f"Could not persist IPv6 firewall ownership: {e}")
+            return False
+
+    @staticmethod
+    def _ipv6_firewall_table_present() -> Optional[bool]:
+        if not shutil.which("nft"):
+            log.error("IPv6 leak protection requires nftables")
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "nft",
+                    "list",
+                    "table",
+                    IPV6_FIREWALL_FAMILY,
+                    IPV6_FIREWALL_TABLE,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except Exception as e:
+            log.error(f"Could not inspect the IPv6 firewall table: {e}")
+            return None
+        if result.returncode == 0:
+            return True
+        detail = (result.stderr or result.stdout).casefold()
+        if any(token in detail for token in ("no such file", "does not exist")):
+            return False
+        log.error(
+            "Could not inspect the IPv6 firewall table: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+        return None
+
+    def _wireguard_devices(self) -> Optional[set[str]]:
+        """Return kernel-confirmed WireGuard egress devices, or None on error."""
+        try:
+            result = subprocess.run(
+                ["ip", "-o", "link", "show", "type", "wireguard"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except Exception as e:
+            log.error(f"Could not enumerate WireGuard interfaces: {e}")
+            return None
+        if result.returncode != 0:
+            log.error(
+                "Could not enumerate WireGuard interfaces: "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+            return None
+        devices = set()
+        for line in result.stdout.splitlines():
+            match = re.match(r"^\d+:\s+([^:@]+)(?:@[^:]+)?:", line)
+            if not match:
+                continue
+            device = match.group(1)
+            if re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", device):
+                devices.add(device)
+        return devices
+
+    def _allowed_ipv6_egress_devices(self) -> Optional[set[str]]:
+        devices = self._wireguard_devices()
+        if devices is None:
+            return None
+        devices.add("lo")
+        for device in (
+            getattr(self, "pending_tun_device", None),
+            getattr(self, "current_tun_device", None),
+        ):
+            if device and re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", str(device)):
+                devices.add(str(device))
+        return devices
+
+    def _allowed_dns_egress_devices(self) -> set[str]:
+        """Allow resolver traffic only to the local stub or owned VPN link."""
+        devices = {"lo"}
+        for device in (
+            getattr(self, "pending_tun_device", None),
+            getattr(self, "current_tun_device", None),
+        ):
+            if device and re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", str(device)):
+                devices.add(str(device))
+        return devices
+
+    def _install_ipv6_firewall(self) -> bool:
+        """Atomically drop IPv6 on every non-VPN/non-WireGuard egress."""
+        allowed_devices = self._allowed_ipv6_egress_devices()
+        if not allowed_devices:
+            return False
+        dns_allowed_devices = self._allowed_dns_egress_devices()
+        table_present = self._ipv6_firewall_table_present()
+        if table_present is None:
+            return False
+        marker_exists = IPV6_FIREWALL_MARKER.exists()
+        if table_present and not marker_exists:
+            log.error("Refusing to claim a pre-existing IPv6 firewall table")
+            return False
+        if marker_exists and not self._ipv6_firewall_marker_matches_current():
+            log.error("IPv6 firewall ownership belongs to another activation")
+            return False
+        if not marker_exists and not self._write_ipv6_firewall_marker():
+            return False
+
+        quoted_devices = ", ".join(
+            f'"{device}"' for device in sorted(allowed_devices)
+        )
+        quoted_dns_devices = ", ".join(
+            f'"{device}"' for device in sorted(dns_allowed_devices)
+        )
+        statements = []
+        if table_present:
+            statements.append(
+                f"delete table {IPV6_FIREWALL_FAMILY} {IPV6_FIREWALL_TABLE}"
+            )
+        # The entire nft batch is one netlink transaction, so replacing an
+        # allowlist never creates an unfiltered interval.
+        statements.append(
+            f"add table {IPV6_FIREWALL_FAMILY} {IPV6_FIREWALL_TABLE}"
+        )
+        statements.extend((
+            "add chain "
+            f"{IPV6_FIREWALL_FAMILY} {IPV6_FIREWALL_TABLE} {IPV6_FIREWALL_CHAIN} "
+            "{ type filter hook output priority -150; policy accept; }",
+            "add rule "
+            f"{IPV6_FIREWALL_FAMILY} {IPV6_FIREWALL_TABLE} {IPV6_FIREWALL_CHAIN} "
+            f"meta nfproto ipv6 oifname != {{ {quoted_devices} }} counter drop "
+            f'comment "{IPV6_FIREWALL_COMMENT}"',
+            "add rule "
+            f"{IPV6_FIREWALL_FAMILY} {IPV6_FIREWALL_TABLE} {IPV6_FIREWALL_CHAIN} "
+            f"oifname != {{ {quoted_dns_devices} }} udp dport {{ 53, 853 }} "
+            f'counter drop comment "{DNS_UDP_FIREWALL_COMMENT}"',
+            "add rule "
+            f"{IPV6_FIREWALL_FAMILY} {IPV6_FIREWALL_TABLE} {IPV6_FIREWALL_CHAIN} "
+            f"oifname != {{ {quoted_dns_devices} }} tcp dport {{ 53, 853 }} "
+            f'counter drop comment "{DNS_TCP_FIREWALL_COMMENT}"',
+        ))
+        try:
+            result = subprocess.run(
+                ["nft", "-f", "-"],
+                input="\n".join(statements) + "\n",
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except Exception as e:
+            log.error(f"Could not install the IPv6 firewall: {e}")
+            return False
+        if result.returncode != 0:
+            log.error(
+                "Could not install the IPv6 firewall: "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+            return False
+        if not self._verify_ipv6_firewall(
+            allowed_devices,
+            dns_allowed_devices,
+        ):
+            log.error("The IPv6 firewall did not retain its exact owned policy")
+            return False
+        return True
+
+    def _verify_ipv6_firewall(
+            self,
+            expected_devices: Optional[set[str]] = None,
+            expected_dns_devices: Optional[set[str]] = None,
+    ) -> bool:
+        """Verify the exact owned nft output policy and its allowlist."""
+        if not IPV6_FIREWALL_MARKER.exists():
+            return False
+        if not self._ipv6_firewall_marker_matches_current():
+            return False
+        if expected_devices is None:
+            expected_devices = self._allowed_ipv6_egress_devices()
+        if not expected_devices:
+            return False
+        if expected_dns_devices is None:
+            expected_dns_devices = self._allowed_dns_egress_devices()
+        try:
+            result = subprocess.run(
+                [
+                    "nft",
+                    "-j",
+                    "list",
+                    "table",
+                    IPV6_FIREWALL_FAMILY,
+                    IPV6_FIREWALL_TABLE,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return False
+            document = json.loads(result.stdout)
+        except Exception as e:
+            log.warning(f"Could not verify the IPv6 firewall: {e}")
+            return False
+
+        entries = document.get("nftables", []) if isinstance(document, dict) else []
+        chains = [
+            entry.get("chain")
+            for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("chain"), dict)
+        ]
+        owned_chains = [
+            chain for chain in chains
+            if chain.get("family") == IPV6_FIREWALL_FAMILY
+            and chain.get("table") == IPV6_FIREWALL_TABLE
+            and chain.get("name") == IPV6_FIREWALL_CHAIN
+        ]
+        if len(owned_chains) != 1:
+            return False
+        chain = owned_chains[0]
+        if (
+            chain.get("hook") != "output"
+            or int(chain.get("prio", 0)) != -150
+            or chain.get("policy") != "accept"
+        ):
+            return False
+
+        rules = [
+            entry.get("rule")
+            for entry in entries
+            if isinstance(entry, dict)
+            and isinstance(entry.get("rule"), dict)
+            and entry["rule"].get("family") == IPV6_FIREWALL_FAMILY
+            and entry["rule"].get("table") == IPV6_FIREWALL_TABLE
+            and entry["rule"].get("chain") == IPV6_FIREWALL_CHAIN
+        ]
+        expected_comments = {
+            IPV6_FIREWALL_COMMENT,
+            DNS_UDP_FIREWALL_COMMENT,
+            DNS_TCP_FIREWALL_COMMENT,
+        }
+        if (
+            len(rules) != len(expected_comments)
+            or {rule.get("comment") for rule in rules} != expected_comments
+        ):
+            return False
+
+        def normalized_set(value) -> Optional[set]:
+            if isinstance(value, dict):
+                value = value.get("set")
+            if isinstance(value, (str, int)):
+                value = [value]
+            if not isinstance(value, list):
+                return None
+            return set(value)
+
+        def rule_policy(rule) -> tuple[bool, Optional[set[str]], bool, Optional[str], Optional[set[int]]]:
+            drops = False
+            allowed_match = None
+            nfproto_ipv6 = False
+            transport_protocol = None
+            destination_ports = None
+            for expression in rule.get("expr", []):
+                if not isinstance(expression, dict):
+                    continue
+                if "drop" in expression:
+                    drops = True
+                match = expression.get("match")
+                if not isinstance(match, dict):
+                    continue
+                left = match.get("left")
+                if not isinstance(left, dict):
+                    continue
+                meta = left.get("meta")
+                if isinstance(meta, dict):
+                    meta_key = meta.get("key")
+                    if (
+                        meta_key == "nfproto"
+                        and match.get("op") == "=="
+                        and match.get("right") == "ipv6"
+                    ):
+                        nfproto_ipv6 = True
+                    if meta_key == "oifname" and match.get("op") == "!=":
+                        values = normalized_set(match.get("right"))
+                        if values is not None:
+                            allowed_match = {str(device) for device in values}
+                payload = left.get("payload")
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("field") == "dport"
+                    and payload.get("protocol") in {"udp", "tcp"}
+                    and match.get("op") == "=="
+                ):
+                    values = normalized_set(match.get("right"))
+                    if values is not None:
+                        try:
+                            destination_ports = {int(port) for port in values}
+                        except (TypeError, ValueError):
+                            destination_ports = None
+                    transport_protocol = payload.get("protocol")
+            return (
+                drops,
+                allowed_match,
+                nfproto_ipv6,
+                transport_protocol,
+                destination_ports,
+            )
+
+        policies = {
+            rule["comment"]: rule_policy(rule)
+            for rule in rules
+        }
+        ipv6_policy = policies[IPV6_FIREWALL_COMMENT]
+        udp_policy = policies[DNS_UDP_FIREWALL_COMMENT]
+        tcp_policy = policies[DNS_TCP_FIREWALL_COMMENT]
+        return bool(
+            ipv6_policy == (
+                True,
+                set(expected_devices),
+                True,
+                None,
+                None,
+            )
+            and udp_policy == (
+                True,
+                set(expected_dns_devices),
+                False,
+                "udp",
+                {53, 853},
+            )
+            and tcp_policy == (
+                True,
+                set(expected_dns_devices),
+                False,
+                "tcp",
+                {53, 853},
+            )
+        )
+
+    def _write_ipv6_leak_marker(self) -> bool:
+        """Persist the exact route signature before mutating the global table."""
+        try:
             IPV6_LEAK_ROUTE_MARKER.parent.mkdir(parents=True, exist_ok=True)
             temporary = IPV6_LEAK_ROUTE_MARKER.with_name(
                 f".{IPV6_LEAK_ROUTE_MARKER.name}.{os.getpid()}.tmp"
@@ -3515,68 +4672,146 @@ class VPNPluginService(dbus.service.Object):
                 0o600,
             )
             with os.fdopen(descriptor, "w", encoding="utf-8") as marker_file:
+                marker_file.write("version=2\n")
                 marker_file.write(
-                    "connection_uuid="
-                    f"{self.current_connection_uuid or ''}\n"
+                    f"connection_uuid={self.current_connection_uuid or ''}\n"
                 )
+                marker_file.write(f"metric={IPV6_LEAK_ROUTE_METRIC}\n")
+                marker_file.write(f"protocol={IPV6_LEAK_ROUTE_PROTOCOL}\n")
+                marker_file.flush()
+                os.fsync(marker_file.fileno())
             os.replace(temporary, IPV6_LEAK_ROUTE_MARKER)
-
-            result = subprocess.run(
-                [
-                    "ip",
-                    "-6",
-                    "route",
-                    "add",
-                    "unreachable",
-                    "::/0",
-                    "metric",
-                    IPV6_LEAK_ROUTE_METRIC,
-                    "proto",
-                    IPV6_LEAK_ROUTE_PROTOCOL,
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,
-            )
-            if result.returncode == 0:
-                self.ipv6_leak_protection_enabled = True
-                log.info(
-                    "Enabled opt-in IPv6 leak protection with an owned route"
-                )
-            else:
-                log.warning(
-                    "Failed to enable IPv6 leak protection: "
-                    f"{(result.stderr or result.stdout).strip()}"
-                )
-                # A failed add normally means no route was created.  Keep the
-                # marker if the exact route exists or its absence cannot be
-                # verified; recovery can then retry without losing ownership.
-                if self._ipv6_leak_route_present() is False:
-                    IPV6_LEAK_ROUTE_MARKER.unlink(missing_ok=True)
+            return True
         except Exception as e:
-            log.warning(f"Failed to enable IPv6 leak protection: {e}")
+            log.warning(f"Could not persist IPv6 leak-route ownership: {e}")
+            return False
+
+    def _ipv6_leak_marker_matches_current(self) -> bool:
+        """Accept only the fixed v2 marker for this exact activation."""
+        try:
+            marker = dict(
+                line.split("=", 1)
+                for line in IPV6_LEAK_ROUTE_MARKER.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if "=" in line
+            )
+        except Exception:
+            return False
+        return marker == {
+            "version": "2",
+            "connection_uuid": str(self.current_connection_uuid or ""),
+            "metric": IPV6_LEAK_ROUTE_METRIC,
+            "protocol": IPV6_LEAK_ROUTE_PROTOCOL,
+        }
+
+    def _apply_ipv6_leak_protection(self) -> bool:
+        """Install and verify host-wide IPv6 protection before OpenConnect."""
+        if not self._ipv6_leak_protection_required():
+            self.ipv6_leak_protection_enabled = False
+            log.warning("IPv6 leak protection was explicitly disabled by the administrator")
+            return True
+        try:
+            with self._recovery_state_lock():
+                return self._apply_ipv6_leak_protection_locked()
+        except Exception as e:
+            log.error(f"Could not lock IPv6 leak-protection state: {e}")
+            return False
+
+    def _apply_ipv6_leak_protection_locked(self) -> bool:
+        """Apply firewall plus defense-in-depth route while holding the lock."""
+
+        if getattr(self, "ipv6_leak_protection_enabled", False):
+            if self._verify_ipv6_leak_protection():
+                return True
+            self.ipv6_leak_protection_enabled = False
+            log.warning("IPv6 leak protection disappeared; attempting an owned repair")
+
+        # The route below handles the normal public default, while nftables
+        # closes alternate policy-table and more-specific physical-route gaps.
+        # Its allowlist contains only loopback, this owned tunnel name, and
+        # interfaces that the kernel reports as WireGuard.
+        if not self._install_ipv6_firewall():
+            return False
+
+        marker_exists = IPV6_LEAK_ROUTE_MARKER.exists()
+        route_present = self._ipv6_leak_route_present()
+        if route_present is None:
+            return False
+        if not marker_exists and route_present:
+            log.error("Refusing to claim a pre-existing IPv6 unreachable route")
+            return False
+        if marker_exists and not self._ipv6_leak_marker_matches_current():
+            log.error("IPv6 leak-route ownership belongs to another activation")
+            return False
+
+        if not marker_exists and not self._write_ipv6_leak_marker():
+            return False
+
+        if not route_present:
+            try:
+                result = subprocess.run(
+                    [
+                        "ip",
+                        "-6",
+                        "route",
+                        "add",
+                        "unreachable",
+                        "::/0",
+                        "metric",
+                        IPV6_LEAK_ROUTE_METRIC,
+                        "proto",
+                        IPV6_LEAK_ROUTE_PROTOCOL,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+            except Exception as e:
+                log.error(f"Failed to enable IPv6 leak protection: {e}")
+                result = None
+            if result is None or result.returncode != 0:
+                detail = "" if result is None else (result.stderr or result.stdout).strip()
+                log.error(f"Failed to enable IPv6 leak protection: {detail}")
+                if self._ipv6_leak_route_present() is False:
+                    try:
+                        IPV6_LEAK_ROUTE_MARKER.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                return False
+
+        if not self._verify_ipv6_leak_protection():
+            log.error("The IPv6 kill route is not the effective public IPv6 route")
+            return False
+        self.ipv6_leak_protection_enabled = True
+        log.info("Enabled default-on IPv6 leak protection with an owned route")
+        return True
 
     @staticmethod
-    def _ipv6_leak_route_present() -> Optional[bool]:
+    def _ipv6_leak_route_present(
+            metric: str = IPV6_LEAK_ROUTE_METRIC,
+            protocol: Optional[str] = IPV6_LEAK_ROUTE_PROTOCOL,
+    ) -> Optional[bool]:
         """Return exact owned-route presence, or None when it cannot be read."""
+        command = [
+            "ip",
+            "-6",
+            "route",
+            "show",
+            "table",
+            "all",
+            "type",
+            "unreachable",
+            "::/0",
+            "metric",
+            str(metric),
+        ]
+        if protocol is not None:
+            command.extend(["proto", str(protocol)])
         try:
             result = subprocess.run(
-                [
-                    "ip",
-                    "-6",
-                    "route",
-                    "show",
-                    "table",
-                    "all",
-                    "type",
-                    "unreachable",
-                    "::/0",
-                    "metric",
-                    IPV6_LEAK_ROUTE_METRIC,
-                    "proto",
-                    IPV6_LEAK_ROUTE_PROTOCOL,
-                ],
+                command,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -3593,6 +4828,78 @@ class VPNPluginService(dbus.service.Object):
             return None
         return bool(result.stdout.strip())
 
+    @staticmethod
+    def _is_wireguard_device(device: str) -> bool:
+        try:
+            result = subprocess.run(
+                ["ip", "-details", "link", "show", "dev", device],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0 and "wireguard" in result.stdout.casefold()
+
+    @staticmethod
+    def _ipv6_route_probe_error(target: str) -> Optional[int]:
+        """Return the kernel route-selection error without sending a packet."""
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as probe:
+                return probe.connect_ex((target, 53, 0, 0))
+        except Exception as e:
+            log.warning(f"Could not probe the IPv6 route: {e}")
+            return None
+
+    def _verify_ipv6_leak_protection(self) -> bool:
+        """Require public IPv6 to be unreachable or use a WireGuard route."""
+        if not self._verify_ipv6_firewall():
+            return False
+        if not IPV6_LEAK_ROUTE_MARKER.exists():
+            return False
+        if not self._ipv6_leak_marker_matches_current():
+            return False
+        if self._ipv6_leak_route_present() is not True:
+            return False
+
+        for target in ("2606:4700:4700::1111", "2001:4860:4860::8888"):
+            route_error = self._ipv6_route_probe_error(target)
+            if route_error in {errno.EHOSTUNREACH, errno.ENETUNREACH}:
+                continue
+            if route_error != 0:
+                log.error(
+                    "IPv6 route verification failed with unexpected kernel "
+                    f"error {route_error}"
+                )
+                return False
+            try:
+                result = subprocess.run(
+                    ["ip", "-6", "route", "get", target],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+            except Exception as e:
+                log.warning(f"Could not verify the IPv6 kill route: {e}")
+                return False
+            if result.returncode != 0:
+                log.error(
+                    "IPv6 route lookup failed after the kernel reported the "
+                    "destination reachable"
+                )
+                return False
+            route_device = self._route_device(result.stdout)
+            if route_device and self._is_wireguard_device(route_device):
+                continue
+            log.error(
+                f"Public IPv6 target would bypass the VPN via "
+                f"{route_device or 'an unknown route'}"
+            )
+            return False
+        return True
+
     def _clear_ipv6_leak_marker_if_route_absent(self) -> bool:
         """Clear ownership only after confirming the owned route is absent."""
         route_present = self._ipv6_leak_route_present()
@@ -3604,7 +4911,6 @@ class VPNPluginService(dbus.service.Object):
                     "Could not verify IPv6 leak route removal; preserving marker"
                 )
             return False
-        self.ipv6_leak_protection_enabled = False
         try:
             IPV6_LEAK_ROUTE_MARKER.unlink(missing_ok=True)
         except Exception as e:
@@ -3612,23 +4918,104 @@ class VPNPluginService(dbus.service.Object):
             return False
         return True
 
+    def _remove_owned_ipv6_firewall(self, accept_stale_uuid: bool = False) -> bool:
+        """Remove only this plugin's exactly marked nftables table."""
+        if not IPV6_FIREWALL_MARKER.exists():
+            return self._ipv6_firewall_table_present() is False
+        marker = self._ipv6_firewall_marker_values()
+        expected_static = {
+            "version": "1",
+            "family": IPV6_FIREWALL_FAMILY,
+            "table": IPV6_FIREWALL_TABLE,
+        }
+        if (
+            not marker
+            or set(marker) != {*expected_static, "connection_uuid"}
+            or any(
+                marker.get(key) != value
+                for key, value in expected_static.items()
+            )
+        ):
+            log.error("Invalid IPv6 firewall marker; refusing nftables mutation")
+            return False
+        if (
+            not accept_stale_uuid
+            and marker.get("connection_uuid") != str(self.current_connection_uuid or "")
+        ):
+            log.error("IPv6 firewall marker belongs to another activation")
+            return False
+
+        table_present = self._ipv6_firewall_table_present()
+        if table_present is None:
+            return False
+        if table_present:
+            try:
+                result = subprocess.run(
+                    [
+                        "nft",
+                        "delete",
+                        "table",
+                        IPV6_FIREWALL_FAMILY,
+                        IPV6_FIREWALL_TABLE,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+            except Exception as e:
+                log.warning(f"Could not remove the IPv6 firewall: {e}")
+                return False
+            if result.returncode != 0:
+                log.warning(
+                    "Could not remove the IPv6 firewall: "
+                    f"{(result.stderr or result.stdout).strip()}"
+                )
+                return False
+        if self._ipv6_firewall_table_present() is not False:
+            log.warning("Owned IPv6 firewall still exists; preserving marker")
+            return False
+        try:
+            IPV6_FIREWALL_MARKER.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning(f"Could not remove IPv6 firewall marker: {e}")
+            return False
+        return True
+
     def _remove_stale_ipv6_leak_protection(self) -> None:
-        """Remove only routes attributable to this plugin, including v2.0.3."""
+        try:
+            with self._recovery_state_lock():
+                self._remove_stale_ipv6_leak_protection_locked()
+        except Exception as e:
+            log.warning(f"Could not lock stale IPv6 recovery state: {e}")
+
+    def _remove_stale_ipv6_leak_protection_locked(self) -> None:
+        """Remove only routes attributable to this plugin, including old releases."""
+        self._remove_owned_ipv6_firewall(accept_stale_uuid=True)
         marker_exists = IPV6_LEAK_ROUTE_MARKER.exists()
         if marker_exists:
-            self._run_recovery_command([
-                "ip",
-                "-6",
-                "route",
-                "del",
-                "unreachable",
-                "::/0",
-                "metric",
-                IPV6_LEAK_ROUTE_METRIC,
-                "proto",
-                IPV6_LEAK_ROUTE_PROTOCOL,
-            ])
-            self._clear_ipv6_leak_marker_if_route_absent()
+            for metric, protocol in (
+                (IPV6_LEAK_ROUTE_METRIC, IPV6_LEAK_ROUTE_PROTOCOL),
+                LEGACY_IPV6_LEAK_ROUTES[0],
+            ):
+                command = [
+                    "ip", "-6", "route", "del", "unreachable", "::/0",
+                    "metric", metric,
+                ]
+                if protocol is not None:
+                    command.extend(["proto", protocol])
+                self._run_recovery_command(command)
+            current_absent = self._ipv6_leak_route_present() is False
+            old_absent = self._ipv6_leak_route_present(
+                *LEGACY_IPV6_LEAK_ROUTES[0]
+            ) is False
+            if current_absent and old_absent:
+                try:
+                    IPV6_LEAK_ROUTE_MARKER.unlink(missing_ok=True)
+                except Exception as e:
+                    log.warning(f"Could not remove stale IPv6 route marker: {e}")
+            else:
+                log.warning("Could not verify all marked IPv6 routes were removed")
 
         # Versions through 2.0.3 created this exact global route by default but
         # had no ownership marker.  Removing the exact signature once prevents
@@ -3643,7 +5030,7 @@ class VPNPluginService(dbus.service.Object):
                     "unreachable",
                     "::/0",
                     "metric",
-                    "50",
+                    LEGACY_IPV6_LEAK_ROUTES[1][0],
                 ],
                 capture_output=True,
                 text=True,
@@ -3656,25 +5043,34 @@ class VPNPluginService(dbus.service.Object):
             log.info(f"Could not remove legacy IPv6 leak route: {e}")
 
     def _remove_ipv6_leak_protection(self) -> None:
-        """Remove the temporary IPv6 block route added for VPN leak protection."""
+        """Remove the owned IPv6 route and firewall under the recovery lock."""
         if (
             not self.ipv6_leak_protection_enabled
             and not IPV6_LEAK_ROUTE_MARKER.exists()
+            and not IPV6_FIREWALL_MARKER.exists()
         ):
             return
-        self._run_recovery_command([
-            "ip",
-            "-6",
-            "route",
-            "del",
-            "unreachable",
-            "::/0",
-            "metric",
-            IPV6_LEAK_ROUTE_METRIC,
-            "proto",
-            IPV6_LEAK_ROUTE_PROTOCOL,
-        ])
-        self._clear_ipv6_leak_marker_if_route_absent()
+        try:
+            with self._recovery_state_lock():
+                self._run_recovery_command([
+                    "ip",
+                    "-6",
+                    "route",
+                    "del",
+                    "unreachable",
+                    "::/0",
+                    "metric",
+                    IPV6_LEAK_ROUTE_METRIC,
+                    "proto",
+                    IPV6_LEAK_ROUTE_PROTOCOL,
+                ])
+                route_removed = self._clear_ipv6_leak_marker_if_route_absent()
+                firewall_removed = self._remove_owned_ipv6_firewall()
+                if route_removed and firewall_removed:
+                    self.ipv6_leak_protection_enabled = False
+                    self.pending_tun_device = None
+        except Exception as e:
+            log.warning(f"Could not lock IPv6 cleanup state: {e}")
 
     def _emit_starting_keepalive(self, connect_generation: Optional[int] = None):
         """Emit a keepalive STARTING state to reduce NM connect timeouts."""
@@ -3742,6 +5138,15 @@ class VPNPluginService(dbus.service.Object):
             tun_dev = tun_device or self.current_tun_device or 'tun0'
             gateway = self.current_gateway or ''
 
+            if not getattr(self, "dns_leak_protection_ready", False):
+                raise RuntimeError(
+                    f"{LEAK_PROTECTION_ERROR_PREFIX} DNS was not validated before Config"
+                )
+            if not self._apply_ipv6_leak_protection():
+                raise RuntimeError(
+                    f"{LEAK_PROTECTION_ERROR_PREFIX} IPv6 was not blocked before Config"
+                )
+
             log.info(f"Emitting config for {tun_dev}, gateway {gateway}")
 
             # Get IP address from interface
@@ -3803,67 +5208,23 @@ class VPNPluginService(dbus.service.Object):
                 # the address in network byte order.
                 ip_uint = self._ipv4_to_nm_uint32(ip_addr)
 
-                # Get DNS servers - try multiple methods
-                dns_server_ips = []
-
-                # Method 1: Try resolvectl for systemd-resolved systems
-                try:
-                    result = subprocess.run(
-                        ['resolvectl', 'dns', tun_dev],
-                        capture_output=True, text=True, timeout=5
+                # Only the tunnel-bound, recursively validated servers prepared
+                # before Config are authoritative. Never fall back to host DNS.
+                dns_server_ips = self._normalize_dns_servers(
+                    getattr(self, "vpn_dns_servers", [])
+                )
+                if not dns_server_ips:
+                    raise RuntimeError(
+                        f"{LEAK_PROTECTION_ERROR_PREFIX} validated VPN DNS vanished"
                     )
-                    if result.returncode == 0:
-                        # Parse output like "Link 123 (tun0): 10.0.0.1 10.0.0.2"
-                        for line in result.stdout.split('\n'):
-                            if tun_dev in line:
-                                parts = line.split(':')
-                                if len(parts) >= 2:
-                                    dns_part = parts[1].strip()
-                                    for ns in dns_part.split():
-                                        try:
-                                            ns_parts = [int(x) for x in ns.split('.')]
-                                            if len(ns_parts) == 4:
-                                                # Convert IP to uint32 in host byte order (little-endian on x86)
-                                                # IP a.b.c.d becomes: a + b*256 + c*65536 + d*16777216
-                                                ns_uint = ns_parts[0] | (ns_parts[1] << 8) | (ns_parts[2] << 16) | (ns_parts[3] << 24)
-                                                dns_server_ips.append(ns)
-                                                log.info(f"Found DNS from resolvectl: {ns} -> {ns_uint}")
-                                        except:
-                                            pass
-                except Exception as e:
-                    log.info(f"resolvectl failed: {e}")
-
-                # Method 2: If no DNS yet, check stored DNS from OpenConnect output
-                if not dns_server_ips and hasattr(self, 'vpn_dns_servers') and self.vpn_dns_servers:
-                    for ns in self.vpn_dns_servers:
-                        try:
-                            ns_parts = [int(x) for x in ns.split('.')]
-                            if len(ns_parts) == 4:
-                                # Convert IP to uint32 in host byte order (little-endian on x86)
-                                ns_uint = ns_parts[0] | (ns_parts[1] << 8) | (ns_parts[2] << 16) | (ns_parts[3] << 24)
-                                dns_server_ips.append(ns)
-                                log.info(f"Using stored VPN DNS: {ns} -> {ns_uint}")
-                        except:
-                            pass
-
-                # Do not copy the host's /etc/resolv.conf into VPN Ip4Config.
-                # On systemd-resolved systems that is usually 127.0.0.53 and
-                # feeding the local stub back as link DNS creates a resolver
-                # loop.  If the VPN pushed no DNS, emit no VPN DNS and retain
-                # NetworkManager's physical-link resolvers.
-
-                dns_server_ips = self._normalize_dns_servers(dns_server_ips)
                 dns_domains = self._normalize_vpn_domains()
                 if dns_domains:
                     log.info(f"VPN DNS domains for NetworkManager: {dns_domains}")
                 if self.current_protocol == 'anyconnect' and not self.vpn_tunnel_all_dns:
-                    if self._anyconnect_preserve_default_route():
-                        log.info(
-                            "AnyConnect split-exclude/full-tunnel routing active; "
-                            "keeping VPN DNS available for global lookups"
-                        )
-                    else:
-                        log.info("AnyConnect split-DNS mode active; avoiding VPN as global DNS/default route")
+                    log.info(
+                        "AnyConnect supplied split-DNS metadata; enforcing the "
+                        "user-requested all-DNS tunnel policy"
+                    )
                 dns_servers = []
                 for ns in dns_server_ips:
                     ns_parts = [int(x) for x in ns.split('.')]
@@ -3888,23 +5249,22 @@ class VPNPluginService(dbus.service.Object):
                     f"Emitted Ip4Config signal: addr={ip_addr}/{prefix}, "
                     f"dns={len(dns_servers)} servers, domains={dns_domains}"
                 )
-                if self.current_protocol == 'anyconnect' and not self.vpn_tunnel_all_dns:
+                if not self._apply_full_dns_resolved(
+                    tun_dev,
+                    dns_server_ips,
+                    connect_generation,
+                ):
+                    raise RuntimeError(
+                        f"{LEAK_PROTECTION_ERROR_PREFIX} NetworkManager replaced tunnel DNS"
+                    )
+                for delay_seconds in (1, 3):
                     GLib.timeout_add_seconds(
-                        1,
-                        self._apply_split_dns_resolved,
+                        delay_seconds,
+                        self._reapply_full_dns_resolved,
                         tun_dev,
-                        dns_domains,
+                        list(dns_server_ips),
                         connect_generation,
                     )
-                    GLib.timeout_add_seconds(
-                        3,
-                        self._apply_split_dns_resolved,
-                        tun_dev,
-                        dns_domains,
-                        connect_generation,
-                    )
-
-            self._apply_ipv6_leak_protection()
 
             # Now set state to started
             self._set_state(NM_VPN_SERVICE_STATE_STARTED)
@@ -3924,6 +5284,9 @@ class VPNPluginService(dbus.service.Object):
                     )
             except Exception:
                 pass
+            # This callback already passed the generation/process guard above.
+            # cancel_requested is now true, so passing the generation would make
+            # _emit_failure suppress the terminal failure we must report to NM.
             self._emit_failure(str(e))
 
         return False
@@ -4088,6 +5451,7 @@ class VPNPluginService(dbus.service.Object):
         # Clear captured VPN metadata, but retain exact ownership when deletion
         # failed so a later recovery pass/dispatcher can retry safely.
         self.vpn_dns_servers = []
+        self.dns_leak_protection_ready = False
         self.vpn_domains = []
         self.vpn_tunnel_all_dns = None
         self.vpn_split_excludes = []
@@ -4331,7 +5695,7 @@ class VPNPluginService(dbus.service.Object):
         finally:
             # GLib timers do not run after quit.  Keep process-exit cleanup
             # synchronous so SIGTERM/service replacement cannot strand an
-            # owned tunnel, DNS link, or opt-in IPv6 block route.
+            # owned tunnel, DNS link, or default-on IPv6 block route.
             self.cancel_requested = True
             self._connect_generation += 1
             try:

@@ -60,6 +60,7 @@ _reload_networkmanager_plugin() {
 post_install() {
   _setup_runtime_dirs
   _install_playwright_chromium
+  /usr/libexec/nm-ms-sso-migrate-dns-policy || true
   _reload_networkmanager_plugin
 }
 

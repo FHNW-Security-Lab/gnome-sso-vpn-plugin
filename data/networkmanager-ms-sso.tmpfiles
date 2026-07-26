@@ -1,3 +1,4 @@
 d /var/cache/ms-playwright 0755 root root -
 d /var/cache/ms-sso-openconnect 0755 root root -
 d /var/cache/ms-sso-openconnect/browser-session 0755 root root -
+d /run/network-manager-ms-sso 0755 root root -

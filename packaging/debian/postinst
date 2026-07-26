@@ -41,6 +41,11 @@ case "$1" in
             echo "Chromium runtime installed successfully."
         fi
 
+        # NetworkManager snapshots DNS priority at activation start. Upgrade
+        # existing profiles now so their first post-upgrade connection is
+        # exclusive too, including hosts without systemd-resolved.
+        /usr/libexec/nm-ms-sso-migrate-dns-policy || true
+
         # D-Bus-activated helpers can survive a NetworkManager restart and
         # continue running the pre-upgrade code. Stop them explicitly so the
         # next activation always starts the helper installed by this package.
