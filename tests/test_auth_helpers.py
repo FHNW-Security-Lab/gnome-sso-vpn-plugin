@@ -24,14 +24,24 @@ from core.auth import (  # noqa: E402
     MICROSOFT_KMSI_ACCEPT_LABELS,
     MICROSOFT_KMSI_MARKERS,
     MICROSOFT_NUMBER_MATCH_MARKERS,
+    MICROSOFT_NUMBER_MATCH_TOTP_ALTERNATE_LABELS,
+    MICROSOFT_METHOD_PICKER_SETTLE_SECONDS,
     MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS,
+    MICROSOFT_PUSH_DELIVERY_MAX_RETRIES,
     MICROSOFT_TOTP_MAX_SUBMISSIONS,
     MICROSOFT_PASSKEY_MARKERS,
+    MICROSOFT_PASSKEY_APP_FALLBACK_LABELS,
     MICROSOFT_PASSWORD_DIRECT_SELECTORS,
     MICROSOFT_PASSWORD_DISPATCH_CONFIRM_SECONDS,
     MICROSOFT_PASSWORD_METHOD_LABELS,
+    MICROSOFT_PRIMARY_CREDENTIAL_PICKER_SELECTORS,
+    MICROSOFT_PRIMARY_METHOD_PICKER_MARKERS,
+    MICROSOFT_PUSH_DELIVERY_FAILURE_MARKERS,
     MICROSOFT_PUSH_DIRECT_SELECTORS,
+    MICROSOFT_PUSH_METHOD_LABELS,
     MICROSOFT_TOTP_DIRECT_SELECTORS,
+    MICROSOFT_EXACT_TOTP_METHOD_LABELS,
+    MICROSOFT_TOTP_METHOD_LABELS,
     SAML_UI_MAX_RECOVERIES,
     SAML_UI_MAX_PROCESSING_EXTENSIONS,
     SAML_UI_MAX_SUBMIT_WAIT_SECONDS,
@@ -85,10 +95,16 @@ from core.auth import (  # noqa: E402
     _password_alternate_dispatch_allowed,
     _password_control_is_progress,
     _password_discovery_classification_deferred,
+    _password_discovery_method_picker_ready,
     _password_discovery_replacement_ready,
     _password_discovery_replacement_allowed,
     _password_discovery_supported,
     _password_entry_uses_key_events,
+    _password_fallback_input_allowed,
+    _password_bridge_transition_action,
+    _password_bridge_allowed,
+    _passkey_fallback_route,
+    _passkey_password_transition_action,
     _password_submission_uses_strict_owning_form,
     _password_submission_classification_deadline,
     _password_submission_classification_delay,
@@ -3022,8 +3038,21 @@ class MicrosoftAuthUiTests(unittest.TestCase):
 
     def test_fhnw_german_authenticator_fallback_is_supported(self):
         self.assertIn(
+            "I can't use my Microsoft Authenticator app right now",
+            MICROSOFT_ALTERNATE_MFA_LABELS,
+        )
+        self.assertIn(
             "Ich kann meine Microsoft Authenticator-App im Moment nicht verwenden",
             MICROSOFT_ALTERNATE_MFA_LABELS,
+        )
+        self.assertIn("Use a verification code", MICROSOFT_TOTP_METHOD_LABELS)
+        self.assertIn(
+            "I can't use my Microsoft Authenticator app right now",
+            MICROSOFT_NUMBER_MATCH_TOTP_ALTERNATE_LABELS,
+        )
+        self.assertIn(
+            "Use a verification code",
+            MICROSOFT_EXACT_TOTP_METHOD_LABELS,
         )
 
     def test_microsoft_totp_method_has_stable_selector(self):
@@ -3031,9 +3060,20 @@ class MicrosoftAuthUiTests(unittest.TestCase):
 
     def test_current_password_and_alternate_selectors_are_supported(self):
         self.assertIn("#idA_PWD_SwitchToPassword", MICROSOFT_PASSWORD_DIRECT_SELECTORS)
-        self.assertIn("#idA_PWD_SwitchToCredPicker", MICROSOFT_ALTERNATE_MFA_SELECTORS)
+        self.assertNotIn(
+            "#idA_PWD_SwitchToCredPicker",
+            MICROSOFT_ALTERNATE_MFA_SELECTORS,
+        )
+        self.assertIn(
+            "#idA_PWD_SwitchToCredPicker",
+            MICROSOFT_PRIMARY_CREDENTIAL_PICKER_SELECTORS,
+        )
         self.assertIn("Use my password", MICROSOFT_PASSWORD_METHOD_LABELS)
         self.assertIn("Mein Kennwort verwenden", MICROSOFT_PASSWORD_METHOD_LABELS)
+        self.assertIn(
+            "Choose a way to sign in",
+            MICROSOFT_PRIMARY_METHOD_PICKER_MARKERS,
+        )
 
     def test_german_stay_signed_in_prompt_is_supported(self):
         self.assertIn("Angemeldet bleiben", MICROSOFT_KMSI_MARKERS)
@@ -3083,6 +3123,10 @@ class MicrosoftAuthUiTests(unittest.TestCase):
     def test_push_passkey_and_number_match_states_are_supported(self):
         self.assertIn("[data-value='PhoneAppNotification']", MICROSOFT_PUSH_DIRECT_SELECTORS)
         self.assertIn("Passkey verwenden", MICROSOFT_PASSKEY_MARKERS)
+        self.assertIn(
+            "Face, fingerprint, PIN or security key",
+            MICROSOFT_PASSKEY_MARKERS,
+        )
         self.assertIn("Geben Sie die Nummer ein", MICROSOFT_NUMBER_MATCH_MARKERS)
         self.assertIn("Geben Sie die angezeigte Zahl ein", MICROSOFT_NUMBER_MATCH_MARKERS)
         self.assertIn(
@@ -3099,10 +3143,48 @@ class MicrosoftAuthUiTests(unittest.TestCase):
         self.assertEqual(_standalone_two_digit_numbers("Code 65\n2026\n123456"), set())
         self.assertEqual(_standalone_two_digit_numbers("12\n65"), {"12", "65"})
 
-    def test_number_match_selector_is_authoritative_without_known_wording(self):
-        self.assertTrue(_has_number_match_evidence(False, True))
-        self.assertTrue(_has_number_match_evidence(True, False))
-        self.assertFalse(_has_number_match_evidence(False, False))
+    def test_number_match_container_requires_a_number_without_known_wording(self):
+        self.assertTrue(_has_number_match_evidence(False, True, True))
+        self.assertTrue(_has_number_match_evidence(True, False, False))
+        self.assertFalse(_has_number_match_evidence(False, True, False))
+        self.assertFalse(_has_number_match_evidence(False, False, True))
+
+    def test_password_fallback_rejects_username_like_text_controls(self):
+        self.assertFalse(_password_fallback_input_allowed("text", "username", 9))
+        self.assertFalse(_password_fallback_input_allowed("email", "email", 9))
+        self.assertFalse(_password_fallback_input_allowed("text", "", 3))
+        self.assertTrue(_password_fallback_input_allowed("password", "", 8))
+        self.assertTrue(
+            _password_fallback_input_allowed("text", "current-password", 6)
+        )
+        self.assertFalse(_password_fallback_input_allowed("password", "", 0))
+
+    def test_safe_lookup_can_promote_primary_password_picker(self):
+        common = {
+            "protocol": "anyconnect",
+            "submission_kind": "password-unknown",
+            "lookup_observed": True,
+            "credential_tainted": False,
+            "unsafe_write_observed": False,
+            "primary_picker_visible": True,
+            "password_method_visible": True,
+        }
+        self.assertTrue(_password_discovery_method_picker_ready(**common))
+        for override in (
+            {"protocol": "pulse"},
+            {"submission_kind": "password"},
+            {"lookup_observed": False},
+            {"credential_tainted": True},
+            {"unsafe_write_observed": True},
+            {"primary_picker_visible": False},
+            {"password_method_visible": False},
+        ):
+            with self.subTest(override=override):
+                self.assertFalse(
+                    _password_discovery_method_picker_ready(
+                        **(common | override)
+                    )
+                )
 
     def test_auto_and_totp_switch_number_match_to_totp(self):
         self.assertTrue(_prefer_totp_for_number_match("auto", True, False))
@@ -3142,8 +3224,68 @@ class MicrosoftAuthUiTests(unittest.TestCase):
             "none",
         )
 
+    def test_password_bridge_can_continue_through_revealed_totp_picker(self):
+        self.assertEqual(
+            _password_bridge_transition_action(True, False, True),
+            "select-totp",
+        )
+        self.assertEqual(
+            _password_bridge_transition_action(True, True, True),
+            "select-totp",
+        )
+
+    def test_password_bridge_keeps_password_continuation_available(self):
+        self.assertEqual(
+            _password_bridge_transition_action(False, True, True),
+            "accept-password",
+        )
+        self.assertEqual(
+            _password_bridge_transition_action(False, False, True),
+            "wait",
+        )
+        self.assertEqual(
+            _password_bridge_transition_action(False, False, False),
+            "fail",
+        )
+        self.assertTrue(_password_bridge_allowed("auto"))
+        self.assertFalse(_password_bridge_allowed("totp"))
+        self.assertFalse(_password_bridge_allowed("push"))
+
+    def test_post_password_passkey_stays_on_explicit_totp_route(self):
+        self.assertEqual(_passkey_fallback_route(True, True), "totp")
+        self.assertEqual(_passkey_fallback_route(False, True), "password")
+        self.assertEqual(_passkey_fallback_route(True, False), "password")
+        self.assertIn(
+            "Use an app instead",
+            MICROSOFT_PASSKEY_APP_FALLBACK_LABELS,
+        )
+        self.assertIn(
+            "Eine Anforderung in meiner Microsoft Authenticator-App bestätigen",
+            MICROSOFT_PUSH_METHOD_LABELS,
+        )
+        self.assertIn(
+            "Die Anforderung wurde nicht gesendet",
+            MICROSOFT_PUSH_DELIVERY_FAILURE_MARKERS,
+        )
+
+    def test_passkey_password_transition_is_bounded(self):
+        self.assertEqual(
+            _passkey_password_transition_action(True, True),
+            "accept-password",
+        )
+        self.assertEqual(
+            _passkey_password_transition_action(False, True),
+            "wait",
+        )
+        self.assertEqual(
+            _passkey_password_transition_action(False, False),
+            "fail",
+        )
+
     def test_mfa_transition_allows_slow_spa_rendering(self):
         self.assertGreaterEqual(MICROSOFT_MFA_TRANSITION_TIMEOUT_SECONDS, 15.0)
+        self.assertGreaterEqual(MICROSOFT_METHOD_PICKER_SETTLE_SECONDS, 5.0)
+        self.assertEqual(MICROSOFT_PUSH_DELIVERY_MAX_RETRIES, 1)
 
     def test_totp_rotation_alone_never_authorizes_a_second_submission(self):
         self.assertEqual(MICROSOFT_TOTP_MAX_SUBMISSIONS, 1)
