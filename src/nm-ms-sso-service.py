@@ -148,6 +148,7 @@ NM_VPN_PLUGIN_FAILURE_BAD_IP_CONFIG = 2
 # pointing at the old tunnel ifindex after OpenConnect has removed it.
 NETWORK_RECOVERY_INITIAL_DELAY_MS = 750
 NETWORK_RECOVERY_TIMEOUT_SECONDS = 15
+CONNECT_DRAIN_TIMEOUT_SECONDS = 30
 GP_GATEWAY_ROUTE_STABILIZATION_DELAYS = (0.0, 0.2, 0.5, 1.0, 1.5)
 ANYCONNECT_STRUCTURAL_READY_GRACE_SECONDS = 1.0
 IPV6_LEAK_ROUTE_METRIC = "1"
@@ -458,6 +459,28 @@ class VPNPluginService(dbus.service.Object):
             retry_kwargs = dict(auth_kwargs)
             retry_kwargs['disable_browser_session_cache'] = True
             return do_saml_auth(**retry_kwargs)
+
+    @staticmethod
+    def _browser_session_cache_disabled(
+            protocol: str,
+            mfa_preference: str,
+            totp_secret: str,
+            explicitly_disabled: bool,
+            explicitly_enabled: bool,
+    ) -> bool:
+        """Choose a deterministic browser profile policy for one activation."""
+        if explicitly_enabled:
+            return False
+        if explicitly_disabled:
+            return True
+        # A saved TOTP secret makes every AnyConnect activation self-contained.
+        # Reusing Chromium state adds no authentication value in that flow and
+        # can preserve a half-finished Microsoft page after an NM timeout.
+        return bool(
+            protocol == 'anyconnect'
+            and mfa_preference == 'totp'
+            and str(totp_secret or '').strip()
+        )
 
     @staticmethod
     def _is_cookie_rejection(error_msg) -> bool:
@@ -1320,7 +1343,46 @@ class VPNPluginService(dbus.service.Object):
                 connect_generation,
             )
             return
-        if self._is_connect_cancelled(connect_generation):
+        if connect_generation != self._connect_generation:
+            return
+        self._connect_thread(settings, connect_generation)
+
+    def _connect_after_prior_activation(
+            self,
+            prior_thread,
+            recovery_thread,
+            settings,
+            connect_generation: int,
+    ) -> None:
+        """Drain a superseded worker before starting the newest activation."""
+        prior_thread.join(timeout=CONNECT_DRAIN_TIMEOUT_SECONDS)
+        if prior_thread.is_alive():
+            GLib.idle_add(
+                self._emit_failure,
+                "Prior VPN activation did not finish cleanup",
+                connect_generation,
+            )
+            return
+        if connect_generation != self._connect_generation:
+            return
+
+        if recovery_thread and recovery_thread.is_alive():
+            recovery_thread.join(timeout=NETWORK_RECOVERY_TIMEOUT_SECONDS + 10)
+            if recovery_thread.is_alive():
+                GLib.idle_add(
+                    self._emit_failure,
+                    "Prior VPN network recovery did not finish",
+                    connect_generation,
+                )
+                return
+        if connect_generation != self._connect_generation:
+            return
+
+        # A cancelled worker intentionally suppresses its stale terminal
+        # callback. Clean its generation-owned residue here, before the new
+        # worker captures uplinks or launches a browser.
+        self._cleanup_dns()
+        if connect_generation != self._connect_generation:
             return
         self._connect_thread(settings, connect_generation)
 
@@ -2691,9 +2753,15 @@ class VPNPluginService(dbus.service.Object):
         """Worker thread for VPN connection."""
         try:
             self._reset_inactivity_timeout()
-            if connect_generation != self._connect_generation:
-                return
-            self.cancel_requested = False
+            cleanup_lock = getattr(self, "_cleanup_lock", None) or threading.RLock()
+            self._cleanup_lock = cleanup_lock
+            with cleanup_lock:
+                if connect_generation != self._connect_generation:
+                    return
+                # Clear only the cancellation used to unwind the prior
+                # generation. A Disconnect increments the generation under the
+                # same lock and therefore cannot be accidentally undone here.
+                self.cancel_requested = False
 
             def _connect_cancelled() -> bool:
                 return self._is_connect_cancelled(connect_generation)
@@ -2752,12 +2820,17 @@ class VPNPluginService(dbus.service.Object):
                     and self._is_truthy(os.environ.get("MS_SSO_NM_ANYCONNECT_ENABLE_BROWSER_SESSION_CACHE"))
                 )
             )
-            disable_browser_session_cache = (
+            explicitly_disable_browser_session_cache = (
                 self._is_truthy(secrets.get('disable_browser_session_cache'))
                 or self._is_truthy(os.environ.get("MS_SSO_NM_DISABLE_BROWSER_SESSION_CACHE"))
             )
-            if force_enable_browser_session_cache:
-                disable_browser_session_cache = False
+            disable_browser_session_cache = self._browser_session_cache_disabled(
+                protocol,
+                mfa_preference,
+                totp_secret,
+                explicitly_disable_browser_session_cache,
+                force_enable_browser_session_cache,
+            )
             log.info(
                 "Browser session cache: "
                 f"{'disabled' if disable_browser_session_cache else 'enabled'}"
@@ -2769,10 +2842,19 @@ class VPNPluginService(dbus.service.Object):
             )
             if debug_auth:
                 log.info("Privacy-safe SAML browser diagnostics enabled")
-            if protocol in {'gp', 'anyconnect'} and disable_browser_session_cache and not force_enable_browser_session_cache:
+            if (
+                protocol in {'gp', 'anyconnect'}
+                and explicitly_disable_browser_session_cache
+                and not force_enable_browser_session_cache
+            ):
                 log.info(
                     f"{protocol} uses a fresh browser session by configuration; "
                     "remove disable-browser-session-cache=1 to reuse SSO browser state"
+                )
+            elif disable_browser_session_cache:
+                log.info(
+                    "AnyConnect TOTP uses a fresh browser session by default; "
+                    "set enable-browser-session-cache=1 to opt into reuse"
                 )
 
             if not gateway:
@@ -5488,8 +5570,8 @@ class VPNPluginService(dbus.service.Object):
         recovery_thread = self._network_recovery_thread
 
         # Never overlap two activations that share process/tunnel/DNS state.
-        # Failing the second request cleanly is safer than letting an old worker
-        # delete or reapply resources under a new tunnel.
+        # The newest request supersedes and drains the old worker instead of
+        # being randomly rejected while Chromium is still closing.
         cleanup_lock = getattr(self, "_cleanup_lock", None) or threading.RLock()
         self._cleanup_lock = cleanup_lock
         with cleanup_lock:
@@ -5504,15 +5586,17 @@ class VPNPluginService(dbus.service.Object):
             self._network_recovery_token += 1
             connect_generation = self._connect_generation
 
-        if previous_thread_alive or previous_process_alive:
-            log.error(
-                "Rejecting overlapping Connect request; ending the existing "
-                "activation before NetworkManager retries"
+        previous_thread = self.connection_thread if previous_thread_alive else None
+        if previous_process_alive:
+            log.warning(
+                "A new Connect request superseded the previous tunnel; draining it"
             )
-            if previous_process_alive:
-                self._stop_vpn_process(preserve_session=True, force=True)
-            self._emit_failure("Overlapping VPN activation rejected")
-            return
+            self._stop_vpn_process(preserve_session=True, force=True)
+        elif previous_thread_alive:
+            log.warning(
+                "A new Connect request arrived while authentication was closing; "
+                "queuing it behind cleanup"
+            )
 
         self._set_state(NM_VPN_SERVICE_STATE_STARTING)
 
@@ -5522,7 +5606,15 @@ class VPNPluginService(dbus.service.Object):
         # Start connection in the background.  If a prior recovery command is
         # already in flight, the coordinator waits for it off the D-Bus thread
         # before starting browser authentication or OpenConnect.
-        if recovery_thread and recovery_thread.is_alive():
+        if previous_thread is not None:
+            thread_target = self._connect_after_prior_activation
+            thread_args = (
+                previous_thread,
+                recovery_thread,
+                settings,
+                connect_generation,
+            )
+        elif recovery_thread and recovery_thread.is_alive():
             thread_target = self._connect_after_recovery
             thread_args = (recovery_thread, settings, connect_generation)
         else:
@@ -5548,8 +5640,11 @@ class VPNPluginService(dbus.service.Object):
         """Disconnect VPN."""
         log.info("Disconnect called")
         self._reset_inactivity_timeout()
-        self.cancel_requested = True
-        self._connect_generation += 1
+        cleanup_lock = getattr(self, "_cleanup_lock", None) or threading.RLock()
+        self._cleanup_lock = cleanup_lock
+        with cleanup_lock:
+            self.cancel_requested = True
+            self._connect_generation += 1
 
         if self.state in (
             NM_VPN_SERVICE_STATE_STOPPED,

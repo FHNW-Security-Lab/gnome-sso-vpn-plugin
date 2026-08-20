@@ -13,6 +13,7 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
 
 from core.auth import (  # noqa: E402
     SamlUiStalledError as CoreSamlUiStalledError,
+    _persistent_profile_should_be_discarded_after_stall,
     _ui_stall_exception,
 )
 
@@ -104,6 +105,26 @@ class CachedProfileRecoveryIntegrationTests(unittest.TestCase):
                 )
 
         auth.assert_called_once()
+
+    def test_post_credential_stall_poisons_only_persistent_anyconnect_profile(self):
+        self.assertTrue(
+            _persistent_profile_should_be_discarded_after_stall(
+                "anyconnect",
+                force_ephemeral_browser_session=False,
+            )
+        )
+        self.assertFalse(
+            _persistent_profile_should_be_discarded_after_stall(
+                "anyconnect",
+                force_ephemeral_browser_session=True,
+            )
+        )
+        self.assertFalse(
+            _persistent_profile_should_be_discarded_after_stall(
+                "gp",
+                force_ephemeral_browser_session=False,
+            )
+        )
 
     def test_globalprotect_stall_is_not_retried_in_an_ephemeral_profile(self):
         stall = _ui_stall_exception(

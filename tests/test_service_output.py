@@ -571,6 +571,82 @@ class OpenConnectOutputTests(unittest.TestCase):
 
         auth.assert_called_once()
 
+    def test_anyconnect_totp_uses_clean_browser_session_by_default(self):
+        disabled = self.service._browser_session_cache_disabled(
+            "anyconnect",
+            "totp",
+            "TESTTOTPSECRET",
+            explicitly_disabled=False,
+            explicitly_enabled=False,
+        )
+
+        self.assertTrue(disabled)
+
+    def test_browser_session_cache_can_still_be_explicitly_enabled(self):
+        disabled = self.service._browser_session_cache_disabled(
+            "anyconnect",
+            "totp",
+            "TESTTOTPSECRET",
+            explicitly_disabled=True,
+            explicitly_enabled=True,
+        )
+
+        self.assertFalse(disabled)
+
+    def test_push_and_globalprotect_keep_browser_session_cache_default(self):
+        for protocol, preference, secret in (
+            ("anyconnect", "push", "TESTTOTPSECRET"),
+            ("anyconnect", "totp", ""),
+            ("gp", "totp", "TESTTOTPSECRET"),
+        ):
+            with self.subTest(protocol=protocol, preference=preference):
+                self.assertFalse(
+                    self.service._browser_session_cache_disabled(
+                        protocol,
+                        preference,
+                        secret,
+                        explicitly_disabled=False,
+                        explicitly_enabled=False,
+                    )
+                )
+
+    def test_reconnect_waits_for_prior_auth_worker_instead_of_rejecting(self):
+        prior_thread = MagicMock()
+        prior_thread.is_alive.return_value = False
+        self.service._connect_generation = 7
+
+        with patch.object(self.service, "_cleanup_dns") as cleanup, patch.object(
+            self.service,
+            "_connect_thread",
+        ) as connect:
+            self.service._connect_after_prior_activation(
+                prior_thread,
+                None,
+                {"vpn": {}},
+                7,
+            )
+
+        prior_thread.join.assert_called_once_with(
+            timeout=SERVICE_MODULE.CONNECT_DRAIN_TIMEOUT_SECONDS
+        )
+        cleanup.assert_called_once_with()
+        connect.assert_called_once_with({"vpn": {}}, 7)
+
+    def test_reconnect_after_recovery_is_not_cancelled_by_old_generation_flag(self):
+        recovery_thread = MagicMock()
+        recovery_thread.is_alive.return_value = False
+        self.service._connect_generation = 8
+        self.service.cancel_requested = True
+
+        with patch.object(self.service, "_connect_thread") as connect:
+            self.service._connect_after_recovery(
+                recovery_thread,
+                {"vpn": {}},
+                8,
+            )
+
+        connect.assert_called_once_with({"vpn": {}}, 8)
+
     def test_failed_attempt_cleanup_precedes_fresh_anyconnect_auth_retries(self):
         """A failed attempt's DNS firewall must not reach the next SAML flow."""
         settings = {

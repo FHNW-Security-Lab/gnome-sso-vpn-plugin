@@ -99,19 +99,24 @@ nmcli connection modify "<connection name>" +vpn.data "gp-auth-interface=gateway
 Use `portal` for deployments that require portal discovery. This setting only
 affects GlobalProtect; AnyConnect profiles keep their existing connection path.
 
-GlobalProtect and AnyConnect SAML reuse a browser session by default. This keeps
-Microsoft/IdP SSO state across reconnects, avoids repeated TOTP prompts, and
-makes long-running AnyConnect deployments such as FHNW less fragile. Browser
-state is isolated by VPN protocol, gateway, and account so switching
-between institutions cannot reuse the other connection's tenant or account
-selection. If a cached Microsoft page stops advancing, the plugin re-enters the
-flow once and then falls back to one clean ephemeral session within the same
-NetworkManager activation. UI state is checked continuously: static pages use a
-short recovery threshold, while submitted forms, visible processing, and MFA
-method transitions receive bounded extra time only while they are still active.
-Submitted forms start with a 20-second fast path and progressively extend only
-as needed, up to the protocol deadline; they are never automatically reloaded
-or submitted twice.
+GlobalProtect and interactive AnyConnect SAML reuse a browser session by
+default. Browser state is isolated by VPN protocol, gateway, and account so
+switching between institutions cannot reuse the other connection's tenant or
+account selection. AnyConnect profiles explicitly configured for TOTP use a
+fresh browser session on every activation when a TOTP secret is stored. That
+flow is already self-contained, and a clean session prevents a timed-out
+Microsoft page from making the next reconnect depend on stale UI state. Set
+`enable-browser-session-cache=1` to opt back into reuse for such a profile.
+
+If a persistent AnyConnect page stops advancing, the plugin invalidates that
+profile. A pre-credential stall falls back to one clean ephemeral session in the
+same NetworkManager activation; a post-password or post-MFA stall fails closed
+without replaying the sensitive action, and the next activation starts clean.
+UI state is checked continuously: static pages use a short recovery threshold,
+while submitted forms, visible processing, and MFA method transitions receive
+bounded extra time only while they are still active. Submitted forms start with
+a 20-second fast path and progressively extend only as needed, up to the
+protocol deadline; they are never automatically reloaded or submitted twice.
 
 If an IdP session still causes problems, force a fresh browser session explicitly:
 

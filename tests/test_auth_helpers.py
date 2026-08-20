@@ -72,6 +72,7 @@ from core.auth import (  # noqa: E402
     _exact_action_pattern,
     _enter_password_value,
     _extend_processing_grace,
+    _fill_totp_code_control,
     _get_gp_prelogin,
     _gp_password_client_replacement_ready,
     _gp_initial_password_observation_required,
@@ -142,6 +143,34 @@ class AuthDeadlineTests(unittest.TestCase):
         self.assertEqual(_parse_saml_timeout("anyconnect", "invalid"), 300)
         self.assertEqual(_parse_saml_timeout("anyconnect", "0"), 300)
         self.assertEqual(_parse_saml_timeout("gp", "30"), 240)
+
+
+class TotpControlHydrationTests(unittest.TestCase):
+    def test_hidden_microsoft_session_input_is_never_filled(self):
+        hidden = Mock()
+        hidden.is_visible.return_value = False
+
+        self.assertFalse(_fill_totp_code_control(hidden, "123456"))
+        hidden.fill.assert_not_called()
+
+    def test_retargeted_locator_is_rediscovered_after_bounded_fill(self):
+        replaced = Mock()
+        replaced.is_visible.return_value = True
+        replaced.is_enabled.return_value = True
+        replaced.is_editable.return_value = True
+        replaced.fill.side_effect = TimeoutError("DOM replaced")
+
+        self.assertFalse(_fill_totp_code_control(replaced, "123456"))
+        replaced.fill.assert_called_once_with("123456", timeout=1000)
+
+    def test_visible_editable_totp_control_is_filled(self):
+        visible = Mock()
+        visible.is_visible.return_value = True
+        visible.is_enabled.return_value = True
+        visible.is_editable.return_value = True
+
+        self.assertTrue(_fill_totp_code_control(visible, "123456"))
+        visible.fill.assert_called_once_with("123456", timeout=1000)
 
 
 class BrowserSessionIsolationTests(unittest.TestCase):

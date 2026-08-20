@@ -1602,6 +1602,17 @@ def _discard_stale_browser_profile(
     return True
 
 
+def _persistent_profile_should_be_discarded_after_stall(
+    protocol: str,
+    force_ephemeral_browser_session: bool,
+) -> bool:
+    """Discard stalled AnyConnect state so the next activation starts clean."""
+    return bool(
+        str(protocol or "").casefold() == "anyconnect"
+        and not force_ephemeral_browser_session
+    )
+
+
 def _extend_processing_grace(
     now: float,
     grace_until: float,
@@ -1631,6 +1642,23 @@ def _extend_processing_grace(
 def _is_usable_input_state(enabled: bool, editable: bool) -> bool:
     """Return whether an input can be safely filled in the current DOM state."""
     return bool(enabled and editable)
+
+
+def _fill_totp_code_control(otp_loc, totp_code: str) -> bool:
+    """Fill only a currently visible TOTP control; tolerate DOM replacement."""
+    try:
+        if not otp_loc.is_visible() or not _is_usable_input_state(
+            otp_loc.is_enabled(),
+            otp_loc.is_editable(),
+        ):
+            return False
+        # Microsoft replaces MFA panels in place. Keep this bounded so an
+        # index-based Playwright locator that was retargeted to a hidden session
+        # field is rediscovered on the next auth loop instead of failing login.
+        otp_loc.fill(totp_code, timeout=1000)
+        return True
+    except Exception:
+        return False
 
 
 def _username_fallback_wait_required(
@@ -3192,16 +3220,16 @@ def do_saml_auth(
                 elif discard_persistent_profile_on_close:
                     _discard_stale_browser_profile(cache_dir, session_tmp_dir)
 
-        def _raise_pre_sensitive_profile_stall(message: str) -> None:
-            """Discard only a stale cached profile and request one clean retry."""
+        def _raise_profile_stall(message: str) -> None:
+            """Invalidate stale persistent state without replaying credentials."""
             nonlocal discard_persistent_profile_on_close
-            if (
-                protocol == "anyconnect"
-                and not force_ephemeral_browser_session
+            if _persistent_profile_should_be_discarded_after_stall(
+                protocol,
+                force_ephemeral_browser_session,
             ):
                 discard_persistent_profile_on_close = True
                 _report_progress("saml-persistent-profile-invalidated")
-            raise SamlUiStalledError(message)
+            raise _ui_stall_exception(message, sensitive_submission_started)
 
         saml_result = {
             "prelogin_cookie": None,
@@ -5534,21 +5562,19 @@ def do_saml_auth(
                 if recovery_action == "wait":
                     return False
                 if sensitive_submission_started:
-                    raise _ui_stall_exception(
+                    _raise_profile_stall(
                         "Microsoft authentication UI did not make substantive progress",
-                        sensitive_submission_started,
                     )
                 if (
                     protocol == "anyconnect"
                     and not force_ephemeral_browser_session
                 ):
-                    _raise_pre_sensitive_profile_stall(
+                    _raise_profile_stall(
                         "Cached SAML browser profile did not make substantive progress"
                     )
                 if recovery_action == "fail":
-                    raise _ui_stall_exception(
+                    _raise_profile_stall(
                         "SAML login UI did not make substantive progress after recovery",
-                        sensitive_submission_started,
                     )
 
                 ui_recovery_attempts += 1
@@ -6679,7 +6705,7 @@ def do_saml_auth(
                         actionable_pre_sensitive_state_visible
                     ),
                 ):
-                    _raise_pre_sensitive_profile_stall(
+                    _raise_profile_stall(
                         "Cached SAML browser profile exceeded the pre-sensitive "
                         "progress limit"
                     )
@@ -7013,10 +7039,9 @@ def do_saml_auth(
                     # A submitted credential or MFA form is not a stale static
                     # page. Reloading it can duplicate a sign-in or phone prompt,
                     # so stop only at its immutable, protocol-clamped deadline.
-                    raise _ui_stall_exception(
+                    _raise_profile_stall(
                         "Microsoft did not complete the submitted sign-in within "
                         "the adaptive processing limit",
-                        sensitive_submission_started,
                     )
 
                 form_submission_pending = bool(
@@ -8044,10 +8069,18 @@ def do_saml_auth(
                     continue
                 if totp_secret and auto_totp and not totp_disabled_for_attempt:
                     if otp_loc:
-                        if otp_control_identity_this_loop is None:
-                            otp_control_identity_this_loop = (
-                                _form_control_identity(otp_loc)
-                            )
+                        # The loop performs several Microsoft-state probes after
+                        # first finding the field. Re-resolve it immediately
+                        # before use because an nth() locator can otherwise move
+                        # to a hidden session input when the panel hydrates.
+                        otp_loc = _find_otp_input()
+                        if otp_loc is None:
+                            otp_input_reported = False
+                            _interruptible_pause(0.1)
+                            continue
+                        otp_control_identity_this_loop = (
+                            _form_control_identity(otp_loc)
+                        )
                         otp_submission_control_progress = (
                             _otp_control_is_progress(
                                 otp_control_identity_this_loop,
@@ -8087,7 +8120,16 @@ def do_saml_auth(
                                     totp_code = generate_totp(totp_secret)
                                     if not re.fullmatch(r"[0-9]{6,8}", totp_code or ""):
                                         raise ValueError("invalid generated TOTP")
-                                    otp_loc.fill(totp_code)
+                                    if not _fill_totp_code_control(
+                                        otp_loc,
+                                        totp_code,
+                                    ):
+                                        otp_input_reported = False
+                                        _report_progress(
+                                            "mfa-totp-control-replaced"
+                                        )
+                                        _interruptible_pause(0.1)
+                                        continue
                                     totp_error_before_submit = _totp_error_signature(otp_loc)
                                     progressed = True
                                     submitted = _submit_otp(otp_loc)
@@ -8381,10 +8423,9 @@ def do_saml_auth(
                 and not _auth_capture_complete()
                 and not _is_vpn_url(page.url)
             ):
-                raise _ui_stall_exception(
+                _raise_profile_stall(
                     "Microsoft did not complete the submitted sign-in within "
                     "the adaptive processing limit",
-                    sensitive_submission_started,
                 )
 
             remaining_ms = _remaining_timeout_ms(deadline)
@@ -8399,9 +8440,8 @@ def do_saml_auth(
                     or not _is_vpn_url(page.url)
                 )
             ):
-                raise _ui_stall_exception(
+                _raise_profile_stall(
                     "SAML authentication did not complete before the protocol deadline",
-                    sensitive_submission_started,
                 )
 
             # Collect cookies
