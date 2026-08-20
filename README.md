@@ -197,6 +197,15 @@ without opening the editor:
 nmcli connection modify "<connection name>" vpn.timeout 360
 ```
 
+When starting the profile from a terminal, also raise `nmcli`'s independent
+command wait. Its default 90-second wait can expire while NetworkManager is
+still completing a valid SAML/MFA activation; that does not mean the VPN has
+failed. Use:
+
+```bash
+nmcli --wait 360 connection up id "<connection name>"
+```
+
 For example, use `"FHNW"` as the connection name for the FHNW AnyConnect
 profile. GlobalProtect profiles keep their existing timeout behavior.
 
