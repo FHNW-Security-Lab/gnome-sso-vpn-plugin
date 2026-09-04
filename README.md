@@ -24,7 +24,7 @@ Install the exact package path printed by the build with APT so its runtime
 dependencies are resolved automatically. For example:
 
 ```bash
-sudo apt install "$PWD/dist/network-manager-ms-sso_2.0.6-1_amd64.deb"
+sudo apt install "$PWD/dist/network-manager-ms-sso_2.0.7-1_amd64.deb"
 ```
 
 ## Build Or Install On Arch
@@ -213,6 +213,57 @@ nmcli --wait 360 connection up id "<connection name>"
 
 For example, use `"FHNW"` as the connection name for the FHNW AnyConnect
 profile. GlobalProtect profiles keep their existing timeout behavior.
+
+## Reconnect behavior
+
+The `nm-ms-sso-reconnect` system service observes manually started VPNs. Clicking
+Connect keeps that profile enabled for the current boot:
+
+| Event | Behavior |
+| --- | --- |
+| Server session expires, tunnel exits, or activation fails | Start a fresh NetworkManager activation after cleanup |
+| Sleep or loss of the underlying network | Wait for resume and a usable uplink, then reconnect |
+| Disconnect in GNOME or `nmcli connection down` | Stop reconnecting, including during authentication |
+| Reboot or shutdown | Forget the previous Connect choice; do not activate a saved profile |
+
+Retries continue without an attempt limit, with delays increasing from 5 seconds
+to at most 5 minutes after repeated failures. Successful connections reset the
+delay. Valid VPN cookies are reused; an expired session runs SSO again. MFA may
+still require user interaction when required by the identity provider.
+
+To disable retries even while waiting for the network, set the profile policy:
+
+```bash
+nmcli connection modify "FHNW" +vpn.data "auto-reconnect=false"
+```
+
+Set `auto-reconnect=true` and press Connect to enable it again. Do not configure
+an uplink's `connection.secondaries` to activate this VPN if you want it to stay
+off after reboot. Reconnect intent is held in memory, so restarting the observer
+while disconnected also clears it.
+
+Debian, Arch and the NixOS module enable the observer on installation. With a
+manual Meson installation, enable it once:
+
+```bash
+sudo systemctl enable --now nm-ms-sso-reconnect.service
+```
+
+Microsoft authentication prefers structural field and method identifiers and
+supports English, German, French and Italian password/TOTP picker labels. It
+waits for document readiness and exposed reactive form bindings before password
+entry, instead of adding a fixed login delay. New page structures can still
+require adaptation; no client can guarantee availability or unchanged SSO pages.
+
+Run regression checks with:
+
+```bash
+python3 -m unittest discover -s tests
+meson test -C build-test --print-errorlogs
+```
+
+The browser readiness tests require the Playwright Chromium runtime. They serve
+all browser requests from local fixtures and do not contact an identity provider.
 
 ## Nix Flake Usage
 

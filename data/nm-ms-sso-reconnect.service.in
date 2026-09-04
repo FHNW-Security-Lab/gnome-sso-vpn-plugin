@@ -1,0 +1,17 @@
+[Unit]
+Description=Reconnect manually enabled MS SSO VPN connections
+Wants=NetworkManager.service
+After=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=@LIBEXECDIR@/nm-ms-sso-reconnect
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

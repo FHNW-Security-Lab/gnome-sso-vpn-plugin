@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_NAME="network-manager-ms-sso"
-VERSION="2.0.6"
+VERSION="2.0.7"
 MIN_OPENCONNECT_VERSION="9.12"
 
 BUILD_DEPENDENCIES=(

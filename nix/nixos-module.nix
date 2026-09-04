@@ -90,6 +90,18 @@ in
         '';
       };
 
+      systemd.services.nm-ms-sso-reconnect = {
+        description = "Reconnect manually enabled MS SSO VPN connections";
+        wantedBy = [ "multi-user.target" ];
+        wants = [ "NetworkManager.service" ];
+        after = [ "NetworkManager.service" ];
+        serviceConfig = {
+          ExecStart = "${pkgs.networkmanager-ms-sso}/libexec/nm-ms-sso-reconnect";
+          Restart = "on-failure";
+          RestartSec = 5;
+        };
+      };
+
       # This dispatcher also removes the crash-safe IPv6 kill route. Security
       # teardown must not be disabled by the legacy DNS-cleanup option.
       networking.networkmanager.dispatcherScripts = [

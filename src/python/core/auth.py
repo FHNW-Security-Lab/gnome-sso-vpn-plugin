@@ -58,6 +58,11 @@ SAML_UI_MAX_RECOVERIES = 1
 SAML_PERSISTENT_PROFILE_PRE_SENSITIVE_MAX_SECONDS = 20.0
 
 MICROSOFT_TOTP_METHOD_LABELS = (
+    'Utiliser un code de vérification',
+    'Entrer un code de vérification',
+    'Usa un codice di verifica',
+    'Utilizza un codice di verifica',
+    'Usar un código de verificación',
     "Use a verification code",
     "Enter a verification code",
     "Use a code from my authenticator app",
@@ -72,6 +77,12 @@ MICROSOFT_TOTP_METHOD_LABELS = (
 )
 
 MICROSOFT_ALTERNATE_MFA_LABELS = (
+    'Se connecter d’une autre manière',
+    "Se connecter d'une autre manière",
+    'Autres méthodes de connexion',
+    'Accedi in un altro modo',
+    'Altre opzioni di accesso',
+    'Iniciar sesión de otra forma',
     "I can't use my Microsoft Authenticator app right now",
     "Sign in another way",
     "Other ways to sign in",
@@ -90,21 +101,32 @@ MICROSOFT_ALTERNATE_MFA_LABELS = (
 )
 
 MICROSOFT_NUMBER_MATCH_TOTP_ALTERNATE_LABELS = (
+    'Je ne peux pas utiliser mon application Microsoft Authenticator pour le moment',
+    'Non posso usare l’app Microsoft Authenticator in questo momento',
     "I can't use my Microsoft Authenticator app right now",
     "Ich kann meine Microsoft Authenticator-App im Moment nicht verwenden",
 )
 
 MICROSOFT_PASSKEY_APP_FALLBACK_LABELS = (
+    'Utiliser une application à la place',
+    'Usa invece un’app',
     "Use an app instead",
     "Stattdessen eine App verwenden",
 )
 
 MICROSOFT_PRIMARY_METHOD_PICKER_MARKERS = (
+    'Choisissez une méthode de connexion',
+    'Choisir une méthode de connexion',
+    'Scegli un modo per accedere',
+    'Elija una forma de iniciar sesión',
     "Choose a way to sign in",
     "Methode für die Anmeldung auswählen",
 )
 
 MICROSOFT_EXACT_TOTP_METHOD_LABELS = (
+    'Utiliser un code de vérification',
+    'Usa un codice di verifica',
+    'Usar un código de verificación',
     "Use a verification code",
     "Prüfcode verwenden",
     "Bestätigungscode verwenden",
@@ -136,6 +158,11 @@ MICROSOFT_PUSH_METHOD_LABELS = (
 )
 
 MICROSOFT_PASSWORD_METHOD_LABELS = (
+    'Utiliser mon mot de passe',
+    'Utiliser votre mot de passe',
+    'Usa la password',
+    'Usa invece la password',
+    'Usar mi contraseña',
     "Use my password",
     "Use your password instead",
     "Use password instead",
@@ -149,6 +176,7 @@ MICROSOFT_PASSWORD_METHOD_LABELS = (
 
 MICROSOFT_PASSWORD_DIRECT_SELECTORS = (
     "#idA_PWD_SwitchToPassword",
+    "[data-value='Password' i]",
 )
 
 MICROSOFT_PASSKEY_MARKERS = (
@@ -2310,6 +2338,34 @@ def _password_submission_classification_deadline(
             discovery_completed,
         ),
     )
+
+
+def _password_form_hydrated(password_loc, protocol: Optional[str]) -> bool:
+    """Do not type into Microsoft's visible but not yet bound password form.
+
+    Playwright's actionability checks cannot tell whether a reactive submit
+    handler exists. Wait for the owning document and, when exposed by the page,
+    its Knockout binding. This is a readiness probe, not a fixed sleep; already
+    ready forms take the existing fast path. The outer SAML deadline bounds it.
+    """
+    if str(protocol or "").casefold() != "anyconnect":
+        return True
+    try:
+        return bool(password_loc.evaluate("""element => {
+            const doc = element.ownerDocument;
+            const view = doc.defaultView;
+            if (view.location.hostname !== 'login.microsoftonline.com')
+                return true;
+            if (!element.isConnected || doc.readyState !== 'complete')
+                return false;
+            const bound = element.closest('[data-bind]');
+            if (bound && view.ko && typeof view.ko.contextFor === 'function')
+                return !!view.ko.contextFor(element);
+            return true;
+        }"""))
+    except Exception:
+        # Navigation or a detached input means the next loop must reacquire it.
+        return False
 
 
 def _enter_password_value(password_loc, password: str, protocol: Optional[str]) -> None:
@@ -6294,7 +6350,7 @@ def do_saml_auth(
                     password_action_attempts > 0
                     and not sensitive_action_ledger.dispatched("password")
                 ):
-                    if debug:
+                    if debug or protocol == "anyconnect":
                         transition_evidence = (
                             max(
                                 0,
@@ -7753,6 +7809,12 @@ def do_saml_auth(
                             continue
                         if gp_password_navigation_pending:
                             _report_progress("gp-password-navigation-pending")
+                            _interruptible_pause(0.1)
+                            continue
+                        if not _password_form_hydrated(pass_loc, protocol):
+                            password_input_ready_since = 0.0
+                            password_input_identity = None
+                            _report_progress("password-form-hydrating")
                             _interruptible_pause(0.1)
                             continue
                         password_now = time.monotonic()

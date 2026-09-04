@@ -1,5 +1,5 @@
 project('network-manager-ms-sso', 'c',
-  version: '2.0.6',
+  version: '2.0.7',
   meson_version: '>= 0.56.0',
   license: 'GPL-2.0-or-later',
   default_options: [
@@ -48,6 +48,21 @@ install_data('src/nm-ms-sso-service.py',
   rename: 'nm-ms-sso-service',
   install_dir: libexecdir,
   install_mode: 'rwxr-xr-x',
+)
+
+# Boot-local reconnect observer. Starting it never activates a saved VPN.
+install_data('src/nm-ms-sso-reconnect.py',
+  rename: 'nm-ms-sso-reconnect',
+  install_dir: libexecdir,
+  install_mode: 'rwxr-xr-x',
+)
+reconnect_config = configuration_data()
+reconnect_config.set('LIBEXECDIR', libexecdir)
+configure_file(
+  input: 'data/nm-ms-sso-reconnect.service.in',
+  output: 'nm-ms-sso-reconnect.service',
+  configuration: reconnect_config,
+  install_dir: join_paths(prefix, 'lib', 'systemd', 'system'),
 )
 
 # Install Python auth dialog

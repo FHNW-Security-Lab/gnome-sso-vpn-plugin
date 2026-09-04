@@ -1,3 +1,13 @@
+network-manager-ms-sso (2.0.7-1) unstable; urgency=medium
+
+  * Reconnect manually enabled VPNs after session expiry, failure, and resume
+  * Keep reconnect intent in memory and honor user disconnect and shutdown
+  * Wait for Microsoft form bindings before password entry without fixed delays
+  * Extend localized password and verification-code method selection
+  * Add reconnect lifecycle and real Chromium readiness regression coverage
+
+ -- MS SSO OpenConnect Maintainers <maintainers@example.com>  Fri, 04 Sep 2026 22:00:00 +0200
+
 network-manager-ms-sso (2.0.6-1) unstable; urgency=medium
 
   * Route every DNS query through validated tunnel-bound resolvers

@@ -45,7 +45,7 @@ let
 in
 python3Packages.buildPythonApplication rec {
   pname = "networkmanager-ms-sso";
-  version = "2.0.6";
+  version = "2.0.7";
   format = "other";
 
   src = lib.cleanSource ../.;

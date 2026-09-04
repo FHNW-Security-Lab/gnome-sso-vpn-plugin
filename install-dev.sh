@@ -27,7 +27,7 @@ for pkg in meson ninja-build pkg-config libnm-dev libgtk-4-dev libglib2.0-dev li
     fi
 done
 
-if [ -n "$MISSING" ]; then
+if [ -n "${MISSING:-}" ]; then
     echo ""
     echo "Install missing dependencies with:"
     echo "  sudo apt install meson ninja-build pkg-config libnm-dev libgtk-4-dev libglib2.0-dev libsecret-1-dev"
@@ -107,6 +107,13 @@ echo "  /usr/share/dbus-1/system.d/nm-ms-sso-service.conf"
 echo "  $LIBDIR/libnm-vpn-plugin-ms-sso-editor.so"
 echo "  /usr/share/network-manager-ms-sso/python/core/"
 echo ""
+
+# Install the boot-local reconnect observer.
+sudo install -m755 "$SCRIPT_DIR/src/nm-ms-sso-reconnect.py" /usr/libexec/nm-ms-sso-reconnect
+sed 's|@LIBEXECDIR@|/usr/libexec|g' "$SCRIPT_DIR/data/nm-ms-sso-reconnect.service.in" \
+    | sudo tee /usr/lib/systemd/system/nm-ms-sso-reconnect.service >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now nm-ms-sso-reconnect.service
 
 # Restart NetworkManager
 echo "Restarting NetworkManager..."
