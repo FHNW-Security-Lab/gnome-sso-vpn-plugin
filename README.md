@@ -12,6 +12,40 @@ Standalone GNOME NetworkManager plugin for MS SSO OpenConnect.
 - Arch packaging assets (`packaging/arch/`)
 - Nix packaging + NixOS module (`nix/`, `flake.nix`)
 
+## Connect and watch progress
+
+Connect using GNOME Settings → Network → VPN, or start the saved FHNW profile
+from a terminal:
+
+```bash
+nmcli --wait 360 connection up id FHNW
+```
+
+Watch SSO steps, tunnel validation, and reconnect attempts in another terminal:
+
+```bash
+journalctl -f -t nm-ms-sso -t nm-ms-sso-reconnect
+```
+
+Press Ctrl+C to stop viewing logs without disconnecting. If journal access is
+restricted, run the log command with `sudo`. Authentication runs in a headless
+browser, so progress appears as log messages rather than a browser window.
+
+Check the current connection and observer status:
+
+```bash
+nmcli -f NAME,TYPE,STATE connection show
+systemctl status nm-ms-sso-reconnect.service --no-pager
+```
+
+`FHNW` should show `activated` once connected. The reconnect service can be
+`active (running)` even when the VPN is off: it observes future Connect requests.
+Its being enabled on boot does not enable VPN autoconnect after reboot.
+
+See [Connection progress and troubleshooting](docs/troubleshooting.md) for log
+messages, process IDs, retry controls, known limitations, and diagnostic reports.
+For NixOS installation, see [Nix packaging](nix/README.md).
+
 ## Build Debian Package
 
 ```bash
@@ -264,6 +298,11 @@ meson test -C build-test --print-errorlogs
 
 The browser readiness tests require the Playwright Chromium runtime. They serve
 all browser requests from local fixtures and do not contact an identity provider.
+
+Some FHNW sign-in attempts can still stall after the password-form action.
+Automatic retries have recovered an observed session-expiry disconnect, but
+first-attempt login and physical suspend/resume still need further validation.
+See the [known limitations](docs/troubleshooting.md#known-limitations-in-207).
 
 ## Nix Flake Usage
 
