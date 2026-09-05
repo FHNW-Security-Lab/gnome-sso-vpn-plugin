@@ -133,6 +133,52 @@ nmcli connection modify "<connection name>" +vpn.data "gp-auth-interface=gateway
 Use `portal` for deployments that require portal discovery. This setting only
 affects GlobalProtect; AnyConnect profiles keep their existing connection path.
 
+### UniBas reconnect settings
+
+The reconnect observer in version 2.0.7 supports both AnyConnect and
+GlobalProtect. It selects profiles by this plugin's NetworkManager service type,
+not by institution or VPN protocol. UniBas therefore has the same retry,
+network-recovery, sleep/resume, manual-disconnect, and reboot policy as FHNW.
+No additional reconnect helper or package is required.
+
+Explicitly enable it for the saved `Unibas` profile and allow up to 360 seconds
+for a NetworkManager activation:
+
+```bash
+nmcli connection modify Unibas +vpn.data 'auto-reconnect=true' vpn.timeout 360
+```
+
+This extends the activation deadline without adding a delay to successful
+connections. It does not change GlobalProtect's separate SAML timeout or replace
+an existing tunnel. Preserve a larger activation timeout if already configured.
+The editor's GlobalProtect default remains 300 seconds, and it preserves an
+explicit 360-second value when the profile is saved.
+
+Keep the UniBas gateway and registered MFA configuration. Direct gateway
+profiles use `gp-auth-interface=gateway`; TOTP profiles use `mfa-preference=totp`.
+GlobalProtect keeps its own cookie handling: a consumed gateway prelogin cookie
+cannot be reused, so a reconnect can require SSO again. Shared DNS validation
+and exclusive VPN DNS policy apply to both protocols.
+
+This plugin supports one active VPN at a time. To switch from FHNW to UniBas,
+disconnect FHNW first, then connect UniBas:
+
+```bash
+nmcli connection down id FHNW
+nmcli --wait 360 connection up id Unibas
+```
+
+Run the first command only if FHNW is active. To disable future UniBas retries:
+
+```bash
+nmcli connection modify Unibas +vpn.data 'auto-reconnect=false'
+```
+
+Changing the retry policy does not disconnect an established tunnel; use
+`nmcli connection down id Unibas` for that. See the
+[troubleshooting guide](docs/troubleshooting.md#connect-disconnect-and-stop-retries)
+for live progress and the full retry controls.
+
 GlobalProtect and interactive AnyConnect SAML reuse a browser session by
 default. Browser state is isolated by VPN protocol, gateway, and account so
 switching between institutions cannot reuse the other connection's tenant or

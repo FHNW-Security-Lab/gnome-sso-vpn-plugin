@@ -157,7 +157,7 @@ class ReconnectTests(unittest.TestCase):
         other = activation(self.profile, '/active/2')
         self.monitor.added(self.client, other)
         self.monitor.changed(self.active, NM.ActiveConnectionState.DEACTIVATED, 2)
-        self.assertEqual(self.monitor.intent.uuid, 'vpn-1')
+        self.assertEqual(self.monitor.intent.uuid, self.profile.get_uuid())
 
     def test_nm_crash_without_final_signal_still_retries(self):
         self.start()
@@ -253,6 +253,54 @@ class ReconnectTests(unittest.TestCase):
         self.client.activate_connection_finish.return_value = self.active
         self.monitor.activated(self.client, None, context)
         self.client.deactivate_connection_async.assert_called_once()
+
+
+def real_protocol_profile(protocol):
+    """Exercise libnm's actual VPN data map, without secrets or a live tunnel."""
+    connection = NM.SimpleConnection.new()
+    identity = NM.SettingConnection.new()
+    identity.props.id = 'reconnect-test-' + protocol
+    identity.props.uuid = 'f35ad2dd-32ea-48d2-a665-dbeca659ca7a'
+    identity.props.type = 'vpn'
+    connection.add_setting(identity)
+    vpn = NM.SettingVpn.new()
+    vpn.props.service_type = M.SERVICE_TYPE
+    vpn.add_data_item('protocol', protocol)
+    vpn.add_data_item('auto-reconnect', 'true')
+    if protocol == 'gp':
+        vpn.add_data_item('gp-auth-interface', 'gateway')
+        vpn.add_data_item('mfa-preference', 'totp')
+    connection.add_setting(vpn)
+    return connection
+
+
+class GlobalProtectReconnectTests(ReconnectTests):
+    """Run the lifecycle contract with an actual GlobalProtect NM profile."""
+    protocol = 'gp'
+
+    def setUp(self):
+        super().setUp()
+        self.profile = real_protocol_profile(self.protocol)
+        self.assertTrue(self.profile.verify())
+        self.client.get_connection_by_uuid.return_value = self.profile
+        self.active = activation(self.profile)
+
+    def test_real_profile_defaults_to_reconnect_and_honors_explicit_disable(self):
+        vpn = self.profile.get_setting_vpn()
+        vpn.remove_data_item('auto-reconnect')
+        self.assertTrue(M.ReconnectMonitor.enabled(self.profile))
+        vpn.add_data_item('auto-reconnect', 'false')
+        self.assertFalse(M.ReconnectMonitor.enabled(self.profile))
+        self.monitor.added(self.client, self.active)
+        self.assertIsNone(self.monitor.intent)
+        vpn.add_data_item('auto-reconnect', 'true')
+        self.monitor.added(self.client, self.active)
+        self.assertIsNotNone(self.monitor.intent)
+
+
+class AnyConnectReconnectTests(GlobalProtectReconnectTests):
+    """The identical lifecycle contract applies to a real AnyConnect profile."""
+    protocol = 'anyconnect'
 
 
 if __name__ == '__main__':

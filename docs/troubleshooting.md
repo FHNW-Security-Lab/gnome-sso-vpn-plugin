@@ -146,6 +146,32 @@ restarting it while the VPN is disconnected forgets that you wanted to reconnect
 After reboot, press Connect again. For behavior details, see
 [Reconnect behavior](../README.md#reconnect-behavior).
 
+## UniBas / GlobalProtect
+
+The same reconnect service and journal filters apply to `Unibas`. For a saved
+GlobalProtect profile, enable retries and set the activation allowance with:
+
+```bash
+nmcli connection modify Unibas +vpn.data 'auto-reconnect=true' vpn.timeout 360
+nmcli -f GENERAL.STATE,GENERAL.VPN connection show Unibas
+journalctl -f -t nm-ms-sso -t nm-ms-sso-reconnect
+```
+
+Keep an existing timeout above 360 seconds. These settings take effect for the
+next activation; they do not switch away from a currently active FHNW tunnel.
+The plugin supports one active VPN at a time. Disconnect the active VPN before
+starting `nmcli --wait 360 connection up id Unibas`.
+
+The configured UniBas gateway and registered MFA method should remain in place.
+GlobalProtect direct-gateway authentication uses a single-use prelogin cookie,
+so reconnecting may run SSO again even when browser-session caching is enabled.
+A mock lifecycle test passing for GlobalProtect does not validate the live
+UniBas identity provider, physical suspend/resume, or its session-expiry policy.
+
+See [UniBas reconnect settings](../README.md#unibas-reconnect-settings) for the
+protocol-specific details. To disable UniBas retries, use `auto-reconnect=false`
+on that profile as described above for FHNW.
+
 ## Known limitations in 2.0.7
 
 Some FHNW Microsoft sign-in attempts can still stall after the password-form
